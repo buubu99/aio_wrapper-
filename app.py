@@ -1,8 +1,12 @@
 from flask import Flask, request, jsonify
 import requests
 import os
+import logging
 
 app = Flask(__name__)
+
+# Set logging level from EV (default INFO)
+logging.basicConfig(level=os.environ.get('LOG_LEVEL', 'INFO'))
 
 # Your ElfHosted AIOStreams base URL (set in Render env if different)
 AIO_BASE = os.environ.get('AIO_URL', 'https://buubuu99-aiostreams.elfhosted.cc/stremio/acc199cb-6b12-4fa9-be4e-a8ff4c13fa50/eyJpIjoiRTJES0N1ZFBaWm8wb25aS05tNEFsUT09IiwiZSI6InhrVVFtdTFEWm5lcGVrcEh5VUZaejZlcEJLMEMrcXdLakY4UU9zUDJoOFE9IiwidCI6ImEifQ')
@@ -10,10 +14,16 @@ AIO_BASE = os.environ.get('AIO_URL', 'https://buubuu99-aiostreams.elfhosted.cc/s
 # Your ElfHosted Store Stremthru base URL (set in Render env if different)
 STORE_BASE = os.environ.get('STORE_URL', 'https://buubuu99-stremthru.elfhosted.cc/stremio/store/eyJzdG9yZV9uYW1lIjoiIiwic3RvcmVfdG9rZW4iOiJZblYxWW5WMU9UazZUV0Z5YVhOellUazVRREV4Tnc9PSIsImhpZGVfY2F0YWxvZyI6dHJ1ZSwid2ViZGwiOnRydWV9')
 
-# Min thresholds to filter low-viability streams (avoid ⏳)
-MIN_SEEDERS = 10
-MIN_SIZE_BYTES = 500000000  # 500MB
-MAX_SIZE_BYTES = 100000000000  # 100GB
+# Min thresholds to filter low-viability streams (avoid ⏳) - from EVs
+MIN_SEEDERS = int(os.environ.get('MIN_SEEDERS', 10))
+MIN_SIZE_BYTES = int(os.environ.get('MIN_SIZE_BYTES', 500000000))  # 500MB
+MAX_SIZE_BYTES = int(os.environ.get('MAX_SIZE_BYTES', 100000000000))  # 100GB
+
+# Timeout in milliseconds from EV (default 30000 ms = 30s)
+REQUEST_TIMEOUT = int(os.environ.get('TIMEOUT', 30000)) / 1000  # Convert to seconds for requests
+
+# Concurrency limit (not used yet, but future-proof)
+CONCURRENCY_LIMIT = int(os.environ.get('CONCURRENCY_LIMIT', 20))
 
 @app.route('/manifest.json')
 def manifest():
@@ -33,14 +43,14 @@ def streams(media_type, media_id):
     try:
         # Fetch from AIOStreams
         aio_url = f"{AIO_BASE}/stream/{media_type}/{media_id}.json"
-        aio_response = requests.get(aio_url, timeout=30)
+        aio_response = requests.get(aio_url, timeout=REQUEST_TIMEOUT)
         aio_response.raise_for_status()
         aio_data = aio_response.json()
         all_streams = aio_data.get('streams', [])
 
         # Fetch from Store Stremthru
         store_url = f"{STORE_BASE}/stream/{media_type}/{media_id}.json"
-        store_response = requests.get(store_url, timeout=30)
+        store_response = requests.get(store_url, timeout=REQUEST_TIMEOUT)
         store_response.raise_for_status()
         store_data = store_response.json()
         all_streams += store_data.get('streams', [])
@@ -87,7 +97,7 @@ def streams(media_type, media_id):
 
         return jsonify({'streams': filtered[:60]})  # Limit to 60 to avoid clutter
     except Exception as e:
-        print(f"Error: {e}")  # For Render logs
+        logging.error(f"Error fetching streams: {e}")
         return jsonify({'streams': []}), 500
 
 if __name__ == '__main__':
