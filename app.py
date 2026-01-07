@@ -34,16 +34,30 @@ REQUEST_TIMEOUT = int(os.environ.get('TIMEOUT', 60000)) / 1000  # Default 60s
 
 CONCURRENCY_LIMIT = int(os.environ.get('CONCURRENCY_LIMIT', 20))
 
-# Flag mapping for languages
+# Flag mapping for languages (improved detection)
 LANGUAGE_FLAGS = {
     'eng': '🇬🇧',
+    'english': '🇬🇧',
+    'en': '🇬🇧',
     'jpn': '🇯🇵',
+    'japanese': '🇯🇵',
+    'jp': '🇯🇵',
     'ita': '🇮🇹',
+    'italian': '🇮🇹',
+    'it': '🇮🇹',
     'fra': '🇫🇷',
+    'french': '🇫🇷',
+    'fr': '🇫🇷',
     'kor': '🇰🇷',
+    'korea': '🇰🇷',
+    'korean': '🇰🇷',
+    'kr': '🇰🇷',
     'chn': '🇨🇳',
-    'uk': '🇬🇧'  # UK same as Eng
-    # Add more as needed, e.g., 'spa': '🇪🇸', 'ger': '🇩🇪'
+    'china': '🇨🇳',
+    'chinese': '🇨🇳',
+    'cn': '🇨🇳',
+    'uk': '🇬🇧',
+    'british': '🇬🇧'
 }
 
 @app.route('/manifest.json')
@@ -61,7 +75,7 @@ def manifest():
 
 @app.route('/health')
 def health():
-    return "OK", 200  # For pinger, small output
+    return "OK", 200 # For pinger, small output
 
 @app.route('/stream/<media_type>/<media_id>.json')
 def streams(media_type, media_id):
@@ -85,14 +99,14 @@ def streams(media_type, media_id):
             logging.info(f"Store fetch success: {len(store_streams)} streams")
         except Exception as e:
             logging.error(f"Store fetch error: {e}")
-    # Filter: Relax - skip only true ⏳ uncached; include if parse fails
+    # Filter: Stricter - skip if ⏳ or uncached
     filtered = []
     for s in all_streams:
         hints = s.get('behaviorHints', {})
         title = s.get('title', '').lower()
         is_cached = hints.get('isCached', False)
         logging.debug(f"Stream: {title}, isCached: {is_cached}")
-        if '⏳' in title and not is_cached:
+        if '⏳' in title or not is_cached:
             continue
         parts = title.split()
         seeders = 0
