@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import logging
+import re
 from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -22,7 +23,7 @@ MIN_SIZE_BYTES = int(os.environ.get('MIN_SIZE_BYTES', 500000000))
 MAX_SIZE_BYTES = int(os.environ.get('MAX_SIZE_BYTES', 100000000000))
 REQUEST_TIMEOUT = int(os.environ.get('TIMEOUT', 60000)) / 1000 # Default 60s
 CONCURRENCY_LIMIT = int(os.environ.get('CONCURRENCY_LIMIT', 20))
-# Flag mapping for languages (focus on short codes to avoid false positives)
+# Flag mapping for languages (expanded)
 LANGUAGE_FLAGS = {
     'eng': '🇬🇧',
     'en': '🇬🇧',
@@ -36,14 +37,15 @@ LANGUAGE_FLAGS = {
     'kr': '🇰🇷',
     'chn': '🇨🇳',
     'cn': '🇨🇳',
-    'uk': '🇬🇧'
-    # Add more as needed, remove full words like 'english' since we're parsing exactly
+    'uk': '🇬🇧',
+    'ger': '🇩🇪',
+    'de': '🇩🇪',
 }
 @app.route('/manifest.json')
 def manifest():
     return jsonify({
         "id": "org.grok.wrapper",
-        "version": "1.0.2",  # Bump for sorting/flags fix
+        "version": "1.0.5",  # Bump for detailed logging
         "name": "Grok AIO Wrapper",
         "description": "Wraps AIOStreams to filter and format streams (Store optional)",
         "resources": ["stream"],
@@ -53,7 +55,7 @@ def manifest():
     })
 @app.route('/health')
 def health():
-    return "OK", 200 # For pinger, small output
+    return "OK", 200
 @app.route('/stream/<media_type>/<media_id>.json')
 def streams(media_type, media_id):
     all_streams = []
@@ -80,68 +82,64 @@ def streams(media_type, media_id):
     filtered = []
     for s in all_streams:
         hints = s.get('behaviorHints', {})
-        title_lower = s.get('title', '').lower()
+        title = s.get('title', '').replace('\n', ' ')  # Normalize multi-line
+        title_lower = title.lower()
         is_cached = hints.get('isCached', False)
-        logging.debug(f"Stream: {title_lower}, isCached: {is_cached}")
+        logging.debug(f"Stream title: {title if title else 'NO TITLE'}, isCached: {is_cached}")
         if '⏳' in title_lower or not is_cached:
+            logging.debug(f"Skipped stream: {title if title else 'NO TITLE'} (uncached or ⏳)")
             continue
-        parts = title_lower.split()
-        seeders = 0
-        for i, part in enumerate(parts):
-            if 'seed' in part and i > 0 and parts[i-1].isdigit():
-                seeders = int(parts[i-1])
-                break
-        size_str = next((part for part in parts if 'gb' in part or 'mb' in part), '0 gb')
-        try:
-            size_num = float(''.join(c for c in size_str if c.isdigit() or c == '.'))
-        except ValueError:
-            size_num = 0
-        size = size_num * (10**9 if 'gb' in size_str else 10**6)
+        # Parse seeders
+        seed_match = re.search(r'👥 (\d+)|(\d+)\s*seed', title_lower, re.I)
+        seeders = int(seed_match.group(1) or seed_match.group(2)) if seed_match else 0
+        # Parse size
+        size_match = re.search(r'(\d+\.?\d*)\s*(gb|mb)', title_lower, re.I)
+        size = 0
+        if size_match:
+            size_num = float(size_match.group(1))
+            unit = size_match.group(2).lower()
+            size = size_num * (10**9 if unit == 'gb' else 10**6)
+        logging.debug(f"Parsed seeders/size for '{title}': seeders={seeders}, size={size}")
         if seeders >= MIN_SEEDERS and MIN_SIZE_BYTES <= size <= MAX_SIZE_BYTES:
             filtered.append(s)
-    # Sort: Res → Quality → Provider → Size desc (Tam-Taro approx: best first, mix providers, size within)
+            logging.debug(f"Kept stream: {title} (cached, meets criteria)")
+        else:
+            logging.debug(f"Skipped stream: {title} (low seeders/size)")
+    # Sort: Res > Quality > Provider > Size desc > Seeders desc
     def sort_key(s):
-        title_lower = s.get('title', '').lower()
+        title = s.get('title', '').replace('\n', ' ')
+        title_lower = title.lower()
         hints = s.get('behaviorHints', {})
-        # Res priority (lower better: 4k=0)
         res_priority = {'4k': 0, '2160p': 0, '1080p': 1, '720p': 2}.get(next((r for r in ['4k', '2160p', '1080p', '720p'] if r in title_lower), ''), 3)
-        # Quality priority (lower better: remux=0, bluray=1, etc.)
         quality_priority = {'remux': 0, 'bluray': 1, 'web-dl': 2, 'webrip': 3}.get(next((q for q in ['remux', 'bluray', 'web-dl', 'webrip'] if q in title_lower), ''), 4)
-        # Provider priority (lower better: store=0, rd=1, tb=2, ad=3)
         source_priority = 0 if 'store' in title_lower or 'stremthru' in title_lower else (1 if 'rd' in title_lower or 'realdebrid' in title_lower else (2 if 'tb' in title_lower or 'torbox' in title_lower else (3 if 'ad' in title_lower or 'alldebrid' in title_lower else 4)))
-        # Size desc (-size_num for higher better in asc sort)
-        parts = title_lower.split()
-        size_str = next((part for part in parts if 'gb' in part or 'mb' in part), '0 gb')
-        try:
-            size_num = float(''.join(c for c in size_str if c.isdigit() or c == '.'))
-        except ValueError:
-            size_num = 0
-        logging.debug(f"Parsed size for '{title_lower}': {size_num} from '{size_str}'")
-        return (res_priority, quality_priority, source_priority, -size_num)
+        size_match = re.search(r'(\d+\.?\d*)\s*(gb|mb)', title_lower, re.I)
+        size_num = float(size_match.group(1)) if size_match else 0
+        seed_match = re.search(r'👥 (\d+)|(\d+)\s*seed', title_lower, re.I)
+        seeders = int(seed_match.group(1) or seed_match.group(2)) if seed_match else 0
+        key = (res_priority, quality_priority, source_priority, -size_num, -seeders)
+        logging.debug(f"Sort key for '{title}': {key} (res={res_priority}, qual={quality_priority}, src={source_priority}, size={size_num}, seeds={seeders})")
+        return key
     filtered.sort(key=sort_key)
     # Reformat: ★ for Store/4K/StremThru, dim uncached/⏳, parse/replace languages with unique flags
     for s in filtered:
-        title = s.get('title', '')
+        title = s.get('title', '').replace('\n', ' ')
         hints = s.get('behaviorHints', {})
-        orig_title = title  # For debug
-        # Parse and replace languages (assume last part if comma-separated short codes)
-        parts = title.split()
-        flags_added = set()
-        if len(parts) > 1 and ',' in parts[-1]:
-            lang_str = parts[-1]
-            langs = [l.strip().lower() for l in lang_str.split(',') if l.strip()]
-            for lang in langs:
-                if lang in LANGUAGE_FLAGS:
-                    flags_added.add(LANGUAGE_FLAGS[lang])
-        if flags_added:
-            # Replace lang text with flags (matches Stremthru style)
-            title = ' '.join(parts[:-1]) + ' ' + ' '.join(flags_added)
-            logging.debug(f"Added flags to '{orig_title}': {title}")
+        orig_title = title
+        # Parse langs at end (handles spaces, e.g., "ita, eng")
+        lang_match = re.search(r'([a-z]{2,3}(?:,\s*[a-z]{2,3})*)$', title.lower())
+        if lang_match:
+            lang_str = lang_match.group(1)
+            langs = [l.strip() for l in lang_str.split(',')]
+            flags_added = set(LANGUAGE_FLAGS.get(lang, '') for lang in langs if lang in LANGUAGE_FLAGS)
+            if flags_added:
+                title = re.sub(r'([a-z]{2,3}(?:,\s*[a-z]{2,3})*)$', ' ' + ' '.join(flags_added), title, flags=re.I)
+                logging.debug(f"Added flags to '{orig_title}': {title}")
         else:
             logging.debug(f"No lang match in '{orig_title}'")
         # Update title
         if 'store' in title.lower() or '4k' in title.lower() or 'stremthru' in title.lower():
-            title = f"★ {title}"  # Prepend after flags
+            title = f"★ {title}"
         if '⏳' in title or not hints.get('isCached', False):
             s['title'] = f"[dim]{title} (Unverified)[/dim]"
         else:
