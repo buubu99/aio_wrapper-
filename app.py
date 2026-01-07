@@ -25,12 +25,26 @@ STORE_BASE = os.environ.get('STORE_URL', 'https://buubuu99-stremthru.elfhosted.c
 USE_STORE = os.environ.get('USE_STORE', 'true').lower() == 'true'  # Optional Store
 
 MIN_SEEDERS = int(os.environ.get('MIN_SEEDERS', 0))  # Relax
+
 MIN_SIZE_BYTES = int(os.environ.get('MIN_SIZE_BYTES', 500000000))
+
 MAX_SIZE_BYTES = int(os.environ.get('MAX_SIZE_BYTES', 100000000000))
 
 REQUEST_TIMEOUT = int(os.environ.get('TIMEOUT', 60000)) / 1000  # Default 60s
 
 CONCURRENCY_LIMIT = int(os.environ.get('CONCURRENCY_LIMIT', 20))
+
+# Flag mapping for languages
+LANGUAGE_FLAGS = {
+    'eng': '🇬🇧',
+    'jpn': '🇯🇵',
+    'ita': '🇮🇹',
+    'fra': '🇫🇷',
+    'kor': '🇰🇷',
+    'chn': '🇨🇳',
+    'uk': '🇬🇧'  # UK same as Eng
+    # Add more as needed, e.g., 'spa': '🇪🇸', 'ger': '🇩🇪'
+}
 
 @app.route('/manifest.json')
 def manifest():
@@ -61,7 +75,6 @@ def streams(media_type, media_id):
         logging.info(f"AIO fetch success: {len(aio_streams)} streams")
     except Exception as e:
         logging.error(f"AIO fetch error: {e}")
-
     if USE_STORE:
         try:
             store_url = f"{STORE_BASE}/stream/{media_type}/{media_id}.json"
@@ -72,7 +85,6 @@ def streams(media_type, media_id):
             logging.info(f"Store fetch success: {len(store_streams)} streams")
         except Exception as e:
             logging.error(f"Store fetch error: {e}")
-
     # Filter: Relax - skip only true ⏳ uncached; include if parse fails
     filtered = []
     for s in all_streams:
@@ -96,27 +108,30 @@ def streams(media_type, media_id):
         size = size_num * (10**9 if 'gb' in size_str.lower() else 10**6)
         if seeders >= MIN_SEEDERS and MIN_SIZE_BYTES <= size <= MAX_SIZE_BYTES:
             filtered.append(s)
-
-    # Sort: Store/4K/StremThru first, then cached/high-res
+    # Sort: Quality/res first, then provider, cache
     def sort_key(s):
         title = s.get('title', '').lower()
         hints = s.get('behaviorHints', {})
         res_priority = {'4k': 0, '2160p': 0, '1080p': 1, '720p': 2}.get(next((r for r in ['4k', '2160p', '1080p', '720p'] if r in title), ''), 3)
         source_priority = 0 if 'store' in title or 'stremthru' in title else (1 if 'rd' in title or 'realdebrid' in title else (2 if 'tb' in title or 'torbox' in title else (3 if 'ad' in title or 'alldebrid' in title else 4)))
         cache_priority = 0 if hints.get('isCached', False) else 1
-        return (source_priority, cache_priority, res_priority)
-
+        return (res_priority, source_priority, cache_priority)
     filtered.sort(key=sort_key)
-
-    # Reformat: ★ for Store/4K/StremThru, dim uncached/⏳
+    # Reformat: ★ for Store/4K/StremThru, dim uncached/⏳, add flags for languages
     for s in filtered:
         title = s.get('title', '')
         hints = s.get('behaviorHints', {})
+        # Add flags
+        for code, flag in LANGUAGE_FLAGS.items():
+            if code in title.lower():
+                title += f" {flag}"
+        # Update title
         if 'store' in title.lower() or '4k' in title.lower() or 'stremthru' in title.lower():
             s['title'] = f"★ {title}"
         if '⏳' in title or not hints.get('isCached', False):
             s['title'] = f"[dim]{title} (Unverified)[/dim]"
-
+        else:
+            s['title'] = title  # Update with flags
     logging.info(f"Final filtered: {len(filtered)}")
     return jsonify({'streams': filtered[:60]})
 
