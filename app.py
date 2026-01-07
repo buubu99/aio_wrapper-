@@ -2,8 +2,10 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import logging
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Set logging level from EV (default INFO)
 logging.basicConfig(level=os.environ.get('LOG_LEVEL', 'INFO'))
