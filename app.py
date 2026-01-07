@@ -45,7 +45,7 @@ LANGUAGE_FLAGS = {
 def manifest():
     return jsonify({
         "id": "org.grok.wrapper",
-        "version": "1.0.5",  # Bump for detailed logging
+        "version": "1.0.6",  # Bump for test flag
         "name": "Grok AIO Wrapper",
         "description": "Wraps AIOStreams to filter and format streams (Store optional)",
         "resources": ["stream"],
@@ -137,6 +137,8 @@ def streams(media_type, media_id):
                 logging.debug(f"Added flags to '{orig_title}': {title}")
         else:
             logging.debug(f"No lang match in '{orig_title}'")
+        title += ' 🇬🇧'  # Temporary test flag to check rendering
+        logging.debug(f"Test flag added: {title}")
         # Update title
         if 'store' in title.lower() or '4k' in title.lower() or 'stremthru' in title.lower():
             title = f"★ {title}"
