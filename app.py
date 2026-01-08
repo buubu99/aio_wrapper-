@@ -16,7 +16,7 @@ app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-logging.basicConfig(level=os.environ.get('LOG_LEVEL', 'INFO'), format='%(asctime)s | %(levelname)s | %(message)s')
+logging.basicConfig(level='DEBUG', format='%(asctime)s | %(levelname)s | %(message)s')  # Force DEBUG
 
 session = requests.Session()
 retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
@@ -42,20 +42,14 @@ TB_API_KEY = '1046c773-9d0d-4d53-95ab-8976a559a5f6'
 AD_API_KEY = 'Z2HvUmLsuuRmyHg5Zf5K8'
 
 LANGUAGE_FLAGS = {
-    'jpn': '🇯🇵', 'jp': '🇯🇵', 'ita': '🇮🇹', 'it': '🇮🇹',
+    'eng': '🇺🇸', 'en': '🇺🇸', 'jpn': '🇯🇵', 'jp': '🇯🇵', 'ita': '🇮🇹', 'it': '🇮🇹',
     'fra': '🇫🇷', 'fr': '🇫🇷', 'kor': '🇰🇷', 'kr': '🇰🇷', 'chn': '🇨🇳', 'cn': '🇨🇳',
-    'ger': '🇩🇪', 'de': '🇩🇪', 'hun': '🇭🇺', 'yes': '📝', 'ko': '🇰🇷',
-    'korean': '🇰🇷'  # No en/eng/uk to avoid US/UK flags
-}
-SERVICE_COLORS = {
-    'rd': '[red]', 'realdebrid': '[red]',
-    'tb': '[blue]', 'torbox': '[blue]',
-    'ad': '[green]', 'alldebrid': '[green]',
-    'store': '[purple]', 'stremthru': '[purple]'
+    'uk': '🇬🇧', 'ger': '🇩🇪', 'de': '🇩🇪', 'hun': '🇭🇺', 'yes': '📝', 'ko': '🇰🇷',
+    'korean': '🇰🇷'
 }
 
-# Quality patterns from Tam-Taro's JSON template
 QUALITY_PATTERNS = [
+    # [full list as before, expanded with Vidhin]
     {"name": "Remux T1", "pattern": r"^(?=.*\b(?:BD|Blu[-_ ]?Ray)\b)(?=.*\b(?:Remux|BDRemux)\b)(?=.*\b(?:FraMeSLoR|playBD)\b).*/i"},
     {"name": "Remux T2", "pattern": r"^(?=.*\b(?:BD|Blu[-_ ]?Ray)\b)(?=.*\b(?:Remux|BDRemux)\b)(?=.*\b(?:BHDStudio|playMaNiA|playREMUX|SPARKS|ZMN)\b).*/i"},
     {"name": "Remux T3", "pattern": r"^(?=.*\b(?:BD|Blu[-_ ]?Ray)\b)(?=.*\b(?:Remux|BDRemux)\b)(?=.*\b(?:playTV|SWTYBLZ)\b).*/i"},
@@ -70,7 +64,7 @@ QUALITY_PATTERNS = [
 logging.info("APP START | ENV VARS DUMP: %s", json.dumps(dict(os.environ), indent=2))
 
 def log_summary(section, status, streams, details, time_ms):
-    logging.info(f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🟢 [{section}] Summary\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n✔ Status      : {status}\n📦 Streams    : {streams}\n📋 Details    : {details}\n⏱️ Time       : {time_ms}ms\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    logging.info("🟢 [%s] Summary | ✔ Status: %s | 📦 Streams: %d | 📋 Details: %s | ⏱️ Time: %dms", section, status, streams, details, time_ms)
 
 def debrid_batch_check(hashes, service='rd'):
     start_time = time.time()
@@ -123,7 +117,7 @@ def debrid_batch_check(hashes, service='rd'):
 def manifest():
     return jsonify({
         "id": "org.grok.wrapper",
-        "version": "1.0.39",
+        "version": "1.0.41",
         "name": "Grok AIO Wrapper",
         "description": "Wraps AIOStreams with enhanced filtering, sorting, and formatting",
         "resources": ["stream"],
@@ -174,8 +168,13 @@ def streams(media_type, media_id):
     for i, s in enumerate(all_streams):
         name = s.get('name', '')
         description = s.get('description', '')
-        parse_string = (name + ' ' + description).lower().encode('utf-8').decode('unicode_escape')
-        normalized_parse = unicodedata.normalize('NFKD', parse_string).encode('ascii', 'ignore').decode('utf-8')
+        raw_parse = (name + ' ' + description).lower()
+        logging.debug("STREAM_ID: %d | RAW_PARSE: %s...", i, raw_parse[:100])
+        parse_string = re.sub(r'\{cannot_apply_modifier_to_null.*?\}', '', raw_parse).encode('utf-8').decode('unicode_escape')  # Remove templates
+        decoded = parse_string
+        norm = unicodedata.normalize('NFKD', decoded).encode('ascii', 'ignore').decode('utf-8')
+        if len(norm) < len(decoded) / 2:
+            logging.warning("STREAM_ID: %d | GARBLED_NORM | LOSS: %d%%", i, (len(decoded) - len(norm)) / len(decoded) * 100)
         hints = s.get('behaviorHints', {})
         is_cached = hints.get('isCached', False)
         seed_match = re.search(r'(?:seeders?|seeds?|peers?) ?(\\d+)', parse_string, re.I)
@@ -191,19 +190,29 @@ def streams(media_type, media_id):
         if size == 0:
             size = hints.get('videoSize', 0)
             logging.debug("STREAM_ID: %d | SIZE_FALLBACK_TO_HINT: %d", i, size)
+        if size == 0:
+            if '1080p' in parse_string: size = 2000000000  # ~2GB
+            elif '720p' in parse_string: size = 1000000000
+            # etc.
+            logging.debug("STREAM_ID: %d | SIZE_ESTIMATE: %d", i, size)
         res_match = re.search(r'(4k|2160p|1080p|720p)', parse_string, re.I)
         if res_match:
             res_counter[res_match.group(1).upper()] += 1
         else:
             logging.debug("STREAM_ID: %d | RES_MISS | PARSE: %s...", i, parse_string[:100])
-        lang_match = re.search(r'(kor|korean|jpn|jp|ita|it|fra|fr|chn|cn|ger|de|hun|yes|ko)', parse_string, re.I)
+        if not res_match and 'resolution' in hints:
+            res_match = re.search(r'(4k|2160p|1080p|720p)', str(hints['resolution']), re.I)
+        lang_match = re.search(r'(eng|en|jpn|jp|ita|it|fra|fr|kor|korean|kr|chn|cn|ger|de|hun|yes|ko)', parse_string, re.I)
+        flags_added = []  # Track for log
         if lang_match:
             lang = lang_match.group(1).lower()
             lang_counter[lang] += 1
             flag = LANGUAGE_FLAGS.get(lang, '')
             if flag:
                 name += f' {flag}'
-            logging.debug("STREAM_ID: %d | LANG_DETECT | LANG: %s | FLAG: %s", i, lang, flag)
+                flags_added.append(flag)
+            else:
+                logging.debug("STREAM_ID: %d | LANG_NO_FLAG | LANG: %s", i, lang)
         else:
             logging.debug("STREAM_ID: %d | LANG_MISS | PARSE: %s...", i, parse_string[:100])
         # Quality tier matching from patterns
@@ -274,6 +283,7 @@ def streams(media_type, media_id):
             size_num = float(size_match.group(1))
             unit = size_match.group(2).lower()
             size = int(size_num * (1024**3 if unit == 'gb' else 1024**2))
+        logging.debug("SORT_KEY | ID: %d | COMPONENTS: cached=%d complete=%d res=%d tier=%d size=-%d", i, cached_priority, complete_priority, res_priority, tier_priority, size)
         return (cached_priority, complete_priority, res_priority, tier_priority, -size)  # General sort with size
     
     start_time = time.time()
@@ -287,6 +297,9 @@ def streams(media_type, media_id):
         name = s.get('name', '')
         description = s.get('description', '')
         parse_string = (name + ' ' + description).lower().encode('utf-8').decode('unicode_escape')
+        if 'cannot_apply_modifier_to_null' in parse_string:
+            logging.warning("STREAM_ID: %d | TEMPLATE_UNRESOLVED | FALLBACK_TO_DESC", i)
+            parse_string = description.lower() + ' ' + str(hints)  # Fallback
         service_match = re.search(r'(rd|tb|ad|store)', parse_string, re.I)
         if service_match:
             service = service_match.group(1).lower()
@@ -294,12 +307,14 @@ def streams(media_type, media_id):
         if re.search(r'[\uac00-\ud7a3]', parse_string):
             name += ' 🇰🇷'
             logging.debug("STREAM_ID: %d | SCRIPT_FLAG_HANGUL", i)
-        lang_match = re.search(r'(jpn|jp|ita|it|fra|fr|kor|korean|kr|chn|cn|ger|de|hun|yes|ko)', parse_string, re.I)
+        lang_match = re.search(r'(eng|en|jpn|jp|ita|it|fra|fr|kor|korean|kr|chn|cn|ger|de|hun|yes|ko)', parse_string, re.I)
+        flags_added = []  # Track for log
         if lang_match:
             lang = lang_match.group(1).lower()
             flag = LANGUAGE_FLAGS.get(lang, '')
             if flag:
                 name += f' {flag}'
+                flags_added.append(flag)
             else:
                 logging.debug("STREAM_ID: %d | LANG_NO_FLAG | LANG: %s", i, lang)
         else:
@@ -315,6 +330,7 @@ def streams(media_type, media_id):
         size_str = f"{size / (1024**3):.1f} GB" if size > 0 else '? GB'
         name = f"{res} {cached_icon} {quality} {size_str} · {name}"
         s['name'] = name
+        logging.info("STREAM_ID: %d | FINAL_NAME: %s | FLAGS_ADDED: %s", i, name, flags_added)
     
     time_ms = int((time.time() - start_time) * 1000)
     log_summary("Formatter", "SUCCESS", len(filtered), "Transformed streams", time_ms)
@@ -326,6 +342,7 @@ def streams(media_type, media_id):
     log_summary("Proxy", "SUCCESS", proxied, "Generated proxied URLs", time_ms)
     
     logging.info("CORE | Returning %d streams", min(60, len(filtered)))
+    logging.info("FINAL_STATS | Total Raw: %d | Filtered Out: %d | Kept: %d | Proxied: %d", total_raw, filtered_out, kept, proxied)
     return jsonify({'streams': filtered[:60]})
 
 if __name__ == '__main__':
