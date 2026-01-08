@@ -4,6 +4,7 @@ import os
 import logging
 import re
 import json
+import unicodedata
 from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -45,7 +46,7 @@ SERVICE_COLORS = {
 def manifest():
     return jsonify({
         "id": "org.grok.wrapper",
-        "version": "1.0.20",  # Bump for debug + smart ping
+        "version": "1.0.22",  # Bump for unicode normalization + enhanced debug
         "name": "Grok AIO Wrapper",
         "description": "Wraps AIOStreams to filter and format streams (Store optional)",
         "resources": ["stream"],
@@ -99,8 +100,8 @@ def streams(media_type, media_id):
             logging.debug(f"  URL: {url}")
             logging.debug(f"  Description: {description}")
             logging.debug(f"  Full raw dict: {json.dumps(s, indent=2)}")
-            qual_match = re.search(r'(Web-dl|Webrip|Bluray|Hdrip|Tc|Ts|Cam|Dvdrip|Hdtv)', name + ' ' + description, re.I)
-            res_match = re.search(r'(4k|2160p|1440p|1080p|720p)', name + ' ' + description, re.I)
+            qual_match = re.search(r'(Web-dl|Webrip|Bluray|Hdrip|Tc|Ts|Cam|Dvdrip|Hdtv)', name + ' ' + description, re.I | re.U)
+            res_match = re.search(r'(4k|2160p|1440p|1080p|720p)', name + ' ' + description, re.I | re.U)
             quality = qual_match.group(1).title() if qual_match else 'Unknown'
             res = res_match.group(1).upper() if res_match else '⍰'
             fallback_name = f"{res} {quality}"
@@ -120,12 +121,16 @@ def streams(media_type, media_id):
         name = s.get('name', '').replace('\n', ' ')
         description = s.get('description', '').replace('\n', ' ')
         parse_string = (name + ' ' + description).lower()
+        normalized_parse = unicodedata.normalize('NFKD', parse_string).encode('ascii', 'ignore').decode('utf-8')
+        if normalized_parse != parse_string:
+            logging.debug(f"Unicode normalized for stream {i}: original='{parse_string[:100]}...' -> normalized='{normalized_parse[:100]}...'")
+        parse_string = normalized_parse  # Use normalized for matching
         is_cached = hints.get('isCached', False)
-        seed_match = re.search(r'👥 (\d+)|(\d+)\s*seed|⇋ (\d+)𖧧|(\d+)𖧧', parse_string, re.I)
+        seed_match = re.search(r'👥 (\d+)|(\d+)\s*seed|⇋ (\d+)𖧧|(\d+)𖧧', parse_string, re.I | re.U)
         seeders = int(seed_match.group(1) or seed_match.group(2) or seed_match.group(3) or seed_match.group(4) or 0) if seed_match else 0
         if not seed_match:
-            logging.debug(f"Seeders match failed for stream {i}: parse_string={parse_string[:100]}...")
-        size_match = re.search(r'(\d+\.?\d*)\s*(gb|mb)', parse_string, re.I)
+            logging.debug(f"Seeders match failed for stream {i}: pattern=r'👥 (\d+)|(\d+)\s*seed|⇋ (\d+)𖧧|(\d+)𖧧', parse_string={parse_string[:100]}...")
+        size_match = re.search(r'(\d+\.?\d*)\s*(gb|mb)', parse_string, re.I | re.U)
         size = 0
         if size_match:
             size_num = float(size_match.group(1))
@@ -160,21 +165,25 @@ def streams(media_type, media_id):
         name = s.get('name', '').replace('\n', ' ')
         description = s.get('description', '').replace('\n', ' ')
         name_lower = (name + ' ' + description).lower()
+        normalized_lower = unicodedata.normalize('NFKD', name_lower).encode('ascii', 'ignore').decode('utf-8')
+        if normalized_lower != name_lower:
+            logging.debug(f"Unicode normalized for sort key of '{name}': original='{name_lower[:100]}...' -> normalized='{normalized_lower[:100]}...'")
+        name_lower = normalized_lower
         hints = s.get('behaviorHints', {})
         res_priority = {'4k': 0, '2160p': 0, '1440p': 1, '1080p': 2, '720p': 3}.get(next((r for r in ['4k', '2160p', '1440p', '1080p', '720p'] if r in name_lower), ''), 4)
         if res_priority == 4:
-            logging.debug(f"Res match failed for stream {s.get('url', 'unknown')}: name_lower={name_lower[:100]}... - using default 4")
+            logging.debug(f"Res match failed for stream {s.get('url', 'unknown')}: pattern=r'(4k|2160p|1440p|1080p|720p)', name_lower={name_lower[:100]}... - using default 4")
         quality_priority = {'remux': 0, 'bluray': 1, 'web-dl': 2, 'webrip': 3}.get(next((q for q in ['remux', 'bluray', 'web-dl', 'webrip'] if q in name_lower), ''), 4)
         if quality_priority == 4:
-            logging.debug(f"Quality match failed for stream {s.get('url', 'unknown')}: name_lower={name_lower[:100]}... - using default 4")
+            logging.debug(f"Quality match failed for stream {s.get('url', 'unknown')}: pattern=r'(remux|bluray|web-dl|webrip)', name_lower={name_lower[:100]}... - using default 4")
         source_priority = 0 if 'store' in name_lower or 'stremthru' in name_lower else (1 if 'rd' in name_lower or 'realdebrid' in name_lower else (2 if 'tb' in name_lower or 'torbox' in name_lower else (3 if 'ad' in name_lower or 'alldebrid' in name_lower else 4)))
-        size_match = re.search(r'(\d+\.?\d*)\s*(gb|mb)', name_lower, re.I)
+        size_match = re.search(r'(\d+\.?\d*)\s*(gb|mb)', name_lower, re.I | re.U)
         size_num = float(size_match.group(1)) if size_match else (hints.get('videoSize', 0) / 10**9)
-        seed_match = re.search(r'👥 (\d+)|(\d+)\s*seed|⇋ (\d+)𖧧|(\d+)𖧧', name_lower, re.I)
+        seed_match = re.search(r'👥 (\d+)|(\d+)\s*seed|⇋ (\d+)𖧧|(\d+)𖧧', name_lower, re.I | re.U)
         seeders = int(seed_match.group(1) or seed_match.group(2) or seed_match.group(3) or seed_match.group(4) or 0) if seed_match else 0
         seadex_priority = 0 if 'seadex' in name_lower or 'ʙᴇsᴛ ʀᴇʟᴇᴀsᴇ' in name_lower else 1
         key = (seadex_priority, res_priority, quality_priority, source_priority, -size_num, -seeders)
-        logging.debug(f"Sort key for '{name}': {key} (res={res_priority}, qual={quality_priority}, src={source_priority}, size={size_num}, seeds={seeders}) - from parse_string: {parse_string[:100]}...")
+        logging.debug(f"Sort key for '{name}': {key} (res={res_priority}, qual={quality_priority}, src={source_priority}, size={size_num}, seeds={seeders}) - from name_lower: {name_lower[:100]}...")
         return key
     filtered.sort(key=sort_key)
     logging.info(f"Sorted filtered streams (first 5): {[(f.get('name', 'NO NAME'), sort_key(f)) for f in filtered[:5]]}")
@@ -184,6 +193,10 @@ def streams(media_type, media_id):
         name = s.get('name', '').replace('\n', ' ')
         description = s.get('description', '').replace('\n', ' ')
         parse_string = (name + ' ' + description).lower()
+        normalized_parse = unicodedata.normalize('NFKD', parse_string).encode('ascii', 'ignore').decode('utf-8')
+        if normalized_parse != parse_string:
+            logging.debug(f"Unicode normalized for formatting stream {i}: original='{parse_string[:100]}...' -> normalized='{normalized_parse[:100]}...'")
+        parse_string = normalized_parse
         hints = s.get('behaviorHints', {})
         # Service coloring
         service = next((k for k in SERVICE_COLORS if k in parse_string), '')
@@ -191,15 +204,15 @@ def streams(media_type, media_id):
             name = f"{SERVICE_COLORS[service]}{name}[/]"
             logging.debug(f"Applied color for service {service} in stream {i}")
         else:
-            logging.debug(f"No service match for coloring in stream {i}: parse_string={parse_string[:100]}...")
+            logging.debug(f"No service match for coloring in stream {i}: pattern=SERVICE_COLORS keys, parse_string={parse_string[:100]}...")
         # Auto-lang
-        if re.search(r'[\uac00-\ud7a3]', parse_string):
+        if re.search(r'[\uac00-\ud7a3]', parse_string, re.U):
             name += ' 🇰🇷'
             logging.debug(f"Added KR flag for stream {i} via Hangul detection")
-        elif re.search(r'[\u3040-\u30ff\u4e00-\u9faf]', parse_string):
+        elif re.search(r'[\u3040-\u30ff\u4e00-\u9faf]', parse_string, re.U):
             name += ' 🇯🇵'
             logging.debug(f"Added JP flag for stream {i} via Kanji detection")
-        lang_match = re.search(r'([a-z]{2,3}(?:,\s*[a-z]{2,3})*)', parse_string)
+        lang_match = re.search(r'([a-z]{2,3}(?:,\s*[a-z]{2,3})*)', parse_string, re.I | re.U)
         if lang_match:
             langs = [l.strip() for l in lang_match.group(1).split(',')]
             flags_added = set(LANGUAGE_FLAGS.get(lang, '') for lang in langs if lang in LANGUAGE_FLAGS)
@@ -209,17 +222,17 @@ def streams(media_type, media_id):
             else:
                 logging.debug(f"Lang match but no known flags for stream {i}: {lang_match.group(0)}")
         else:
-            logging.debug(f"No lang pattern match for stream {i}: parse_string={parse_string[:100]}...")
+            logging.debug(f"No lang pattern match for stream {i}: pattern=r'([a-z]{2,3}(?:,\s*[a-z]{2,3})*)', parse_string={parse_string[:100]}...")
         # Audio from desc
-        audio_match = re.search(r'(dd\+|dd|aac|atmos|5\.1|2\.0)', parse_string, re.I)
+        audio_match = re.search(r'(dd\+|dd|aac|atmos|5\.1|2\.0)', parse_string, re.I | re.U)
         if audio_match:
             audio = audio_match.group(1).upper()
             name += f" ♬ {audio}"
             logging.debug(f"Added audio attribute {audio} for stream {i} from match: {audio_match.group(0)}")
         else:
-            logging.debug(f"No audio match for stream {i}: parse_string={parse_string[:100]}...")
+            logging.debug(f"No audio match for stream {i}: pattern=r'(dd\+|dd|aac|atmos|5\.1|2\.0)', parse_string={parse_string[:100]}...")
         name += ' 🇬🇧'  # Test
-        if 'store' in name.lower() or '4k' in name.lower() or 'stremthru' in name.lower():
+        if 'store' in parse_string or '4k' in parse_string or 'stremthru' in parse_string:
             name = f"★ {name}"
         if '⏳' in name or not hints.get('isCached', False):
             s['name'] = f"[dim]{name} (Unverified)[/dim]"
