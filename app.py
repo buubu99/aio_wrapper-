@@ -68,7 +68,7 @@ LANGUAGE_TEXT_FALLBACK = {
 def manifest():
     return jsonify({
         "id": "org.grok.wrapper",
-        "version": "1.0.10",  # Bump for enhanced parsing
+        "version": "1.0.12",  # Bump for enhanced input debugging
         "name": "Grok AIO Wrapper",
         "description": "Wraps AIOStreams to filter and format streams (Store optional)",
         "resources": ["stream"],
@@ -82,14 +82,17 @@ def health():
 @app.route('/stream/<media_type>/<media_id>.json')
 def streams(media_type, media_id):
     all_streams = []
+    blank_count = 0  # Track blank names
     try:
         aio_url = f"{AIO_BASE}/stream/{media_type}/{media_id}.json"
         aio_response = session.get(aio_url, timeout=REQUEST_TIMEOUT)
         aio_response.raise_for_status()
-        aio_streams = aio_response.json().get('streams', [])
+        aio_data = aio_response.json()
+        aio_streams = aio_data.get('streams', [])
+        logging.debug(f"Full raw AIO response: {json.dumps(aio_data, indent=2)}")  # Log entire raw response
         all_streams += aio_streams
         logging.info(f"AIO fetch success: {len(aio_streams)} streams")
-        logging.debug(f"Raw AIO response keys: {list(aio_response.json().keys())}")
+        logging.debug(f"Raw AIO response keys: {list(aio_data.keys())}")
     except Exception as e:
         logging.error(f"AIO fetch error: {e}")
     if USE_STORE:
@@ -97,12 +100,28 @@ def streams(media_type, media_id):
             store_url = f"{STORE_BASE}/stream/{media_type}/{media_id}.json"
             store_response = session.get(store_url, timeout=REQUEST_TIMEOUT)
             store_response.raise_for_status()
-            store_streams = store_response.json().get('streams', [])
+            store_data = store_response.json()
+            store_streams = store_data.get('streams', [])
+            logging.debug(f"Full raw Store response: {json.dumps(store_data, indent=2)}")  # Log entire raw response
             all_streams += store_streams
             logging.info(f"Store fetch success: {len(store_streams)} streams")
-            logging.debug(f"Raw Store response keys: {list(store_response.json().keys())}")
+            logging.debug(f"Raw Store response keys: {list(store_data.keys())}")
         except Exception as e:
             logging.error(f"Store fetch error: {e}")
+    # Enhanced debug: Log summary of all received streams
+    logging.info(f"Total received streams: {len(all_streams)}")
+    for i, s in enumerate(all_streams):
+        name = s.get('name', '')
+        if not name:
+            blank_count += 1
+            logging.warning(f"Blank name detected in stream {i}: Full raw dict = {json.dumps(s, indent=2)}")
+            # Log all keys/values for blank ones
+            logging.debug(f"Keys in blank stream {i}: {list(s.keys())}")
+            for key, value in s.items():
+                logging.debug(f"  {key}: {value}")
+        else:
+            logging.debug(f"Stream {i} has name: '{name}'")
+    logging.info(f"Total blank name streams: {blank_count}/{len(all_streams)}")
     # Filter: Keep all, but dim uncached; filter on seeders/size
     filtered = []
     for i, s in enumerate(all_streams):
@@ -137,6 +156,8 @@ def streams(media_type, media_id):
             else:
                 logging.debug(f"Size pattern match failed and no videoSize for stream {i}: {name}")
         logging.debug(f"Parsed seeders/size for stream {i} '{name}': seeders={seeders}, size={size}")
+        if is_cached and size == 0:
+            logging.warning(f"Potential misflagged cached stream {i}: isCached=True but size=0 - '{name}'")
         if seeders >= MIN_SEEDERS and MIN_SIZE_BYTES <= size <= MAX_SIZE_BYTES:
             filtered.append(s)
             logging.debug(f"Kept stream {i}: {name} (meets criteria)")
