@@ -42,6 +42,7 @@ LANGUAGE_FLAGS = {
     'uk': '🇬🇧',
     'ger': '🇩🇪',
     'de': '🇩🇪',
+    'hun': '🇭🇺',  # Added for HUN
     'yes': '📝'  # For subtitle indicators
 }
 LANGUAGE_TEXT_FALLBACK = {
@@ -60,13 +61,14 @@ LANGUAGE_TEXT_FALLBACK = {
     'uk': '[GB]',
     'ger': '[DE]',
     'de': '[DE]',
+    'hun': '[HU]',
     'yes': '[SUB]'
 }
 @app.route('/manifest.json')
 def manifest():
     return jsonify({
         "id": "org.grok.wrapper",
-        "version": "1.0.8",  # Bump for logging focus
+        "version": "1.0.10",  # Bump for enhanced parsing
         "name": "Grok AIO Wrapper",
         "description": "Wraps AIOStreams to filter and format streams (Store optional)",
         "resources": ["stream"],
@@ -101,66 +103,73 @@ def streams(media_type, media_id):
             logging.debug(f"Raw Store response keys: {list(store_response.json().keys())}")
         except Exception as e:
             logging.error(f"Store fetch error: {e}")
-    # Filter: Stricter - skip if ⏳ or uncached
+    # Filter: Keep all, but dim uncached; filter on seeders/size
     filtered = []
     for i, s in enumerate(all_streams):
         hints = s.get('behaviorHints', {})
-        title = s.get('title', '').replace('\n', ' ')  # Normalize multi-line
-        if '\n' in s.get('title', ''):  # Flag multi-line issue
-            logging.debug(f"Multi-line title detected in stream {i}: {s.get('title', 'NO TITLE')}")
-        title_lower = title.lower()
+        name = s.get('name', '').replace('\n', ' ')
+        description = s.get('description', '').replace('\n', ' ')
+        if '\n' in s.get('name', ''):  # Flag multi-line issue
+            logging.debug(f"Multi-line name detected in stream {i}: {s.get('name', 'NO NAME')}")
+        parse_string = (name + ' ' + description).lower()
+        name_lower = name.lower()
         is_cached = hints.get('isCached', False)
-        if not title:  # Log full raw stream if no title
-            logging.debug(f"Stream {i} received with NO TITLE: raw dict = {json.dumps(s)}")
-        logging.debug(f"Stream {i} title: {title if title else 'NO TITLE'}, isCached: {is_cached}")
-        if '⏳' in title_lower or not is_cached:
-            logging.debug(f"Skipped stream {i}: {title if title else 'NO TITLE'} (uncached or ⏳)")
-            continue
-        # Parse seeders
-        seed_match = re.search(r'👥 (\d+)|(\d+)\s*seed', title_lower, re.I)
-        seeders = int(seed_match.group(1) or seed_match.group(2)) if seed_match else 0
+        if not name:  # Log full raw stream if no name
+            logging.debug(f"Stream {i} received with NO NAME: raw dict = {json.dumps(s)}")
+        logging.debug(f"Stream {i} name: {name if name else 'NO NAME'}, isCached: {is_cached}")
+        # Parse seeders with extended pattern
+        seed_match = re.search(r'👥 (\d+)|(\d+)\s*seed|⇋ (\d+)𖧧|(\d+)𖧧', parse_string, re.I)
+        seeders = int(seed_match.group(1) or seed_match.group(2) or seed_match.group(3) or seed_match.group(4) or 0) if seed_match else 0
         if not seed_match:
-            logging.debug(f"Seeders pattern match failed for stream {i}: {title}")
-        # Parse size (handles no space)
-        size_match = re.search(r'(\d+\.?\d*)(gb|mb)', title_lower, re.I)
+            logging.debug(f"Seeders pattern match failed for stream {i}: {name}")
+        # Parse size
+        size_match = re.search(r'(\d+\.?\d*)\s*(gb|mb)', parse_string, re.I)
         size = 0
         if size_match:
             size_num = float(size_match.group(1))
             unit = size_match.group(2).lower()
-            size = size_num * (10**9 if unit == 'gb' else 10**6)
-        else:
-            logging.debug(f"Size pattern match failed for stream {i}: {title}")
-        logging.debug(f"Parsed seeders/size for stream {i} '{title}': seeders={seeders}, size={size}")
+            size = int(size_num * (10**9 if unit == 'gb' else 10**6))
+            logging.debug(f"Size parsed from string for stream {i}: {size}")
+        if size == 0:
+            size = hints.get('videoSize', 0)
+            if size > 0:
+                logging.debug(f"Used videoSize for stream {i}: {size}")
+            else:
+                logging.debug(f"Size pattern match failed and no videoSize for stream {i}: {name}")
+        logging.debug(f"Parsed seeders/size for stream {i} '{name}': seeders={seeders}, size={size}")
         if seeders >= MIN_SEEDERS and MIN_SIZE_BYTES <= size <= MAX_SIZE_BYTES:
             filtered.append(s)
-            logging.debug(f"Kept stream {i}: {title} (cached, meets criteria)")
+            logging.debug(f"Kept stream {i}: {name} (meets criteria)")
         else:
-            logging.debug(f"Skipped stream {i}: {title} (low seeders/size)")
+            logging.debug(f"Skipped stream {i}: {name} (low seeders/size)")
     # Sort: Res > Quality > Provider > Size desc > Seeders desc
     def sort_key(s):
-        title = s.get('title', '').replace('\n', ' ')
-        title_lower = title.lower()
+        name = s.get('name', '').replace('\n', ' ')
+        description = s.get('description', '').replace('\n', ' ')
+        name_lower = (name + ' ' + description).lower()
         hints = s.get('behaviorHints', {})
-        res_priority = {'4k': 0, '2160p': 0, '1080p': 1, '720p': 2}.get(next((r for r in ['4k', '2160p', '1080p', '720p'] if r in title_lower), ''), 3)
-        quality_priority = {'remux': 0, 'bluray': 1, 'web-dl': 2, 'webrip': 3}.get(next((q for q in ['remux', 'bluray', 'web-dl', 'webrip'] if q in title_lower), ''), 4)
-        source_priority = 0 if 'store' in title_lower or 'stremthru' in title_lower else (1 if 'rd' in title_lower or 'realdebrid' in title_lower else (2 if 'tb' in title_lower or 'torbox' in title_lower else (3 if 'ad' in title_lower or 'alldebrid' in title_lower else 4)))
-        size_match = re.search(r'(\d+\.?\d*)(gb|mb)', title_lower, re.I)
-        size_num = float(size_match.group(1)) if size_match else 0
-        seed_match = re.search(r'👥 (\d+)|(\d+)\s*seed', title_lower, re.I)
-        seeders = int(seed_match.group(1) or seed_match.group(2)) if seed_match else 0
+        res_priority = {'4k': 0, '2160p': 0, '1440p': 1, '1080p': 2, '720p': 3}.get(next((r for r in ['4k', '2160p', '1440p', '1080p', '720p'] if r in name_lower), ''), 4)
+        quality_priority = {'remux': 0, 'bluray': 1, 'web-dl': 2, 'webrip': 3}.get(next((q for q in ['remux', 'bluray', 'web-dl', 'webrip'] if q in name_lower), ''), 4)
+        source_priority = 0 if 'store' in name_lower or 'stremthru' in name_lower else (1 if 'rd' in name_lower or 'realdebrid' in name_lower else (2 if 'tb' in name_lower or 'torbox' in name_lower else (3 if 'ad' in name_lower or 'alldebrid' in name_lower else 4)))
+        size_match = re.search(r'(\d+\.?\d*)\s*(gb|mb)', name_lower, re.I)
+        size_num = float(size_match.group(1)) if size_match else (hints.get('videoSize', 0) / 10**9)
+        seed_match = re.search(r'👥 (\d+)|(\d+)\s*seed|⇋ (\d+)𖧧|(\d+)𖧧', name_lower, re.I)
+        seeders = int(seed_match.group(1) or seed_match.group(2) or seed_match.group(3) or seed_match.group(4) or 0) if seed_match else 0
         key = (res_priority, quality_priority, source_priority, -size_num, -seeders)
-        logging.debug(f"Sort key for '{title}': {key} (res={res_priority}, qual={quality_priority}, src={source_priority}, size={size_num}, seeds={seeders})")
+        logging.debug(f"Sort key for '{name}': {key} (res={res_priority}, qual={quality_priority}, src={source_priority}, size={size_num}, seeds={seeders})")
         return key
     filtered.sort(key=sort_key)
-    logging.info(f"Sorted filtered streams (first 5 titles/keys): {[(f.get('title', 'NO TITLE'), sort_key(f)) for f in filtered[:5]]}")
+    logging.info(f"Sorted filtered streams (first 5 names/keys): {[(f.get('name', 'NO NAME'), sort_key(f)) for f in filtered[:5]]}")
     # Reformat: ★ for Store/4K/StremThru, dim uncached/⏳, parse/replace languages with unique flags
     use_emoji_flags = True  # Set to False for text fallback [GB]
     for i, s in enumerate(filtered):
-        title = s.get('title', '').replace('\n', ' ')
+        name = s.get('name', '').replace('\n', ' ')
+        description = s.get('description', '').replace('\n', ' ')
+        parse_string = (name + ' ' + description).lower()
         hints = s.get('behaviorHints', {})
-        orig_title = title
+        orig_name = name
         # Parse langs at end (handles spaces, e.g., "ita, eng, yes")
-        lang_match = re.search(r'([a-z]{2,3}(?:,\s*[a-z]{2,3})*)$', title.lower())
+        lang_match = re.search(r'([a-z]{2,3}(?:,\s*[a-z]{2,3})*)', parse_string)  # Removed $ to search anywhere
         if lang_match:
             lang_str = lang_match.group(1)
             langs = [l.strip() for l in lang_str.split(',')]
@@ -169,21 +178,21 @@ def streams(media_type, media_id):
             else:
                 flags_added = set(LANGUAGE_TEXT_FALLBACK.get(lang, '') for lang in langs if lang in LANGUAGE_TEXT_FALLBACK)
             if flags_added:
-                title = re.sub(r'([a-z]{2,3}(?:,\s*[a-z]{2,3})*)$', ' ' + ' '.join(flags_added), title, flags=re.I)
-                logging.debug(f"Stream {i} added flags to '{orig_title}': {title} (matched pattern: {lang_match.group(0)})")
+                name += ' ' + ' '.join(flags_added)  # Append instead of replace, since not trailing
+                logging.debug(f"Stream {i} added flags to '{orig_name}': {name} (matched pattern: {lang_match.group(0)})")
             else:
-                logging.debug(f"Stream {i} flag pattern matched but no known langs: '{orig_title}' (pattern: {lang_match.group(0)})")
+                logging.debug(f"Stream {i} flag pattern matched but no known langs: '{orig_name}' (pattern: {lang_match.group(0)})")
         else:
-            logging.debug(f"Stream {i} no lang pattern match in '{orig_title}' (expected trailing langs like 'ita, eng')")
-        title += ' 🇬🇧'  # Temporary test flag
-        logging.debug(f"Stream {i} test flag added: {title}")
-        # Update title
-        if 'store' in title.lower() or '4k' in title.lower() or 'stremthru' in title.lower():
-            title = f"★ {title}"
-        if '⏳' in title or not hints.get('isCached', False):
-            s['title'] = f"[dim]{title} (Unverified)[/dim]"
+            logging.debug(f"Stream {i} no lang pattern match in '{orig_name}' (expected langs like 'ita, eng')")
+        name += ' 🇬🇧'  # Temporary test flag
+        logging.debug(f"Stream {i} test flag added: {name}")
+        # Update name
+        if 'store' in name.lower() or '4k' in name.lower() or 'stremthru' in name.lower():
+            name = f"★ {name}"
+        if '⏳' in name or not hints.get('isCached', False):
+            s['name'] = f"[dim]{name} (Unverified)[/dim]"
         else:
-            s['title'] = title
+            s['name'] = name
     logging.info(f"Final filtered: {len(filtered)}")
     return jsonify({'streams': filtered[:60]})
 if __name__ == '__main__':
