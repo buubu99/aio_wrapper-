@@ -1,19 +1,3 @@
-Based on the three samples ("Running Man" - English/US title, "Ghost Killer" - Japanese, "The Wailing" - Korean), the logs confirm the persistent issues are due to AIOStreams delivering inconsistent data: unrendered SEL templates in names (causing "blank" or bad parsing for res/quality), high ⏳ uncached counts (109-124 excluded, but many misflagged/kept with warnings), unicode in descriptions (e.g., Hangul/Kanji not parsed for lang flags), and failed attribute extraction (e.g., size/seeders from desc if name bad). "Running Man" has the most templates/⏳ (250+ streams, many debrid misflags for 2025 content); "Ghost Killer" shows JP-specific clutter (29 streams, low cached); "The Wailing" has KR unicode in filenames (402 streams, good lang detection potential but missed). Nothing missing—logs capture all; no more granularity needed.
-
-### Improvements in 3 Areas (Tam-Taro & Creative Ideas)
-We'll enhance the wrapper (app.py) to avoid/reduce these without JSON changes, as AIO's SEL can't handle runtime fixes. Tam-Taro (GitHub refs: SEL guides recommend slicing uncached/SeaDex priority; "reduce clutter with fallbacks") inspires limits/priorities; creative additions (e.g., desc parsing) for robustness.
-
-1. **Avoid Uncached**: Logs show 109-124 excluded in AIO, but wrapper gets 250+ with ⏳ (debrid misflags). Solution: Strict skip all ⏳/non-cached (Tam-Taro "conditional exclusion if >5 cached"), keep top 3 uncached sliced by sort_key if <5 cached. No pinging (to avoid delay; logs show AIO timeouts already slow it).
-
-2. **Sorting Correctly**: Failed parses default low (e.g., res=4 if no match). Solution: Parse res/quality/seeders/size from desc/filename if name is template (creative + Tam-Taro filename fallbacks). Boost SeaDex (if 'seadex' in desc).
-
-3. **Add Attributes While Formatting**: Lang missed in KR/JP (unicode in filename/desc). Solution: Auto-detect Hangul (KR)/Kanji (JP) from parse_string (creative, Tam-Taro preferred langs). Append flags/attributes (e.g., ♬ for audio from desc).
-
-GitHub Tam-Taro ref: "SEL-Filtering-and-Sorting" - Used for uncached slice ("slice(uncached,3) per quality"), SeaDex priority, fallback if bad data. No delay added—wrapper processes in ~0.05s (logs show sorter 59ms).
-
-Updated app.py (v1.0.17) implements this. Deploy/test—no pings, quick like Kodi/Umbrella.
-
-```python
 from flask import Flask, request, jsonify
 import requests
 import os
@@ -205,4 +189,3 @@ def streams(media_type, media_id):
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
-```
