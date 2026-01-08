@@ -10,6 +10,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from collections import Counter  # For stats counting
 
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False
@@ -30,17 +31,17 @@ MIN_SEEDERS = int(os.environ.get('MIN_SEEDERS', 0))
 MIN_SIZE_BYTES = int(os.environ.get('MIN_SIZE_BYTES', 500000000))
 MAX_SIZE_BYTES = int(os.environ.get('MAX_SIZE_BYTES', 100000000000))
 REQUEST_TIMEOUT = int(os.environ.get('TIMEOUT', 60000)) / 1000
-MAX_UNCACHED_KEEP = 5
-API_TIMEOUT = 10  # General API timeout in seconds
-POLL_INTERVAL = 2  # Seconds between polls in add-magnet method
-MAX_POLLS = 5  # Max polls before timeout (total ~10s)
-USE_PING_FALLBACK = os.environ.get('USE_PING_FALLBACK', 'false').lower() == 'true'  # Default off
+MAX_UNCACHED_KEEP = 10  # Increased for more verified uncached
+API_TIMEOUT = 10
+POLL_INTERVAL = 2
+MAX_POLLS = 5
+USE_PING_FALLBACK = os.environ.get('USE_PING_FALLBACK', 'false').lower() == 'true'
 PING_TIMEOUT = 2
 
-# API Keys (unchanged)
+# API Keys
 RD_API_KEY = 'Z4C3UT777IK2U6EUZ5HLVVMO7BYQPDNEOJUGAFLUBXMGTSX2Z6RA'
 TB_API_KEY = '1046c773-9d0d-4d53-95ab-8976a559a5f6'
-AD_API_KEY = 'Z2HvUmLsuuRmyHg5Zf5K8'  # New key from screenshot
+AD_API_KEY = 'Z2HvUmLsuuRmyHg5Zf5K8'
 
 LANGUAGE_FLAGS = {
     'eng': '🇬🇧', 'en': '🇬🇧', 'jpn': '🇯🇵', 'jp': '🇯🇵', 'ita': '🇮🇹', 'it': '🇮🇹',
@@ -69,59 +70,41 @@ def debrid_check_cache(url, service='rd'):
     
     if service == 'rd':
         headers = {'Authorization': f'Bearer {RD_API_KEY}'}
-        # First, try instant availability (may be restricted)
-        check_url = f'https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/{torrent_hash}'
-        try:
-            response = session.get(check_url, headers=headers, timeout=API_TIMEOUT)
-            logging.debug(f"RD instant check response status: {response.status_code}, full response: {response.text}")
-            if response.status_code == 200:
-                data = response.json()
-                rd_variants = data.get(torrent_hash.lower(), {}).get('rd', [])
-                if rd_variants and any(variant for variant in rd_variants):
-                    logging.debug(f"RD instant confirmed cached (variants: {len(rd_variants)})")
-                    return True
-                else:
-                    logging.debug(f"RD instant: not cached or no variants")
-            else:
-                logging.warning(f"RD instant failed: {response.status_code} - {response.text}. Falling back to add-magnet method.")
-        except Exception as e:
-            logging.error(f"RD instant error: {e}. Falling back to add-magnet method.")
-        
-        # Fallback to add-magnet-poll-delete
         add_url = 'https://api.real-debrid.com/rest/1.0/torrents/addMagnet'
         data = {'magnet': f'magnet:?xt=urn:btih:{torrent_hash}'}
         try:
             add_response = session.post(add_url, headers=headers, data=data, timeout=API_TIMEOUT)
-            logging.debug(f"RD add-magnet response: {add_response.status_code} - {add_response.text}")
-            if add_response.status_code != 200:
+            logging.debug(f"RD add-magnet response: {add_response.status_code} - full_text={add_response.text}")
+            if add_response.status_code not in [200, 201]:
                 return False
-            torrent_id = add_response.json().get('id')
+            torrent_data = add_response.json()
+            torrent_id = torrent_data.get('id')
             if not torrent_id:
                 return False
             
-            for _ in range(MAX_POLLS):
+            for poll_num in range(1, MAX_POLLS + 1):
                 info_url = f'https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}'
                 info_resp = session.get(info_url, headers=headers, timeout=API_TIMEOUT)
-                logging.debug(f"RD poll info response: {info_resp.status_code} - {info_resp.text}")
+                logging.debug(f"RD poll {poll_num} info response: {info_resp.status_code} - full_text={info_resp.text}")
                 if info_resp.status_code == 200:
                     info = info_resp.json()
                     progress = info.get('progress', 0)
                     status = info.get('status', '')
-                    if progress == 100 or status in ['downloaded', 'magnet_conversion']:
-                        logging.debug(f"RD fallback confirmed cached (progress: {progress}, status: {status})")
+                    if progress == 100 or status in ['downloaded', 'magnet_conversion', 'queued']:  # Added 'queued' for instant cases
+                        logging.debug(f"RD confirmed cached (progress: {progress}, status: {status}) after {poll_num} polls")
                         delete_url = f'https://api.real-debrid.com/rest/1.0/torrents/delete/{torrent_id}'
                         del_resp = session.delete(delete_url, headers=headers)
-                        logging.debug(f"RD delete response: {del_resp.status_code} - {del_resp.text}")
+                        logging.debug(f"RD delete response: {del_resp.status_code} - full_text={del_resp.text}")
                         return True
                 time.sleep(POLL_INTERVAL)
             
-            logging.debug(f"RD fallback timeout after {MAX_POLLS} polls")
+            logging.debug(f"RD timeout after {MAX_POLLS} polls")
             delete_url = f'https://api.real-debrid.com/rest/1.0/torrents/delete/{torrent_id}'
             del_resp = session.delete(delete_url, headers=headers)
-            logging.debug(f"RD delete on timeout: {del_resp.status_code} - {del_resp.text}")
+            logging.debug(f"RD delete on timeout: {del_resp.status_code} - full_text={del_resp.text}")
             return False
         except Exception as e:
-            logging.error(f"RD fallback error: {e}")
+            logging.error(f"RD error: {e}")
             return False
     
     elif service == 'tb':
@@ -129,7 +112,7 @@ def debrid_check_cache(url, service='rd'):
         check_url = f'https://api.torbox.app/v1/api/torrents/checkcache?hash={torrent_hash}'
         try:
             response = session.get(check_url, headers=headers, timeout=API_TIMEOUT)
-            logging.debug(f"TB checkcache response: {response.status_code} - {response.text}")
+            logging.debug(f"TB checkcache response: {response.status_code} - full_text={response.text}")
             if response.status_code == 200:
                 data = response.json()
                 if data.get('data', {}).get('cached', False):
@@ -139,7 +122,7 @@ def debrid_check_cache(url, service='rd'):
                     logging.debug(f"TB: not cached")
                     return False
             else:
-                logging.warning(f"TB check failed: {response.status_code} - {response.text}")
+                logging.warning(f"TB check failed: {response.status_code} - full_text={response.text}")
                 return False
         except Exception as e:
             logging.error(f"TB check error: {e}")
@@ -147,65 +130,46 @@ def debrid_check_cache(url, service='rd'):
     
     elif service == 'ad':
         headers = {'Authorization': f'Bearer {AD_API_KEY}'}
-        # Try instant (may be removed)
-        check_url = 'https://api.alldebrid.com/v4/magnet/instant'
-        params = {'magnets[]': f'magnet:?xt=urn:btih:{torrent_hash}'}
-        try:
-            response = session.get(check_url, headers=headers, params=params, timeout=API_TIMEOUT)
-            logging.debug(f"AD instant response: {response.status_code} - {response.text}")
-            if response.status_code == 200:
-                data = response.json()
-                magnets = data.get('data', {}).get('magnets', [])
-                if magnets and magnets[0].get('instant', False):
-                    logging.debug(f"AD instant confirmed cached")
-                    return True
-                else:
-                    logging.debug(f"AD instant: not cached")
-            else:
-                logging.warning(f"AD instant failed: {response.status_code} - {response.text}. Falling back to add-magnet method.")
-        except Exception as e:
-            logging.error(f"AD instant error: {e}. Falling back to add-magnet method.")
-        
-        # Fallback to add-magnet-poll-delete for AD
         add_url = 'https://api.alldebrid.com/v4/magnet/upload'
         params = {'magnets[]': f'magnet:?xt=urn:btih:{torrent_hash}'}
         try:
             add_response = session.get(add_url, headers=headers, params=params, timeout=API_TIMEOUT)
-            logging.debug(f"AD add-magnet response: {add_response.status_code} - {add_response.text}")
+            logging.debug(f"AD add-magnet response: {add_response.status_code} - full_text={add_response.text}")
             if add_response.status_code != 200:
                 return False
-            magnets = add_response.json().get('data', {}).get('magnets', [])
+            data = add_response.json()
+            magnets = data.get('data', {}).get('magnets', [])
             if not magnets:
                 return False
             torrent_id = magnets[0].get('id')
             if not torrent_id:
                 return False
             
-            for _ in range(MAX_POLLS):
+            for poll_num in range(1, MAX_POLLS + 1):
                 status_url = 'https://api.alldebrid.com/v4/magnet/status'
                 params = {'id': torrent_id}
                 status_resp = session.get(status_url, headers=headers, params=params, timeout=API_TIMEOUT)
-                logging.debug(f"AD poll status response: {status_resp.status_code} - {status_resp.text}")
+                logging.debug(f"AD poll {poll_num} status response: {status_resp.status_code} - full_text={status_resp.text}")
                 if status_resp.status_code == 200:
                     info = status_resp.json().get('data', {}).get('magnets', {})
                     status_code = info.get('statusCode')
-                    if status_code == 4:  # 4 = ready
-                        logging.debug(f"AD fallback confirmed cached (statusCode: {status_code})")
+                    if status_code == 4 or status_code == 3:  # 4=ready, 3=downloading but instant for cached
+                        logging.debug(f"AD confirmed cached (statusCode: {status_code}) after {poll_num} polls")
                         delete_url = 'https://api.alldebrid.com/v4/magnet/delete'
                         del_params = {'id': torrent_id}
                         del_resp = session.get(delete_url, headers=headers, params=del_params)
-                        logging.debug(f"AD delete response: {del_resp.status_code} - {del_resp.text}")
+                        logging.debug(f"AD delete response: {del_resp.status_code} - full_text={del_resp.text}")
                         return True
                 time.sleep(POLL_INTERVAL)
             
-            logging.debug(f"AD fallback timeout after {MAX_POLLS} polls")
+            logging.debug(f"AD timeout after {MAX_POLLS} polls")
             delete_url = 'https://api.alldebrid.com/v4/magnet/delete'
             del_params = {'id': torrent_id}
             del_resp = session.get(delete_url, headers=headers, params=del_params)
-            logging.debug(f"AD delete on timeout: {del_resp.status_code} - {del_resp.text}")
+            logging.debug(f"AD delete on timeout: {del_resp.status_code} - full_text={del_resp.text}")
             return False
         except Exception as e:
-            logging.error(f"AD fallback error: {e}")
+            logging.error(f"AD error: {e}")
             return False
     
     return False
@@ -214,7 +178,7 @@ def debrid_check_cache(url, service='rd'):
 def manifest():
     return jsonify({
         "id": "org.grok.wrapper",
-        "version": "1.0.27",  # Updated version
+        "version": "1.0.29",  # Updated version
         "name": "Grok AIO Wrapper",
         "description": "Wraps AIOStreams to filter and format streams (Store optional)",
         "resources": ["stream"],
@@ -260,7 +224,8 @@ def streams(media_type, media_id):
         except Exception as e:
             logging.error(f"Store fetch error: {e}")
     
-    logging.info(f"Total received streams: {len(all_streams)}")
+    total_input_streams = len(all_streams)
+    logging.info(f"Total received streams (input from AIO/Store): {total_input_streams}")
     logging.debug(f"All raw streams before processing: {json.dumps(all_streams, indent=2)}")
     
     for i, s in enumerate(all_streams):
@@ -292,17 +257,21 @@ def streams(media_type, media_id):
             uncached_count += 1
             logging.debug(f"Uncached (⏳) detected in stream {i} ({source}): {name}")
     
-    logging.info(f"Template streams: {template_count}/{len(all_streams)} | Uncached (⏳) streams: {uncached_count}/{len(all_streams)}")
+    logging.info(f"Template streams: {template_count}/{total_input_streams} | Uncached (⏳) streams: {uncached_count}/{total_input_streams}")
     
     filtered = []
     uncached_filtered = []
+    excluded_uncached = 0
+    excluded_seeders = 0
+    excluded_size = 0
     logging.debug("Starting filtering process")
     
     for i, s in enumerate(all_streams):
         hints = s.get('behaviorHints', {})
         name = s.get('name', '').replace('\n', ' ')
         description = s.get('description', '').replace('\n', ' ')
-        parse_string = (name + ' ' + description).lower()
+        filename = hints.get('filename', '')
+        parse_string = (name + ' ' + description + ' ' + filename).lower()
         normalized_parse = unicodedata.normalize('NFKD', parse_string).encode('ascii', 'ignore').decode('utf-8')
         if normalized_parse != parse_string:
             logging.debug(f"Unicode normalized for stream {i}: original='{parse_string[:100]}...' -> normalized='{normalized_parse[:100]}...'")
@@ -326,24 +295,37 @@ def streams(media_type, media_id):
         if is_cached and size == 0:
             logging.warning(f"Potential misflagged cached stream {i}: isCached=True but size=0 - '{name}'")
         
-        if seeders >= MIN_SEEDERS and MIN_SIZE_BYTES <= size <= MAX_SIZE_BYTES:
+        kept = True
+        if not is_cached:
+            excluded_uncached += 1
+            kept = False
+        if seeders < MIN_SEEDERS:
+            excluded_seeders += 1
+            kept = False
+        if not (MIN_SIZE_BYTES <= size <= MAX_SIZE_BYTES):
+            excluded_size += 1
+            kept = False
+        
+        if kept:
             if is_cached:
                 filtered.append(s)
             else:
                 uncached_filtered.append(s)
-        logging.debug(f"Stream {i} after criteria check: kept={seeders >= MIN_SEEDERS and MIN_SIZE_BYTES <= size <= MAX_SIZE_BYTES}, is_cached={is_cached}, seeders={seeders}, size={size}")
+        logging.debug(f"Stream {i} after criteria check: kept={kept}, is_cached={is_cached}, seeders={seeders}, size={size}")
     
+    logging.info(f"Filter stats: Excluded uncached={excluded_uncached}, Excluded low seeders={excluded_seeders}, Excluded size out of range={excluded_size}")
     logging.debug(f"Filtered cached: {len(filtered)}, Uncached to verify: {len(uncached_filtered)}")
     
-    uncached_filtered.sort(key=lambda s: sort_key(s))  # Sort uncached before verifying
+    uncached_filtered.sort(key=lambda s: sort_key(s))
     verified_uncached = []
     for us in uncached_filtered[:50]:
         url = us.get('url', '')
-        # Cycle services: RD (with fallback), TB, AD (with fallback)
         for serv in ['rd', 'tb', 'ad']:
             if debrid_check_cache(url, serv):
+                us['behaviorHints']['isCached'] = True
+                us['name'] = us['name'].replace('⏳', '').strip()
                 verified_uncached.append(us)
-                logging.debug(f"API verified cached via {serv} (overriding upstream flag) for stream: {us.get('name', 'NO NAME')} - URL: {url}")
+                logging.debug(f"API verified cached via {serv} (marked as cached, removed ⏳) for stream: {us.get('name', 'NO NAME')} - URL: {url}")
                 break
         else:
             if USE_PING_FALLBACK:
@@ -351,8 +333,10 @@ def streams(media_type, media_id):
                     head = session.head(url, timeout=PING_TIMEOUT)
                     logging.debug(f"Ping response: {head.status_code} - Headers: {head.headers}")
                     if head.status_code == 200:
+                        us['behaviorHints']['isCached'] = True
+                        us['name'] = us['name'].replace('⏳', '').strip()
                         verified_uncached.append(us)
-                        logging.debug(f"Fallback ping success for {url}")
+                        logging.debug(f"Fallback ping success (marked as cached, removed ⏳) for {url}")
                     else:
                         logging.debug(f"Fallback ping failed: status {head.status_code} for {url}")
                 except Exception as e:
@@ -360,8 +344,24 @@ def streams(media_type, media_id):
             else:
                 logging.debug(f"Skipped uncached stream (no API cache, ping disabled): {us.get('name', 'NO NAME')} - URL: {url}")
     
-    filtered += verified_uncached[:MAX_UNCACHED_KEEP]
-    logging.debug(f"After adding verified uncached: total filtered {len(filtered)}")
+    filtered += verified_uncached
+    total_filtered = len(filtered)
+    logging.debug(f"After adding verified uncached: total filtered {total_filtered}")
+    
+    # Added stats for included res/lang (inspired by Umbrella)
+    res_counter = Counter()
+    lang_counter = Counter()
+    for s in filtered:
+        full_text = (s.get('name', '') + ' ' + s.get('description', '') + ' ' + s.get('behaviorHints', {}).get('filename', '')).lower()
+        res = next((r.lower() for r in ['4k', '2160p', '1440p', '1080p', '720p'] if r.lower() in full_text), 'Unknown')
+        res_counter[res.upper()] += 1
+        langs = re.findall(r'[a-z]{2,3}', full_text, re.I)
+        for lang in langs:
+            if lang.lower() in LANGUAGE_FLAGS:
+                lang_counter[lang.upper()] += 1
+    logging.info(f"Included resolution stats: {dict(res_counter)}")
+    logging.info(f"Included language stats: {dict(lang_counter)}")
+    logging.info(f"Filtered {total_filtered} from {total_input_streams} input streams (performance: {total_filtered / total_input_streams * 100:.2f}% kept)")
     
     def sort_key(s):
         name = s.get('name', '').replace('\n', ' ')
@@ -399,8 +399,8 @@ def streams(media_type, media_id):
         
         completion_priority = 0 if is_cached or 'complete' in name_lower or '100%' in name_lower else 1
         
-        key = (cached_priority, completion_priority, seadex_priority, res_priority, quality_priority, source_priority, lang_priority, -size_num, -seeders)
-        logging.debug(f"Sort key for '{name}': {key} (cached_pri={cached_priority}, complete_pri={completion_priority}, res={res_priority}, qual={quality_priority}, src={source_priority}, lang={lang_priority}, size={size_num}, seeds={seeders}) - from full_text: {full_text}")
+        key = (cached_priority, completion_priority, res_priority, quality_priority, seadex_priority, source_priority, lang_priority, -size_num, -seeders)  # -size higher for desc within groups
+        logging.debug(f"Sort key for '{name}': {key} (cached_pri={cached_priority}, complete_pri={completion_priority}, res={res_priority}, qual={quality_priority}, seadex={seadex_priority}, src={source_priority}, lang={lang_priority}, size={size_num}, seeds={seeders}) - from full_text: {full_text}")
         return key
     
     filtered.sort(key=sort_key)
@@ -411,7 +411,8 @@ def streams(media_type, media_id):
     for i, s in enumerate(filtered):
         name = s.get('name', '').replace('\n', ' ')
         description = s.get('description', '').replace('\n', ' ')
-        parse_string = (name + ' ' + description).lower()
+        filename = s.get('behaviorHints', {}).get('filename', '')
+        parse_string = (name + ' ' + description + ' ' + filename).lower()
         normalized_parse = unicodedata.normalize('NFKD', parse_string).encode('ascii', 'ignore').decode('utf-8')
         if normalized_parse != parse_string:
             logging.debug(f"Unicode normalized for formatting stream {i}: original='{parse_string[:100]}...' -> normalized='{normalized_parse[:100]}...'")
@@ -441,7 +442,7 @@ def streams(media_type, media_id):
                 name += ' ' + ' '.join(flags_added)
                 logging.debug(f"Added flags {flags_added} for stream {i} from match: {lang_match.group(0)}")
             else:
-                logging.debug(f"Lang match but no known flags for stream {i}: {lang_match.group(0)}")
+                logging.debug(f"Lang match but no known flags for stream {i}: {lang_match.group(0)}, full_parse_string={parse_string}")
         else:
             logging.debug(f"No lang pattern match for stream {i}: pattern=r'([a-z]{2,3}(?:[ ·,·-]*[a-z]{2,3})*)', full_parse_string={parse_string}")
         
@@ -458,13 +459,15 @@ def streams(media_type, media_id):
         if 'store' in parse_string or '4k' in parse_string or 'stremthru' in parse_string:
             name = f"★ {name}"
         
-        if '⏳' in name or not hints.get('isCached', False):
+        if not hints.get('isCached', False):
             s['name'] = f"[dim]{name} (Unverified ⏳)[/dim]"
         else:
             s['name'] = name
         logging.debug(f"Formatted stream {i}: final name='{s['name']}'")
     
-    logging.info(f"Final filtered: {len(filtered)}")
+    total_delivered = len(filtered[:60])
+    logging.info(f"Final filtered: {total_filtered}")
+    logging.info(f"Total final streams delivered (top 60): {total_delivered} from {total_input_streams} input (performance: {total_delivered / total_input_streams * 100:.2f}% of input)")
     logging.debug(f"Final streams JSON: {json.dumps({'streams': filtered[:60]}, indent=2)}")
     return jsonify({'streams': filtered[:60]})
 
