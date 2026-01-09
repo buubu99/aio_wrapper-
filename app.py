@@ -10,6 +10,7 @@ from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from collections import defaultdict
+from urllib3.util.retry import Retry
 
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False
