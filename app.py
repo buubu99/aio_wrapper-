@@ -25,8 +25,8 @@ AIO_BASE = os.environ.get('AIO_URL', 'https://buubuu99-aiostreams.elfhosted.cc/s
 STORE_BASE = os.environ.get('STORE_URL', 'https://buubuu99-stremthru.elfhosted.cc/stremio/store/eyJzdG9yZV9uYW1lIjoiIiwic3RvcmVfdG9rZW4iOiJZblYxWW5WMU9UazZUV0Z5YVhOellUazVRREV4Tnc9PSIsImhpZGVfY2F0YWxvZyI6dHJ1ZSwid2ViZGwiOnRydWV9')
 USE_STORE = os.environ.get('USE_STORE', 'false').lower() == 'true'
 
-MIN_SEEDERS = int(os.environ.get('MIN_SEEDERS', 0))
-MIN_SIZE_BYTES = int(os.environ.get('MIN_SIZE_BYTES', 500000000))
+MIN_SEEDERS = int(os.environ.get('MIN_SEEDERS', 10))  # Updated to 10 for stricter filtering
+MIN_SIZE_BYTES = int(os.environ.get('MIN_SIZE_BYTES', 2000000000))  # ~2GB min
 MAX_SIZE_BYTES = int(os.environ.get('MAX_SIZE_BYTES', 100000000000))
 REQUEST_TIMEOUT = int(os.environ.get('TIMEOUT', 60000)) / 1000
 MAX_UNCACHED_KEEP = 5
@@ -39,12 +39,14 @@ AD_API_KEY = 'ZXzHvUmLsuuRmgyHg5zjFsk8'
 LANGUAGE_FLAGS = {
     'eng': '🇬🇧', 'en': '🇬🇧', 'jpn': '🇯🇵', 'jp': '🇯🇵', 'ita': '🇮🇹', 'it': '🇮🇹',
     'fra': '🇫🇷', 'fr': '🇫🇷', 'kor': '🇰🇷', 'kr': '🇰🇷', 'chn': '🇨🇳', 'cn': '🇨🇳',
-    'uk': '🇬🇧', 'ger': '🇩🇪', 'de': '🇩🇪', 'hun': '🇭🇺', 'yes': '📝', 'ko': '🇰🇷'
+    'uk': '🇬🇧', 'ger': '🇩🇪', 'de': '🇩🇪', 'hun': '🇭🇺', 'yes': '📝', 'ko': '🇰🇷',
+    'rus': '🇷🇺', 'hin': '🇮🇳', 'multi': '🌍'  # Added for common langs in screenshots
 }
 LANGUAGE_TEXT_FALLBACK = {
     'eng': '[GB]', 'en': '[GB]', 'jpn': '[JP]', 'jp': '[JP]', 'ita': '[IT]', 'it': '[IT]',
     'fra': '[FR]', 'fr': '[FR]', 'kor': '[KR]', 'kr': '[KR]', 'chn': '[CN]', 'cn': '[CN]',
-    'uk': '[GB]', 'ger': '[DE]', 'de': '[DE]', 'hun': '[HU]', 'yes': '[SUB]', 'ko': '[KR]'
+    'uk': '[GB]', 'ger': '[DE]', 'de': '[DE]', 'hun': '[HU]', 'yes': '[SUB]', 'ko': '[KR]',
+    'rus': '[RU]', 'hin': '[IN]', 'multi': '[MULTI]'
 }
 SERVICE_COLORS = {
     'rd': '[red]', 'realdebrid': '[red]',
@@ -113,6 +115,10 @@ def get_streams(type_, id_):
             logging.info(f"Fetched {len(data_store.get('streams', []))} from Store in {time.time() - start_store:.2f}s")
         except Exception as e:
             logging.error(f"Store fetch failed: {e}")
+    # Added: Log raw data for debugging
+    logging.info(f"Raw streams count from backends: {len(streams)}")
+    if streams:
+        logging.debug(f"Sample raw streams: {json.dumps(streams[:3], indent=2)}")
     return streams
 
 @app.route('/manifest.json')
@@ -223,7 +229,8 @@ def stream(type_, id_):
                 logging.debug(f"Lang match but no known flags for stream {i}: {lang_match.group(0)}")
         else:
             logging.debug(f"No lang pattern match for stream {i}: pattern=r'([a-z]{2,3}(?:[ ·,·-]*[a-z]{2,3})*)', parse_string={parse_string[:100]}...")
-        audio_match = re.search(r'(dd\+|dd|dts-hd|dts|opus|aac|atmos|ma|5\.1|7\.1|2\.0)', parse_string, re.I | re.U)
+        # Updated broader audio regex
+        audio_match = re.search(r'(dd\+|dd|dts-hd|dts|opus|aac|atmos|ma|5\.1|7\.1|2\.0|h\.26[4-5]|hev|dv|hdr)', parse_string, re.I | re.U)
         channel_match = re.search(r'(\d\.\d)', parse_string, re.I | re.U)
         if audio_match:
             audio = audio_match.group(1).upper()
@@ -231,7 +238,7 @@ def stream(type_, id_):
             name += f" ♬ {audio} {channels}".strip()
             logging.debug(f"Added audio attribute {audio} {channels} for stream {i} from match: {audio_match.group(0)}")
         else:
-            logging.debug(f"No audio match for stream {i}: pattern=r'(dd\\+|dd|aac|atmos|5\\.1|2\\.0)', parse_string={parse_string[:100]}...")
+            logging.debug(f"No audio match for stream {i}: pattern=r'(dd\\+|dd|dts-hd|dts|opus|aac|atmos|ma|5\\.1|7\\.1|2\\.0|h\\.26[4-5]|hev|dv|hdr)', parse_string={parse_string[:100]}...")
         if 'store' in parse_string or '4k' in parse_string or 'stremthru' in parse_string:
             name = f"★ {name}"
         if '⏳' in name or not hints.get('isCached', False):
