@@ -23,7 +23,7 @@ session.mount('https://', adapter)
 
 AIO_BASE = os.environ.get('AIO_URL', 'https://buubuu99-aiostreams.elfhosted.cc/stremio/acc199cb-6b12-4fa9-be4e-a8ff4c13fa50/eyJpIjoiRTJES0N1ZFBaWm8wb25aS05tNEFsUT09IiwiZSI6InhrVVFtdTFEWm5lcGVrcEh5VUZaejZlcEJLMEMrcXdLakY4UU9zUDJoOFE9IiwidCI6ImEifQ')
 STORE_BASE = os.environ.get('STORE_URL', 'https://buubuu99-stremthru.elfhosted.cc/stremio/store/eyJzdG9yZV9uYW1lIjoiIiwic3RvcmVfdG9rZW4iOiJZblYxWW5WMU9UazZUV0Z5YVhOellUazVRREV4Tnc9PSIsImhpZGVfY2F0YWxvZyI6dHJ1ZSwid2ViZGwiOnRydWV9')
-USE_STORE = os.environ.get('USE_STORE', 'true').lower() == 'true'
+USE_STORE = os.environ.get('USE_STORE', 'false').lower() == 'true'  # Changed to false based on your clarification
 
 MIN_SEEDERS = int(os.environ.get('MIN_SEEDERS', 0))
 MIN_SIZE_BYTES = int(os.environ.get('MIN_SIZE_BYTES', 500000000))
@@ -58,331 +58,146 @@ def debrid_check_cache(url, service='rd'):
     if not hash_match:
         logging.debug(f"No torrent hash found in URL: {url}")
         return False
-    torrent_hash = hash_match.group(1).upper()
+    torrent_hash = hash_match.group(1).lower()
     if service == 'rd':
+        api_url = f"https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/{torrent_hash}"
         headers = {'Authorization': f'Bearer {RD_API_KEY}'}
-        add_url = 'https://api.real-debrid.com/rest/1.0/torrents/addMagnet'
-        data = {'magnet': f'magnet:?xt=urn:btih:{torrent_hash}'}
-        response = session.post(add_url, headers=headers, data=data)
-        if response.status_code != 200:
-            logging.debug(f"RD add magnet failed: {response.text}")
-            return False
-        torrent_id = response.json().get('id')
-        if not torrent_id:
-            return False
-        start_time = time.time()
-        while time.time() - start_time < API_POLL_TIMEOUT:
-            info_url = f'https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}'
-            info_resp = session.get(info_url, headers=headers)
-            if info_resp.status_code == 200:
-                info = info_resp.json()
-                if info.get('progress') == 100 or 'filename' in info:
-                    logging.debug(f"RD API confirmed cached for hash {torrent_hash}")
-                    delete_url = f'https://api.real-debrid.com/rest/1.0/torrents/delete/{torrent_id}'
-                    session.delete(delete_url, headers=headers)
-                    return True
-            time.sleep(1)
-        delete_url = f'https://api.real-debrid.com/rest/1.0/torrents/delete/{torrent_id}'
-        session.delete(delete_url, headers=headers)
-        logging.debug(f"RD API timeout/not cached for hash {torrent_hash}")
-        return False
     elif service == 'tb':
+        api_url = f"https://api.torbox.app/v1/api/torrents/checkcached?hash={torrent_hash}&list_files=true"
         headers = {'Authorization': f'Bearer {TB_API_KEY}'}
-        add_url = 'https://api.torbox.app/v1/api/torrents/async_create_torrent'
-        data = {'magnet': f'magnet:?xt=urn:btih:{torrent_hash}'}
-        response = session.post(add_url, headers=headers, json=data)
-        if response.status_code != 200:
-            logging.debug(f"TB add failed: {response.text}")
-            return False
-        torrent_id = response.json().get('id')
-        if not torrent_id:
-            return False
-        start_time = time.time()
-        while time.time() - start_time < API_POLL_TIMEOUT:
-            info_url = f'https://api.torbox.app/v1/api/torrents/{torrent_id}'
-            info_resp = session.get(info_url, headers=headers)
-            if info_resp.status_code == 200:
-                info = info_resp.json()
-                if info.get('status') == 'finished':
-                    logging.debug(f"TB API confirmed cached for hash {torrent_hash}")
-                    delete_url = f'https://api.torbox.app/v1/api/torrents/{torrent_id}'
-                    session.delete(delete_url, headers=headers)
-                    return True
-            time.sleep(1)
-        delete_url = f'https://api.torbox.app/v1/api/torrents/{torrent_id}'
-        session.delete(delete_url, headers=headers)
-        logging.debug(f"TB API timeout/not cached for hash {torrent_hash}")
-        return False
     elif service == 'ad':
-        headers = {'Authorization': f'Bearer {AD_API_KEY}'}
-        add_url = 'https://api.alldebrid.com/v4/magnet/upload'
-        params = {'magnets[]': f'magnet:?xt=urn:btih:{torrent_hash}'}
-        response = session.post(add_url, headers=headers, params=params)
-        if response.status_code != 200:
-            logging.debug(f"AD add magnet failed: {response.text}")
-            return False
-        magnets = response.json().get('data', {}).get('magnets', [])
-        if not magnets:
-            return False
-        torrent_id = magnets[0].get('id')
-        if not torrent_id:
-            return False
-        start_time = time.time()
-        while time.time() - start_time < API_POLL_TIMEOUT:
-            info_url = 'https://api.alldebrid.com/v4.1/magnet/status'  # Updated to v4.1
-            params = {'id': torrent_id}
-            info_resp = session.post(info_url, headers=headers, params=params)
-            if info_resp.status_code == 200:
-                info = info_resp.json().get('data', {}).get('magnets', [{}])[0]
-                if info.get('statusCode') == 4:  # 4 = ready/completed
-                    logging.debug(f"AD API confirmed cached for hash {torrent_hash}")
-                    delete_url = 'https://api.alldebrid.com/v4/magnet/delete'
-                    data = {'id': torrent_id}  # Changed to data for POST body
-                    session.post(delete_url, headers=headers, data=data)
-                    return True
-            time.sleep(1)
-        delete_url = 'https://api.alldebrid.com/v4/magnet/delete'
-        data = {'id': torrent_id}  # Changed to data for POST body
-        session.post(delete_url, headers=headers, data=data)
-        logging.debug(f"AD API timeout/not cached for hash {torrent_hash}")
-        return False
-    return False
-
-@app.route('/manifest.json')
-def manifest():
-    return jsonify({
-        "id": "org.grok.wrapper",
-        "version": "1.0.46",  # Updated to 1.0.46
-        "name": "AIO Wrapper",
-        "description": "Wraps AIOStreams to filter and format streams (Store optional)",
-        "resources": ["stream"],
-        "types": ["movie", "series"],
-        "catalogs": [],
-        "idPrefixes": ["tt"]
-    })
-
-@app.route('/health')
-def health():
-    return "OK", 200
-
-@app.route('/stream/<media_type>/<media_id>.json')
-def streams(media_type, media_id):
-    logging.info("Runtime check: Debug level active? %s", logging.getLogger().isEnabledFor(logging.DEBUG))
-    logging.debug(f"Starting stream processing for {media_type}/{media_id}")
-    all_streams = []
-    template_count = 0
-    uncached_count = 0
-    seed_miss_count = 0  # Initialized
-    res_miss_count = 0  # Initialized
-    try:
-        aio_url = f"{AIO_BASE}/stream/{media_type}/{media_id}.json"
-        logging.debug(f"Fetching AIO: {aio_url}")
-        aio_response = session.get(aio_url, timeout=REQUEST_TIMEOUT)
-        aio_response.raise_for_status()
-        aio_data = aio_response.json()
-        aio_streams = aio_data.get('streams', [])
-        logging.debug(f"Full raw AIO response: {json.dumps(aio_data, indent=2)}")
-        all_streams += aio_streams
-        logging.info(f"AIO fetch success: {len(aio_streams)} streams")
-        
-        # New: Data quality check
-        template_ratio = sum(1 for s in aio_streams if re.search(r'\{stream\..*::', s.get('name', ''))) / len(aio_streams) if aio_streams else 0
-        unicode_issues = sum(1 for s in aio_streams if unicodedata.normalize('NFKD', (s.get('name', '') + s.get('description', '')).lower()).encode('ascii', 'ignore').decode('utf-8') != (s.get('name', '') + s.get('description', '')).lower())
-        logging.info(f"AIO data quality: Templates {template_ratio*100:.1f}% | Unicode issues {unicode_issues}/{len(aio_streams)} - if high, expect filter drops/mismatches")
-    except Exception as e:
-        logging.error(f"AIO fetch error: {e}")
-    
-    if USE_STORE:
+        api_url = f"https://api.alldebrid.com/v4/magnet/instant?agent=StremioWrapper&version=1.0&magnet={requests.utils.quote(url)}"
+        params = {'apikey': AD_API_KEY}
         try:
-            store_url = f"{STORE_BASE}/stream/{media_type}/{media_id}.json"
-            logging.debug(f"Fetching Store: {store_url}")
-            store_response = session.get(store_url, timeout=REQUEST_TIMEOUT)
-            store_response.raise_for_status()
-            store_data = store_response.json()
-            store_streams = store_data.get('streams', [])
-            logging.debug(f"Full raw Store response: {json.dumps(store_data, indent=2)}")
-            all_streams += store_streams
-            logging.info(f"Store fetch success: {len(store_streams)} streams")
+            response = session.get(api_url, params=params, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            data = response.json()
+            return data.get('data', {}).get('magnets', {}).get('instant', False)
         except Exception as e:
-            logging.error(f"Store fetch error: {e}")
-    
-    logging.info(f"Total received streams: {len(all_streams)}")
-    logging.debug(f"All raw streams before processing: {json.dumps(all_streams, indent=2)}")
-    
-    for i, s in enumerate(all_streams):
-        name = s.get('name', '')
-        description = s.get('description', '')
-        hints = s.get('behaviorHints', {})
-        source = 'AIO' if i < len(aio_streams) else 'Store'
-        logging.debug(f"Processing stream {i} from {source}: raw dict = {json.dumps(s, indent=2)}")
-        if re.search(r'\{stream\..*::', name) or not name.strip():
-            template_count += 1
-            filename = hints.get('filename', '')
-            url = s.get('url', '')
-            logging.warning(f"Unrendered template detected in stream {i} ({source}): name='{name}'")
-            logging.debug(f" Filename: {filename}")
-            logging.debug(f" URL: {url}")
-            logging.debug(f" Description: {description}")
-            qual_match = re.search(r'(Web-dl|Webrip|Bluray|Bdremux|Remux|Hdrip|Tc|Ts|Cam|Dvdrip|Hdtv)', filename + ' ' + name + ' ' + description, re.I | re.U)
-            res_match = re.search(r'(4k|2160p|1440p|1080p|720p)', filename + ' ' + name + ' ' + description, re.I | re.U)
-            quality = qual_match.group(1).title() if qual_match else 'Unknown'
-            res = res_match.group(1).upper() if res_match else '⍰'
-            fallback_name = f"{res} {quality}"
-            if filename:
-                fallback_name = f"{fallback_name} from {filename.replace('.', ' ').title()}"
-            s['name'] = fallback_name
-            logging.debug(f" Fallback title applied (filename prioritized): {fallback_name}")
-        if '⏳' in name or not hints.get('isCached', False):
-            uncached_count += 1
-            logging.debug(f"Uncached (⏳) detected in stream {i} ({source}): {name}")
-    
-    logging.info(f"Template streams: {template_count}/{len(all_streams)} | Uncached (⏳) streams: {uncached_count}/{len(all_streams)}")
-    
-    filtered = []
-    uncached_filtered = []
-    logging.debug("Starting filtering process")
-    
-    for i, s in enumerate(all_streams):
-        hints = s.get('behaviorHints', {})
-        name = s.get('name', '').replace('\n', ' ')
-        description = s.get('description', '').replace('\n', ' ')
-        parse_string = (name + ' ' + description).lower()
-        normalized_parse = unicodedata.normalize('NFKD', parse_string).encode('ascii', 'ignore').decode('utf-8')
-        if normalized_parse != parse_string:
-            logging.debug(f"Unicode normalized for stream {i}: original='{parse_string[:100]}...' -> normalized='{normalized_parse[:100]}...'")
-        parse_string = normalized_parse
-        is_cached = hints.get('isCached', False)
-        seed_match = re.search(r'(?:👥|seeders?|seeds?|⇋|peers?) ?(\d+)(?:𖧧)?|(\d+)\s*(?:seed|𖧧)', parse_string, re.I | re.U)
-        seeders = int(seed_match.group(1) or seed_match.group(2) or 0) if seed_match else (1 if not is_cached else 0)
-        if not seed_match:
-            logging.debug(f"Seeders match failed for stream {i}: pattern=r'(?:👥|seeders?|seeds?|⇋|peers?) ?(\d+)(?:𖧧)?|(\d+)\s*(?:seed|𖧧)', parse_string={parse_string[:100]}...")
-            seed_miss_count += 1
-        size_match = re.search(r'(\d+\.?\d*)\s*(gb|mb)', parse_string, re.I | re.U)
-        size = 0
-        if size_match:
-            size_num = float(size_match.group(1))
-            unit = size_match.group(2).lower()
-            size = int(size_num * (10**9 if unit == 'gb' else 10**6))
-        if size == 0:
-            size = hints.get('videoSize', 0)
-        if is_cached and size == 0:
-            logging.warning(f"Potential misflagged cached stream {i}: isCached=True but size=0 - '{name}'")
-        if seeders >= MIN_SEEDERS and MIN_SIZE_BYTES <= size <= MAX_SIZE_BYTES:
-            if is_cached:
-                filtered.append(s)
-            else:
-                uncached_filtered.append(s)
-        logging.debug(f"Stream {i} after criteria check: kept={seeders >= MIN_SEEDERS and MIN_SIZE_BYTES <= size <= MAX_SIZE_BYTES}, is_cached={is_cached}, seeders={seeders}, size={size}")
-    
-    # New: Aggregate misses log
-    logging.info(f"Aggregate misses: Seed {seed_miss_count}/{len(all_streams)}, Res {res_miss_count}/{len(all_streams)} - possible bad data if high")
-    
-    logging.debug(f"Filtered cached: {len(filtered)}, Uncached to verify: {len(uncached_filtered)}")
-    
-    # New: Drop reasons (fixed: re-compute per s)
-    drop_reasons = {'low_seed': 0, 'size_out': 0, 'other': 0}
-    for s in all_streams:
-        # Re-compute seeders/size for this s
-        parse_string = (s.get('name', '') + ' ' + s.get('description', '')).lower().replace('\n', ' ')
-        seed_match = re.search(r'(?:👥|seeders?|seeds?|⇋|peers?) ?(\d+)(?:𖧧)?|(\d+)\s*(?:seed|𖧧)', parse_string, re.I | re.U)
-        seeders = int(seed_match.group(1) or seed_match.group(2) or 0) if seed_match else 0
-        size_match = re.search(r'(\d+\.?\d*)\s*(gb|mb)', parse_string, re.I | re.U)
-        size = 0
-        if size_match:
-            size_num = float(size_match.group(1))
-            unit = size_match.group(2).lower()
-            size = int(size_num * (10**9 if unit == 'gb' else 10**6))
-        if size == 0:
-            size = s.get('behaviorHints', {}).get('videoSize', 0)
-        if seeders < MIN_SEEDERS: drop_reasons['low_seed'] += 1
-        elif not MIN_SIZE_BYTES <= size <= MAX_SIZE_BYTES: drop_reasons['size_out'] += 1
-        else: drop_reasons['other'] += 1
-    logging.info(f"Drop stats: Low seed {drop_reasons['low_seed']}, Size out {drop_reasons['size_out']}, Other {drop_reasons['other']} - Total dropped {sum(drop_reasons.values())}")
-    
-    uncached_filtered.sort(key=sort_key)
-    verified_uncached = []
-    for us in uncached_filtered[:10]:
-        url = us.get('url', '')
-        if debrid_check_cache(url, 'rd') or debrid_check_cache(url, 'tb') or debrid_check_cache(url, 'ad'):
-            verified_uncached.append(us)
-        else:
-            try:
-                head = session.head(url, timeout=PING_TIMEOUT)
-                if head.status_code == 200:
-                    verified_uncached.append(us)
-                    logging.debug(f"Fallback ping success for uncached stream {url}")
-                else:
-                    logging.debug(f"Fallback ping failed: status {head.status_code}")
-            except Exception as e:
-                logging.debug(f"Fallback ping error: {e}")
-    filtered += verified_uncached[:MAX_UNCACHED_KEEP]
-    logging.debug(f"After adding verified uncached: total filtered {len(filtered)}")
-    
-    def sort_key(s):
-        global res_miss_count  # Declare global
-        # Existing sort_key code...
-        name = s.get('name', '').replace('\n', ' ')
-        description = s.get('description', '').replace('\n', ' ')
-        name_lower = (name + ' ' + description).lower()
-        normalized_lower = unicodedata.normalize('NFKD', name_lower).encode('ascii', 'ignore').decode('utf-8')
-        if normalized_lower != name_lower:
-            logging.debug(f"Unicode normalized for sort key of '{name}': original='{name_lower[:100]}...' -> normalized='{normalized_lower[:100]}...'")
-        name_lower = normalized_lower
-        hints = s.get('behaviorHints', {})
-        is_cached = hints.get('isCached', False)
-        cached_priority = 0 if is_cached else 1
-        res_priority = {'4k': 0, '2160p': 0, '1440p': 1, '1080p': 2, '720p': 3, 'bdremux': 0}.get(next((r for r in ['4k', '2160p', '1440p', '1080p', '720p', 'bdremux'] if r in name_lower), ''), 4)
-        if res_priority == 4:
-            logging.debug(f"Res match failed for stream {s.get('url', 'unknown')}: pattern=r'(4k|2160p|1440p|1080p|720p)', name_lower={name_lower[:100]}... - using default 4")
-            res_miss_count += 1
-        quality_priority = {'remux': 0, 'bdremux': 0, 'bluray': 1, 'web-dl': 2, 'webrip': 3, 'web': 3, 'hdtv': 4, 'ts': 5}.get(next((q for q in ['remux', 'bdremux', 'bluray', 'web-dl', 'webrip', 'web', 'hdtv', 'ts'] if q in name_lower), ''), 4)
-        if quality_priority == 4:
-            logging.debug(f"Quality match failed for stream {s.get('url', 'unknown')}: pattern=r'(remux|bluray|web-dl|webrip)', name_lower={name_lower[:100]}... - using default 4")
-        source_priority = 0 if 'store' in name_lower or 'stremthru' in name_lower else (1 if 'rd' in name_lower or 'realdebrid' in name_lower else (2 if 'tb' in name_lower or 'torbox' in name_lower else (3 if 'ad' in name_lower or 'alldebrid' in name_lower else 4)))
-        size_match = re.search(r'(\d+\.?\d*)\s*(gb|mb)', name_lower, re.I | re.U)
-        size_num = float(size_match.group(1)) if size_match else (hints.get('videoSize', 0) / 10**9)
-        seed_match = re.search(r'(?:👥|seeders?|seeds?|⇋|peers?) ?(\d+)(?:𖧧)?|(\d+)\s*(?:seed|𖧧)', name_lower, re.I | re.U)
-        seeders = int(seed_match.group(1) or seed_match.group(2) or 0) if seed_match else 0
-        seadex_priority = 0 if 'seadex' in name_lower or 'ʙᴇsᴛ ʀᴇʟᴇᴀsᴇ' in name_lower else 1
-        key = (cached_priority, seadex_priority, res_priority, quality_priority, source_priority, -size_num, -seeders)
-        logging.debug(f"Sort key for '{name}': {key} (cached_pri={cached_priority}, res={res_priority}, qual={quality_priority}, src={source_priority}, size={size_num}, seeds={seeders}) - from name_lower: {name_lower[:100]}...")
-        return key
-    
-    filtered.sort(key=sort_key)
-    logging.info(f"Sorted filtered streams (first 5): {[(f.get('name', 'NO NAME'), sort_key(f)) for f in filtered[:5]]}")
-    logging.debug(f"All sorted streams: {json.dumps([f.get('name', 'NO NAME') for f in filtered], indent=2)}")
-    
-    # New: Post-filter stats
-    if filtered:
-        kept_cached = sum(1 for f in filtered if f.get('behaviorHints', {}).get('isCached', False))
-        kept_res = {res: sum(1 for f in filtered if res in f.get('name', '').lower()) for res in ['4k', '2160p', '1440p', '1080p', '720p']}
-        kept_qual = {qual: sum(1 for f in filtered if qual in f.get('name', '').lower()) for qual in ['remux', 'bdremux', 'bluray', 'web-dl', 'webrip', 'web', 'hdtv', 'ts']}
-        logging.info(f"Post-filter stats: Kept {len(filtered)}, Cached {kept_cached}, Resolutions {kept_res}, Qualities {kept_qual} - Mismatch alert if 0 but Stremio shows streams")
+            logging.error(f"AD cache check failed: {e}")
+            return False
     else:
-        logging.warning("0 kept - Mismatch with Stremio? Check AIO data or filters")
-    
-    use_emoji_flags = True
-    for i, s in enumerate(filtered):
-        name = s.get('name', '').replace('\n', ' ')
-        description = s.get('description', '').replace('\n', ' ')
-        parse_string = (name + ' ' + description).lower()
-        normalized_parse = unicodedata.normalize('NFKD', parse_string).encode('ascii', 'ignore').decode('utf-8')
-        if normalized_parse != parse_string:
-            logging.debug(f"Unicode normalized for formatting stream {i}: original='{parse_string[:100]}...' -> normalized='{normalized_parse[:100]}...'")
-        parse_string = normalized_parse
-        hints = s.get('behaviorHints', {})
-        service = next((k for k in SERVICE_COLORS if k in parse_string), '')
-        if service:
-            name = f"{SERVICE_COLORS[service]}{name}[/]"
-            logging.debug(f"Applied color for service {service} in stream {i}")
+        return False
+    try:
+        response = session.get(api_url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        if service == 'rd':
+            return bool(data.get(torrent_hash, {}).get('rd'))
+        elif service == 'tb':
+            return data.get('data', {}).get('is_cached', False)
+    except Exception as e:
+        logging.error(f"{service.upper()} cache check failed: {e}")
+        return False
+
+def get_streams(type_, id_):
+    aio_url = f"{AIO_BASE}/stream/{type_}/{id_}.json"
+    store_url = f"{STORE_BASE}/stream/{type_}/{id_}.json" if USE_STORE else None
+    streams = []
+    start = time.time()
+    try:
+        response = session.get(aio_url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        streams.extend(data.get('streams', []))
+        logging.info(f"Fetched {len(streams)} from AIO in {time.time() - start:.2f}s")
+    except Exception as e:
+        logging.error(f"AIO fetch failed: {e}")
+    if USE_STORE:
+        start_store = time.time()
+        try:
+            response_store = session.get(store_url, timeout=REQUEST_TIMEOUT)
+            response_store.raise_for_status()
+            data_store = response_store.json()
+            streams.extend(data_store.get('streams', []))
+            logging.info(f"Fetched {len(data_store.get('streams', []))} from Store in {time.time() - start_store:.2f}s")
+        except Exception as e:
+            logging.error(f"Store fetch failed: {e}")
+    return streams
+
+@app.route('/stream/<type_>/<id_>.json')
+def stream(type_, id_):
+    logging.info(f"Stream request: {type_}/{id_}")
+    streams = get_streams(type_, id_)
+    logging.debug(f"Raw streams fetched: {len(streams)}")
+    filtered = []
+    uncached_count = 0
+    for i, s in enumerate(streams):
+        parse_string = unicodedata.normalize('NFKD', s.get('name', '') + ' ' + s.get('title', '') + ' ' + s.get('infoHash', '')).lower()
+        logging.debug(f"Parsing stream {i}: {parse_string[:100]}...")
+        size_match = re.search(r'(\d+(?:\.\d+)?)\s*(gb|mb)', parse_string, re.I)
+        if size_match:
+            size_gb = float(size_match.group(1)) if size_match.group(2).lower() == 'gb' else float(size_match.group(1)) / 1024
+            size_bytes = size_gb * 1073741824
+            logging.debug(f"Size match for stream {i}: {size_gb} GB ({size_bytes} bytes)")
         else:
-            logging.debug(f"No service match for coloring in stream {i}: pattern=SERVICE_COLORS keys, parse_string={parse_string[:100]}...")
-        if re.search(r'[\uac00-\ud7a3]', parse_string, re.U):
-            name += ' 🇰🇷'
-            logging.debug(f"Added KR flag for stream {i} via Hangul detection")
-        elif re.search(r'[\u3040-\u30ff\u4e00-\u9faf]', parse_string, re.U):
-            name += ' 🇯🇵'
-            logging.debug(f"Added JP flag for stream {i} via Kanji detection")
+            size_bytes = 0
+            logging.debug(f"No size match for stream {i}: pattern=r'(\\d+(?:\\.\\d+)?)\\s*(gb|mb)', parse_string={parse_string[:100]}...")
+        if size_bytes and (size_bytes < MIN_SIZE_BYTES or size_bytes > MAX_SIZE_BYTES):
+            logging.debug(f"Filtered out stream {i}: size {size_bytes} bytes out of range [{MIN_SIZE_BYTES}, {MAX_SIZE_BYTES}]")
+            continue
+        seeder_match = re.search(r'(?:👥|seeders?|seeds?|⇋|peers?) ?(\d+)(?:𖧧)?|(\d+)\s*(?:seed|𖧧)', parse_string, re.I | re.U)
+        seeders = int(seeder_match.group(1) or seeder_match.group(2)) if seeder_match else 0
+        if seeders < MIN_SEEDERS:
+            logging.debug(f"Filtered out stream {i}: seeders {seeders} < {MIN_SEEDERS}")
+            continue
+        hints = {}
+        service = next((k for k in SERVICE_COLORS if k in parse_string), None)
+        if service:
+            hints['service'] = service
+            url = s.get('url', '') or s.get('behaviorHints', {}).get('proxyUrl', '')
+            if url:
+                is_cached = debrid_check_cache(url, service)
+                hints['isCached'] = is_cached
+                if not is_cached:
+                    uncached_count += 1
+                    if uncached_count > MAX_UNCACHED_KEEP:
+                        logging.debug(f"Filtered out uncached stream {i}: exceeded max uncached keep {MAX_UNCACHED_KEEP}")
+                        continue
+        filtered.append(s)
+        s['hints'] = hints
+        logging.debug(f"Kept stream {i}: seeders={seeders}, size={size_bytes}, cached={hints.get('isCached', 'N/A')}")
+    logging.info(f"Filtered: {len(filtered)} (from {len(streams)} raw)")
+    res_order = {'4k': 5, '2160p': 5, '1440p': 4, '1080p': 3, '720p': 2, '480p': 1, 'sd': 0}
+    def sort_key(s):
+        parse = unicodedata.normalize('NFKD', s.get('name', '') + ' ' + s.get('title', '')).lower()
+        res_match = re.search(r'(4k|2160p|1440p|1080p|720p|480p|sd)', parse, re.I)
+        res_score = res_order.get(res_match.group(1).lower() if res_match else 'sd', 0)
+        size_match = re.search(r'(\d+(?:\.\d+)?)\s*(gb|mb)', parse, re.I)
+        size_gb = float(size_match.group(1)) if size_match and size_match.group(2).lower() == 'gb' else (float(size_match.group(1)) / 1024 if size_match else 0)
+        seeder_match = re.search(r'(?:👥|seeders?|seeds?|⇋|peers?) ?(\d+)(?:𖧧)?|(\d+)\s*(?:seed|𖧧)', parse, re.I | re.U)
+        seeders = int(seeder_match.group(1) or seeder_match.group(2)) if seeder_match else 0
+        is_cached = s.get('hints', {}).get('isCached', False)
+        return (-int(is_cached), -seeders, -size_gb, -res_score)
+    filtered.sort(key=sort_key)
+    logging.info(f"Sorted {len(filtered)} streams: cached first, then seeders/size/res descending")
+    for i, s in enumerate(filtered):
+        parse_string = unicodedata.normalize('NFKD', s.get('name', '') + ' ' + s.get('title', '') + ' ' + s.get('infoHash', '')).lower()
+        hints = s.get('hints', {})
+        service = hints.get('service', '')
+        color = SERVICE_COLORS.get(service, '')
+        name = f"{color} " if color else ''
+        res_match = re.search(r'(4k|2160p|1440p|1080p|720p|480p|sd)', parse_string, re.I)
+        if res_match:
+            res = res_match.group(1).upper()
+            name += f"📺 {res}"
+            logging.debug(f"Added res {res} for stream {i} from match: {res_match.group(0)}")
+        else:
+            logging.debug(f"No res match for stream {i}: pattern=r'(4k|2160p|1440p|1080p|720p|480p|sd)', parse_string={parse_string[:100]}...")
+        size_match = re.search(r'(\d+(?:\.\d+)?)\s*(gb|mb)', parse_string, re.I)
+        if size_match:
+            size = f"{size_match.group(1)} {size_match.group(2).upper()}"
+            name += f" 💿 {size}"
+            logging.debug(f"Added size {size} for stream {i} from match: {size_match.group(0)}")
+        else:
+            logging.debug(f"No size match for stream {i}: pattern=r'(\\d+(?:\\.\\d+)?)\\s*(gb|mb)', parse_string={parse_string[:100]}...")
+        seeder_match = re.search(r'(?:👥|seeders?|seeds?|⇋|peers?) ?(\d+)(?:𖧧)?|(\d+)\s*(?:seed|𖧧)', parse_string, re.I | re.U)
+        if seeder_match:
+            seeders = seeder_match.group(1) or seeder_match.group(2)
+            name += f" 👥 {seeders}"
+            logging.debug(f"Added seeders {seeders} for stream {i} from match: {seeder_match.group(0)}")
+        else:
+            logging.debug(f"Seeders match failed for stream {i}: pattern=r'(?:👥|seeders?|seeds?|⇋|peers?) ?(\\d+)(?:𖧧)?|(\\d+)\\s*(?:seed|𖧧)', parse_string={parse_string[:100]}...")
         lang_match = re.search(r'([a-z]{2,3}(?:[ ·,·-]*[a-z]{2,3})*)', parse_string, re.I | re.U)
         if lang_match:
             langs = re.findall(r'[a-z]{2,3}', lang_match.group(1), re.I)
@@ -402,7 +217,7 @@ def streams(media_type, media_id):
             name += f" ♬ {audio} {channels}".strip()
             logging.debug(f"Added audio attribute {audio} {channels} for stream {i} from match: {audio_match.group(0)}")
         else:
-            logging.debug(f"No audio match for stream {i}: pattern=r'(dd\+|dd|aac|atmos|5\.1|2\.0)', parse_string={parse_string[:100]}...")
+            logging.debug(f"No audio match for stream {i}: pattern=r'(dd\\+|dd|aac|atmos|5\\.1|2\\.0)', parse_string={parse_string[:100]}...")
         if 'store' in parse_string or '4k' in parse_string or 'stremthru' in parse_string:
             name = f"★ {name}"
         if '⏳' in name or not hints.get('isCached', False):
