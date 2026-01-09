@@ -172,6 +172,8 @@ def streams(media_type, media_id):
     all_streams = []
     template_count = 0
     uncached_count = 0
+    seed_miss_count = 0  # Initialized
+    res_miss_count = 0  # Initialized
     try:
         aio_url = f"{AIO_BASE}/stream/{media_type}/{media_id}.json"
         logging.debug(f"Fetching AIO: {aio_url}")
@@ -240,9 +242,6 @@ def streams(media_type, media_id):
     uncached_filtered = []
     logging.debug("Starting filtering process")
     
-    # New: Aggregate miss counts
-    seed_miss_count = 0
-    res_miss_count = 0
     for i, s in enumerate(all_streams):
         hints = s.get('behaviorHints', {})
         name = s.get('name', '').replace('\n', ' ')
@@ -280,10 +279,21 @@ def streams(media_type, media_id):
     
     logging.debug(f"Filtered cached: {len(filtered)}, Uncached to verify: {len(uncached_filtered)}")
     
-    # New: Drop reasons
+    # New: Drop reasons (fixed: re-compute per s)
     drop_reasons = {'low_seed': 0, 'size_out': 0, 'other': 0}
     for s in all_streams:
-        # Mock seed/size from loop (use actual vars if needed)
+        # Re-compute seeders/size for this s
+        parse_string = (s.get('name', '') + ' ' + s.get('description', '')).lower().replace('\n', ' ')
+        seed_match = re.search(r'(?:👥|seeders?|seeds?|⇋|peers?) ?(\d+)(?:𖧧)?|(\d+)\s*(?:seed|𖧧)', parse_string, re.I | re.U)
+        seeders = int(seed_match.group(1) or seed_match.group(2) or 0) if seed_match else 0
+        size_match = re.search(r'(\d+\.?\d*)\s*(gb|mb)', parse_string, re.I | re.U)
+        size = 0
+        if size_match:
+            size_num = float(size_match.group(1))
+            unit = size_match.group(2).lower()
+            size = int(size_num * (10**9 if unit == 'gb' else 10**6))
+        if size == 0:
+            size = s.get('behaviorHints', {}).get('videoSize', 0)
         if seeders < MIN_SEEDERS: drop_reasons['low_seed'] += 1
         elif not MIN_SIZE_BYTES <= size <= MAX_SIZE_BYTES: drop_reasons['size_out'] += 1
         else: drop_reasons['other'] += 1
@@ -309,11 +319,33 @@ def streams(media_type, media_id):
     logging.debug(f"After adding verified uncached: total filtered {len(filtered)}")
     
     def sort_key(s):
-        # Existing sort_key...
-        # Add to res_priority check
+        global res_miss_count  # Declare global
+        # Existing sort_key code...
+        name = s.get('name', '').replace('\n', ' ')
+        description = s.get('description', '').replace('\n', ' ')
+        name_lower = (name + ' ' + description).lower()
+        normalized_lower = unicodedata.normalize('NFKD', name_lower).encode('ascii', 'ignore').decode('utf-8')
+        if normalized_lower != name_lower:
+            logging.debug(f"Unicode normalized for sort key of '{name}': original='{name_lower[:100]}...' -> normalized='{normalized_lower[:100]}...'")
+        name_lower = normalized_lower
+        hints = s.get('behaviorHints', {})
+        is_cached = hints.get('isCached', False)
+        cached_priority = 0 if is_cached else 1
+        res_priority = {'4k': 0, '2160p': 0, '1440p': 1, '1080p': 2, '720p': 3, 'bdremux': 0}.get(next((r for r in ['4k', '2160p', '1440p', '1080p', '720p', 'bdremux'] if r in name_lower), ''), 4)
         if res_priority == 4:
-            res_miss_count += 1  # Increment global miss count
-        # ... rest unchanged
+            logging.debug(f"Res match failed for stream {s.get('url', 'unknown')}: pattern=r'(4k|2160p|1440p|1080p|720p)', name_lower={name_lower[:100]}... - using default 4")
+            res_miss_count += 1
+        quality_priority = {'remux': 0, 'bdremux': 0, 'bluray': 1, 'web-dl': 2, 'webrip': 3, 'web': 3, 'hdtv': 4, 'ts': 5}.get(next((q for q in ['remux', 'bdremux', 'bluray', 'web-dl', 'webrip', 'web', 'hdtv', 'ts'] if q in name_lower), ''), 4)
+        if quality_priority == 4:
+            logging.debug(f"Quality match failed for stream {s.get('url', 'unknown')}: pattern=r'(remux|bluray|web-dl|webrip)', name_lower={name_lower[:100]}... - using default 4")
+        source_priority = 0 if 'store' in name_lower or 'stremthru' in name_lower else (1 if 'rd' in name_lower or 'realdebrid' in name_lower else (2 if 'tb' in name_lower or 'torbox' in name_lower else (3 if 'ad' in name_lower or 'alldebrid' in name_lower else 4)))
+        size_match = re.search(r'(\d+\.?\d*)\s*(gb|mb)', name_lower, re.I | re.U)
+        size_num = float(size_match.group(1)) if size_match else (hints.get('videoSize', 0) / 10**9)
+        seed_match = re.search(r'(?:👥|seeders?|seeds?|⇋|peers?) ?(\d+)(?:𖧧)?|(\d+)\s*(?:seed|𖧧)', name_lower, re.I | re.U)
+        seeders = int(seed_match.group(1) or seed_match.group(2) or 0) if seed_match else 0
+        seadex_priority = 0 if 'seadex' in name_lower or 'ʙᴇsᴛ ʀᴇʟᴇᴀsᴇ' in name_lower else 1
+        key = (cached_priority, seadex_priority, res_priority, quality_priority, source_priority, -size_num, -seeders)
+        logging.debug(f"Sort key for '{name}': {key} (cached_pri={cached_priority}, res={res_priority}, qual={quality_priority}, src={source_priority}, size={size_num}, seeds={seeders}) - from name_lower: {name_lower[:100]}...")
         return key
     
     filtered.sort(key=sort_key)
@@ -331,8 +363,53 @@ def streams(media_type, media_id):
     
     use_emoji_flags = True
     for i, s in enumerate(filtered):
-        # Existing formatting...
-        # Unchanged
+        name = s.get('name', '').replace('\n', ' ')
+        description = s.get('description', '').replace('\n', ' ')
+        parse_string = (name + ' ' + description).lower()
+        normalized_parse = unicodedata.normalize('NFKD', parse_string).encode('ascii', 'ignore').decode('utf-8')
+        if normalized_parse != parse_string:
+            logging.debug(f"Unicode normalized for formatting stream {i}: original='{parse_string[:100]}...' -> normalized='{normalized_parse[:100]}...'")
+        parse_string = normalized_parse
+        hints = s.get('behaviorHints', {})
+        service = next((k for k in SERVICE_COLORS if k in parse_string), '')
+        if service:
+            name = f"{SERVICE_COLORS[service]}{name}[/]"
+            logging.debug(f"Applied color for service {service} in stream {i}")
+        else:
+            logging.debug(f"No service match for coloring in stream {i}: pattern=SERVICE_COLORS keys, parse_string={parse_string[:100]}...")
+        if re.search(r'[\uac00-\ud7a3]', parse_string, re.U):
+            name += ' 🇰🇷'
+            logging.debug(f"Added KR flag for stream {i} via Hangul detection")
+        elif re.search(r'[\u3040-\u30ff\u4e00-\u9faf]', parse_string, re.U):
+            name += ' 🇯🇵'
+            logging.debug(f"Added JP flag for stream {i} via Kanji detection")
+        lang_match = re.search(r'([a-z]{2,3}(?:[ ·,·-]*[a-z]{2,3})*)', parse_string, re.I | re.U)
+        if lang_match:
+            langs = re.findall(r'[a-z]{2,3}', lang_match.group(1), re.I)
+            flags_added = set(LANGUAGE_FLAGS.get(lang, '') for lang in langs if lang in LANGUAGE_FLAGS)
+            if flags_added:
+                name += ' ' + ' '.join(flags_added)
+                logging.debug(f"Added flags {flags_added} for stream {i} from match: {lang_match.group(0)}")
+            else:
+                logging.debug(f"Lang match but no known flags for stream {i}: {lang_match.group(0)}")
+        else:
+            logging.debug(f"No lang pattern match for stream {i}: pattern=r'([a-z]{2,3}(?:[ ·,·-]*[a-z]{2,3})*)', parse_string={parse_string[:100]}...")
+        audio_match = re.search(r'(dd\+|dd|dts-hd|dts|opus|aac|atmos|ma|5\.1|7\.1|2\.0)', parse_string, re.I | re.U)
+        channel_match = re.search(r'(\d\.\d)', parse_string, re.I | re.U)
+        if audio_match:
+            audio = audio_match.group(1).upper()
+            channels = channel_match.group(1) if channel_match else ''
+            name += f" ♬ {audio} {channels}".strip()
+            logging.debug(f"Added audio attribute {audio} {channels} for stream {i} from match: {audio_match.group(0)}")
+        else:
+            logging.debug(f"No audio match for stream {i}: pattern=r'(dd\+|dd|aac|atmos|5\.1|2\.0)', parse_string={parse_string[:100]}...")
+        if 'store' in parse_string or '4k' in parse_string or 'stremthru' in parse_string:
+            name = f"★ {name}"
+        if '⏳' in name or not hints.get('isCached', False):
+            s['name'] = f"[dim]{name} (Unverified ⏳)[/dim]"
+        else:
+            s['name'] = name
+        logging.debug(f"Formatted stream {i}: final name='{s['name']}'")
     
     logging.info(f"Final filtered: {len(filtered)}")
     
@@ -348,5 +425,8 @@ def streams(media_type, media_id):
     return jsonify({'streams': final_streams})
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)  # Force debug for full logs
+    try:
+        port = int(os.environ.get('PORT', 5000))
+        app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)  # Force debug for full logs
+    except Exception as e:
+        logging.error(f"App startup error: {e}")
