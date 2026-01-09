@@ -1,6 +1,6 @@
 {
   "id": "org.grok.wrapper",
-  "version": "1.0.0",
+  "version": "1.0.45",
   "name": "AIO Wrapper",
   "description": "Wraps AIOStreams to filter and format streams",
   "resources": ["stream"],
