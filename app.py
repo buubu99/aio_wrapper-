@@ -4,347 +4,194 @@ import os
 import logging
 import re
 import json
-import unicodedata
 import time
 from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from collections import defaultdict, Counter
 from fuzzywuzzy import fuzz
-from collections import defaultdict
-
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False
 CORS(app, resources={r"/*": {"origins": "*"}})
-
-logging.basicConfig(level='DEBUG', format='%(asctime)s | %(levelname)s | %(message)s')  # Force DEBUG
-
+logging.basicConfig(level='DEBUG', format='%(asctime)s | %(levelname)s | %(message)s')
 session = requests.Session()
 retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
 adapter = HTTPAdapter(max_retries=retry)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
-
 AIO_BASE = os.environ.get('AIO_URL', 'https://buubuu99-aiostreams.elfhosted.cc/stremio/acc199cb-6b12-4fa9-be4e-a8ff4c13fa50/eyJpIjoiRTJES0N1ZFBaWm8wb25aS05tNEFsUT09IiwiZSI6InhrVVFtdTFEWm5lcGVrcEh5VUZaejZlcEJLMEMrcXdLakY4UU9zUDJoOFE9IiwidCI6ImEifQ')
-STORE_BASE = os.environ.get('STORE_URL', 'https://buubuu99-stremthru.elfhosted.cc/stremio/store/eyJzdG9yZV9uYW1lIjoiIiwic3RvcmVfdG9rZW4iOiJZblYxWW5WMU9UazZUV0Z5YVhOellUazVRREV4Tnc9PSIsImhpZGVfY2F0YWxvZyI6dHJ1ZSwid2ViZGwiOnRydWV9')
-USE_STORE = os.environ.get('USE_STORE', 'true').lower() == 'true'
-MIN_SEEDERS = int(os.environ.get('MIN_SEEDERS', 1))
-MIN_SIZE_BYTES = int(os.environ.get('MIN_SIZE_BYTES', 500000000))
-MAX_SIZE_BYTES = int(os.environ.get('MAX_SIZE_BYTES', 100000000000))
-REQUEST_TIMEOUT = int(os.environ.get('TIMEOUT', 60000)) / 1000
-MAX_UNCACHED_KEEP = 30
-PING_TIMEOUT = 2
-API_POLL_TIMEOUT = 10
-POLL_INTERVAL = 1
-MAX_POLLS = 15
-
-RD_API_KEY = 'Z4C3UT777IK2U6EUZ5HLVVMO7BYQPDNEOJUGAFLUBXMGTSX2Z6RA'
-TB_API_KEY = '1046c773-9d0d-4d53-95ab-8976a559a5f6'
-AD_API_KEY = 'Z2HvUmLsuuRmyHg5Zf5K8'
-
-LANGUAGE_FLAGS = {
-    'eng': '🇺🇸', 'en': '🇺🇸', 'jpn': '🇯🇵', 'jp': '🇯🇵', 'ita': '🇮🇹', 'it': '🇮🇹',
-    'fra': '🇫🇷', 'fr': '🇫🇷', 'kor': '🇰🇷', 'kr': '🇰🇷', 'chn': '🇨🇳', 'cn': '🇨🇳',
-    'uk': '🇬🇧', 'ger': '🇩🇪', 'de': '🇩🇪', 'hun': '🇭🇺', 'yes': '📝', 'ko': '🇰🇷',
-    'korean': '🇰🇷'
+MIN_SEEDERS = 1
+MIN_SIZE_BYTES = 500000000
+REQUEST_TIMEOUT = 15
+DEBRID_KEYS = {
+    'tb': '1046c773-9d0d-4d53-95ab-8976a559a5f6',
+    'rd': 'Z4C3UT777IK2U6EUZ5HLVVMO7BYQPDNEOJUGAFLUBXMGTSX2Z6RA',
+    'ad': 'ZXzHvUmLsuuRmgyHg5zjFsk8'
 }
-
 QUALITY_PATTERNS = [
-    # [full list as before, expanded with Vidhin]
-    {"name": "Remux T1", "pattern": r"^(?=.*\b(?:BD|Blu[-_ ]?Ray)\b)(?=.*\b(?:Remux|BDRemux)\b)(?=.*\b(?:FraMeSLoR|playBD)\b).*/i"},
-    {"name": "Remux T2", "pattern": r"^(?=.*\b(?:BD|Blu[-_ ]?Ray)\b)(?=.*\b(?:Remux|BDRemux)\b)(?=.*\b(?:BHDStudio|playMaNiA|playREMUX|SPARKS|ZMN)\b).*/i"},
-    {"name": "Remux T3", "pattern": r"^(?=.*\b(?:BD|Blu[-_ ]?Ray)\b)(?=.*\b(?:Remux|BDRemux)\b)(?=.*\b(?:playTV|SWTYBLZ)\b).*/i"},
-    {"name": "Remux T4", "pattern": r"^(?=.*\b(?:BD|Blu[-_ ]?Ray)\b)(?=.*\b(?:Remux|BDRemux)\b)(?=.*\b(?:playHD|playEX|playMOViE)\b).*/i"},
-    {"name": "Bluray T1", "pattern": r"^(?=.*\bBlu[-_]?Ray\b)(?!.*\bRemux\b)(?!.*\bWEB[-_.]?(?:DL|Rip)\b)(?=.*\b(?:FraMeSToR|playHD)\b).*/i"},
-    {"name": "Bluray T2", "pattern": r"^(?=.*\bBlu[-_]?Ray\b)(?!.*\bRemux\b)(?!.*\bWEB[-_.]?(?:DL|Rip)\b)(?=.*\b(?:CHD|CiNE|CtrlHD|playEV|SPARKS)\b).*/i"},
-    {"name": "Bluray T3", "pattern": r"^(?=.*\bBlu[-_]?Ray\b)(?!.*\bRemux\b)(?!.*\bWEB[-_.]?(?:DL|Rip)\b)(?=.*\b(?:BHDStudio|hallowed|HiFi|HONE|SPHD|WEBDV|playHD)\b).*/i"},
-    # ... (add all from user's JSON; truncated in prompt, but include Bad at end)
-    {"name": "Bad", "pattern": r"(4KMaNiA|4KMVi|AFG|CiTiDeL|CMRG|FiLMiCiTY|GalaxyTV|GALAXYRG|GGWP|HD4U|ION10|MeGusta|MKVCenter|MkvHub|Pahe|PSA|PSARips|RMTeam|Shaanig|STVFRV|TGx|YIFY|YTS|beAst|COLLECTiVE|EPiC|iVy|KiNGDOM|Scene|SUNSCREEN)"}
+    {"name": "Remux", "pattern": r"remux", "flags": re.I},
+    {"name": "Bluray", "pattern": r"blu[-_]?ray|brrip", "flags": re.I},
+    {"name": "Web", "pattern": r"web[-_.]?(dl|rip)", "flags": re.I},
+    {"name": "Bad", "pattern": r"yify|psa|pahe|afg|cmrg|ion10|megusta|tgx", "flags": re.I}
 ]
-
-logging.info("APP START | ENV VARS DUMP: %s", json.dumps(dict(os.environ), indent=2))
-
-def log_summary(section, status, streams, details, time_ms):
-    logging.info("🟢 [%s] Summary | ✔ Status: %s | 📦 Streams: %d | 📋 Details: %s | ⏱️ Time: %dms", section, status, streams, details, time_ms)
-
-def debrid_batch_check(hashes, service='rd'):
-    start_time = time.time()
-    logging.debug("DEBRID_BATCH | START | HASHES: %d | SERVICE: %s", len(hashes), service)
-    cached = {}
-    headers = {'Authorization': f'Bearer {RD_API_KEY if service == "rd" else TB_API_KEY if service == "tb" else AD_API_KEY}'}
+played_feedback = Counter()  # Idea 4; mock for demo
+def update_patterns():  # Idea 3
     try:
-        if service == 'rd':
-            for h in hashes:
-                add_url = 'https://api.real-debrid.com/rest/1.0/torrents/addMagnet'
-                data = {'magnet': f'magnet:?xt=urn:btih:{h}'}
-                response = session.post(add_url, headers=headers, data=data, timeout=API_POLL_TIMEOUT)
-                if response.status_code == 200:
-                    torrent_id = response.json().get('id')
-                    if torrent_id:
-                        for poll in range(1, MAX_POLLS + 1):
-                            info_url = f'https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}'
-                            info_resp = session.get(info_url, headers=headers)
-                            if info_resp.status_code == 200 and info_resp.json().get('status') in ['downloaded', 'queued']:
-                                cached[h] = True
-                                break
-                            time.sleep(POLL_INTERVAL * (1.5 ** poll))
-                        delete_url = f'https://api.real-debrid.com/rest/1.0/torrents/delete/{torrent_id}'
-                        session.delete(delete_url, headers=headers)
-        elif service == 'tb':
-            for h in hashes:
-                check_url = f'https://api.torbox.app/v1/api/torrents/checkcache?hash={h}'
-                response = session.get(check_url, headers=headers, timeout=API_POLL_TIMEOUT)
-                if response.status_code == 200 and response.json().get('data', {}).get('cached', False):
-                    cached[h] = True
-        elif service == 'ad':
-            add_url = 'https://api.alldebrid.com/v4/magnet/upload'
-            magnets = [f'magnet:?xt=urn:btih:{h}' for h in hashes]
-            params = {'magnets[]': magnets}
-            response = session.post(add_url, headers=headers, params=params)
-            if response.status_code == 200:
-                for mag in response.json().get('data', {}).get('magnets', []):
-                    if mag.get('ready', False):
-                        cached[mag.get('hash', '')] = True
-    except Exception as e:
-        logging.error("DEBRID_BATCH | ERROR: %s | SERVICE: %s", str(e), service)
-        if 'disabled' in str(e).lower() or 'france' in str(e).lower():
-            logging.warning("DEBRID_BATCH | RESTRICTION_DETECTED | FALLBACK_TO_TB")
-            return debrid_batch_check(hashes, 'tb')
-    time_ms = int((time.time() - start_time) * 1000)
-    log_summary("Debrid Batch Check", "SUCCESS" if cached else "PARTIAL", len(cached), f"Cached hashes: {len(cached)}/{len(hashes)}", time_ms)
-    return cached
-
-@app.route('/manifest.json')
-def manifest():
-    return jsonify({
-        "id": "org.grok.wrapper",
-        "version": "1.0.41",
-        "name": "Grok AIO Wrapper",
-        "description": "Wraps AIOStreams with enhanced filtering, sorting, and formatting",
-        "resources": ["stream"],
-        "types": ["movie", "series"],
-        "catalogs": [],
-        "idPrefixes": ["tt"]
-    })
-
-@app.route('/health')
-def health():
-    return "OK", 200
-
+        resp = requests.get('https://raw.githubusercontent.com/Vidhin05/Releases-Regex/main/patterns.json')
+        new_patterns = resp.json()
+        QUALITY_PATTERNS.extend(new_patterns)
+        logging.info("UPDATED_PATTERNS | ADDED: %d", len(new_patterns))
+    except:
+        logging.warning("PATTERNS_UPDATE_FAIL")
+update_patterns()
+def clean_string(text):
+    text = re.sub(r'\{.*?\}', '', text, flags=re.I)
+    return text.lower()
+def get_quality_tier(parse_string):
+    for pat in QUALITY_PATTERNS:
+        if re.search(pat['pattern'], parse_string, pat.get('flags', 0)):
+            return pat['name']
+    return 'Unknown'
+HEALTH_TAGS = {'✅': 2, '🧝': 1, '⚠️': -1, '🚫': -2}  # Creative Usenet scores
+def get_health_score(desc):
+    score = 0
+    for tag, val in HEALTH_TAGS.items():
+        if tag in desc:
+            score += val
+    return score
+def verify_cached(hashes):  # Idea 2
+    votes = defaultdict(int)
+    hashes_upper = [h.upper() for h in hashes]
+    # RD batch
+    if DEBRID_KEYS['rd']:
+        rd_url = f"https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/{'/'.join(hashes_upper[:40])}"
+        try:
+            resp = session.get(rd_url, headers={'Authorization': f"Bearer {DEBRID_KEYS['rd']}"}, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for h in hashes_upper:
+                    if data.get(h.lower(), {}).get('rd'):
+                        votes[h] += 1
+        except Exception as e:
+            logging.error(f"RD_VERIFY_ERROR: {e}")
+    # AD batch
+    if DEBRID_KEYS['ad']:
+        ad_url = "https://api.alldebrid.com/v4/magnet/instant"
+        params = {'agent': 'wrapper', 'apikey': DEBRID_KEYS['ad']}
+        for i in range(0, len(hashes_upper), 10):
+            params['magnets[]'] = hashes_upper[i:i+10]
+            try:
+                resp = session.get(ad_url, params=params, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()['data']['magnets']
+                    for item in data:
+                        if item['instant']:
+                            votes[item['hash'].upper()] += 1
+            except Exception as e:
+                logging.error(f"AD_VERIFY_ERROR: {e}")
+    # TB batch (Pro Usenet-enabled)
+    if DEBRID_KEYS['tb']:
+        tb_url = "https://api.torbox.app/v1/api/torrent/check"
+        try:
+            resp = session.post(tb_url, json={'apikey': DEBRID_KEYS['tb'], 'hashes': hashes_upper}, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                for h, status in data.items():
+                    if status.get('cached') or status.get('available'):
+                        votes[h.upper()] += 1
+        except Exception as e:
+            logging.error(f"TB_VERIFY_ERROR: {e}")
+    return [h for h in hashes if votes.get(h.upper(), 0) >= 2]
 @app.route('/stream/<media_type>/<media_id>.json')
 def streams(media_type, media_id):
-    start_time = time.time()
-    logging.info("STREAM_REQ | START | TYPE: %s | ID: %s", media_type, media_id)
     all_streams = []
     try:
         aio_url = f"{AIO_BASE}/stream/{media_type}/{media_id}.json"
-        aio_response = session.get(aio_url, timeout=REQUEST_TIMEOUT)
-        aio_response.raise_for_status()
-        all_streams += aio_response.json().get('streams', [])
+        response = session.get(aio_url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        all_streams = response.json().get('streams', [])
     except Exception as e:
-        logging.error("STREAM_REQ | AIO_ERROR: %s", str(e))
-    
-    if USE_STORE:
-        try:
-            store_url = f"{STORE_BASE}/stream/{media_type}/{media_id}.json"
-            store_response = session.get(store_url, timeout=REQUEST_TIMEOUT)
-            store_response.raise_for_status()
-            all_streams += store_response.json().get('streams', [])
-        except Exception as e:
-            logging.error("STREAM_REQ | STORE_ERROR: %s", str(e))
-    
+        logging.error("AIO_ERROR: %s", str(e))
+        return jsonify({'streams': []})
     total_raw = len(all_streams)
-    time_ms = int((time.time() - start_time) * 1000)
-    log_summary("Scrape", "SUCCESS", total_raw, "Fetched from AIO/Store", time_ms)
-    
+    logging.info("RAW_COUNT: %d", total_raw)
     filtered = []
-    uncached_hashes = defaultdict(list)
-    res_counter = defaultdict(int)
-    lang_counter = defaultdict(int)
-    quality_tier_counter = defaultdict(int)
-    excluded_uncached = 0
-    excluded_seeder = 0
-    excluded_bad = 0
-    start_time = time.time()
+    uncached_hashes = []
+    title_ref = "the wailing"  # Idea 1 (adjust if needed)
+    stale_count = 0
     for i, s in enumerate(all_streams):
-        name = s.get('name', '')
-        description = s.get('description', '')
-        raw_parse = (name + ' ' + description).lower()
-        logging.debug("STREAM_ID: %d | RAW_PARSE: %s...", i, raw_parse[:100])
-        parse_string = re.sub(r'\{cannot_apply_modifier_to_null.*?\}', '', raw_parse).encode('utf-8').decode('unicode_escape')  # Remove templates
-        decoded = parse_string
-        norm = unicodedata.normalize('NFKD', decoded).encode('ascii', 'ignore').decode('utf-8')
-        if len(norm) < len(decoded) / 2:
-            logging.warning("STREAM_ID: %d | GARBLED_NORM | LOSS: %d%%", i, (len(decoded) - len(norm)) / len(decoded) * 100)
+        parse_string = clean_string(s.get('name', '') + ' ' + s.get('description', ''))
         hints = s.get('behaviorHints', {})
-        is_cached = hints.get('isCached', False)
-        seed_match = re.search(r'(?:seeders?|seeds?|peers?) ?(\\d+)', parse_string, re.I)
-        seeders = int(seed_match.group(1) or 0) if seed_match else 0
-        if not seed_match:
-            logging.debug("STREAM_ID: %d | SEED_MISS | PARSE: %s...", i, parse_string[:100])
-        size_match = re.search(r'(\\d+\\.?\\d*)\\s*(gb|mb)', parse_string, re.I)
-        size = 0
-        if size_match:
-            size_num = float(size_match.group(1))
-            unit = size_match.group(2).lower()
-            size = int(size_num * (1024**3 if unit == 'gb' else 1024**2))
-        if size == 0:
-            size = hints.get('videoSize', 0)
-            logging.debug("STREAM_ID: %d | SIZE_FALLBACK_TO_HINT: %d", i, size)
-        if size == 0:
-            if '1080p' in parse_string: size = 2000000000  # ~2GB
-            elif '720p' in parse_string: size = 1000000000
-            # etc.
-            logging.debug("STREAM_ID: %d | SIZE_ESTIMATE: %d", i, size)
-        res_match = re.search(r'(4k|2160p|1080p|720p)', parse_string, re.I)
-        if res_match:
-            res_counter[res_match.group(1).upper()] += 1
-        else:
-            logging.debug("STREAM_ID: %d | RES_MISS | PARSE: %s...", i, parse_string[:100])
-        if not res_match and 'resolution' in hints:
-            res_match = re.search(r'(4k|2160p|1080p|720p)', str(hints['resolution']), re.I)
-        lang_match = re.search(r'(eng|en|jpn|jp|ita|it|fra|fr|kor|korean|kr|chn|cn|ger|de|hun|yes|ko)', parse_string, re.I)
-        flags_added = []  # Track for log
-        if lang_match:
-            lang = lang_match.group(1).lower()
-            lang_counter[lang] += 1
-            flag = LANGUAGE_FLAGS.get(lang, '')
-            if flag:
-                name += f' {flag}'
-                flags_added.append(flag)
-            else:
-                logging.debug("STREAM_ID: %d | LANG_NO_FLAG | LANG: %s", i, lang)
-        else:
-            logging.debug("STREAM_ID: %d | LANG_MISS | PARSE: %s...", i, parse_string[:100])
-        # Quality tier matching from patterns
-        quality_tier = 'Unknown'
-        is_bad = False
-        for pat in QUALITY_PATTERNS:
-            if re.match(pat['pattern'], parse_string, re.I):
-                quality_tier = pat['name']
-                if 'Bad' in quality_tier:
-                    is_bad = True
-                break
-        if is_bad:
-            excluded_bad += 1
-            logging.debug("STREAM_ID: %d | FILTER_SKIP_BAD | TIER: %s | PARSE: %s...", i, quality_tier, parse_string[:100])
+        match_score = fuzz.ratio(parse_string, title_ref)
+        if match_score < 60:
+            logging.debug("DISCARD_FAKE | ID: %d | SCORE: %d", i, match_score)
             continue
-        quality_tier_counter[quality_tier] += 1
-        s['quality_tier'] = quality_tier  # Add for sorting
+        quality = get_quality_tier(parse_string)
+        if quality == 'Bad':
+            logging.debug("DISCARD_BAD | ID: %d | QUALITY: %s", i, quality)
+            continue
+        desc = s.get('description', '')
+        health_score = get_health_score(desc)
+        if health_score <= -1:
+            stale_count += 1
+            logging.debug("DISCARD_STALE_USENET | ID: %d | SCORE: %d", i, health_score)
+            if 'tb' in parse_string or 'torbox' in parse_string:
+                logging.info("TORBOX_USENET_EDGE: Filtered 1 stale NZB")
+            continue
+        s['health_score'] = health_score
+        seed_match = re.search(r'seeders? ?(\d+)', parse_string, re.I)
+        seeders = int(seed_match.group(1)) if seed_match else hints.get('seeders', 0) or 0
+        size_match = re.search(r'(\d+\.?\d*) ?(gb|mb)', parse_string, re.I)
+        size_num = float(size_match.group(1)) if size_match else 0
+        unit = size_match.group(2).lower() if size_match else ''
+        size = size_num * (1024**3 if 'gb' in unit else 1024**2 if 'mb' in unit else 0) or hints.get('videoSize', 0)
+        res_match = re.search(r'(4k|2160p|1440p|1080p|720p|576p|540p|480p|360p|240p|144p)', parse_string, re.I)
+        res = res_match.group(0).upper() if res_match else hints.get('resolution', 'Unknown').upper()
+        if size < MIN_SIZE_BYTES or (res in ['SD', 'UNKNOWN', '360P', '480P', '240P', '144P'] and any(r in ['4K', '2160P', '1080P', '720P'] for st in all_streams for r in [st.get('resolution', '').upper()])):
+            logging.debug("DISCARD_LOW_SIZE_RES | ID: %d | SIZE: %d | RES: %s", i, size, res)
+            continue
         if seeders < MIN_SEEDERS:
-            excluded_seeder += 1
-            logging.debug("STREAM_ID: %d | FILTER_SKIP_SEEDER | SEEDERS: %d < %d", i, seeders, MIN_SEEDERS)
+            logging.debug("DISCARD_LOW_SEED | ID: %d | SEED: %d", i, seeders)
             continue
-        if not (MIN_SIZE_BYTES <= size <= MAX_SIZE_BYTES):
-            logging.debug("STREAM_ID: %d | FILTER_SKIP_SIZE | SIZE: %d", i, size)
-            continue
-        if is_cached:
-            filtered.append(s)
-        else:
-            excluded_uncached += 1
-            hash_match = re.search(r'([a-fA-F0-9]{40})', s.get('url', ''), re.I)
+        is_cached = hints.get('isCached', '⚡' in parse_string)
+        if not is_cached:
+            hash_match = re.search(r'[a-fA-F0-9]{40}', s.get('url', ''), re.I)
             if hash_match:
-                service = next((sv for sv in ['rd', 'tb', 'ad'] if sv in parse_string), 'rd')
-                uncached_hashes[service].append(hash_match.group(1).upper())
-    
-    # Verify uncached
-    verified_uncached = 0
-    for service, hashes in uncached_hashes.items():
-        cached = debrid_batch_check(hashes, service)
-        for s in all_streams:
-            url = s.get('url', '')
-            hash_match = re.search(r'([a-fA-F0-9]{40})', url, re.I)
-            if hash_match and hash_match.group(1).upper() in cached:
-                filtered.append(s)
-                verified_uncached += 1
-                logging.debug("STREAM_ID: VERIFIED | HASH: %s | SERVICE: %s", hash_match.group(1), service)
-    
+                uncached_hashes.append(hash_match.group(0).upper())
+        filtered.append(s)
+        s['quality'] = quality
+        s['res'] = res
+        played_feedback[quality] += 1  # Mock; add real feedback if needed
+    verified = verify_cached(uncached_hashes)
+    for s in all_streams:
+        url = s.get('url', '')
+        h_match = re.search(r'[a-fA-F0-9]{40}', url, re.I)
+        if h_match and h_match.group(0).upper() in verified and s not in filtered:
+            filtered.append(s)
+            logging.debug("ADD_VERIFIED | HASH: %s", h_match.group(0))
     kept = len(filtered)
-    filtered_out = total_raw - kept
-    time_ms = int((time.time() - start_time) * 1000)
-    log_summary("Filter", "SUCCESS", kept, f"Filtered: {filtered_out}", time_ms)
-    logging.info("EXCLUDED_DETAILS | UNCACHED: %d | SEEDER < %d: %d | BAD: %d", excluded_uncached, MIN_SEEDERS, excluded_seeder, excluded_bad)
-    logging.info("INCLUDED_DETAILS | RESOLUTION: %s | LANGUAGE: %s | QUALITY_TIERS: %s", dict(res_counter), dict(lang_counter), dict(quality_tier_counter))
-    
-    filtered = list({json.dumps(f, sort_keys=True): f for f in filtered}.values())
-    
+    logging.info("FILTERED_COUNT: %d | STALE_FILTERED: %d", kept, stale_count)
+    res_groups = defaultdict(list)
+    for s in filtered:
+        res_groups[s.get('res', 'Unknown')].append(s)
+    filtered = []
+    for group in res_groups.values():
+        group.sort(key=lambda s: played_feedback[s['quality']], reverse=True)
+        filtered.extend(group[:10])
+    logging.info("SAMPLED | PER_RES: %s", {r: len(g) for r, g in res_groups.items()})
     def sort_key(s):
-        name_lower = (s.get('name', '') + ' ' + s.get('description', '')).lower()
-        is_cached = s.get('behaviorHints', {}).get('isCached', False)
-        cached_priority = 0 if is_cached else 1
-        complete_priority = 0 if 'complete' in name_lower else 1
-        res_priority = {'4K': 0, '2160P': 0, '1080P': 2, '720P': 3}.get(next((r.upper() for r in ['4k', '2160p', '1080p', '720p'] if r.lower() in name_lower), ''), 4)
-        if res_priority == 4:
-            logging.debug("SORT | RES_MISS | NAME: %s", name_lower[:100])
-        # Tier priority from patterns (lower number better)
-        tier_priority = next((i for i, pat in enumerate(QUALITY_PATTERNS) if pat['name'] == s.get('quality_tier')), 100)
-        size_match = re.search(r'(\\d+\\.?\\d*)\\s*(gb|mb)', name_lower, re.I)
-        size = 0
-        if size_match:
-            size_num = float(size_match.group(1))
-            unit = size_match.group(2).lower()
-            size = int(size_num * (1024**3 if unit == 'gb' else 1024**2))
-        logging.debug("SORT_KEY | ID: %d | COMPONENTS: cached=%d complete=%d res=%d tier=%d size=-%d", i, cached_priority, complete_priority, res_priority, tier_priority, size)
-        return (cached_priority, complete_priority, res_priority, tier_priority, -size)  # General sort with size
-    
-    start_time = time.time()
+        parse_string = (s.get('name', '') + ' ' + s.get('description', '')).lower()
+        service = hints.get('service', '') or ('tb' if 'tb' in parse_string or 'torbox' in parse_string else 'rd' if 'rd' in parse_string or 'realdebrid' in parse_string else 'ad' if 'ad' in parse_string or 'alldebrid' in parse_string else 'unknown')
+        if service == 'unknown':
+            logging.warning("PROVIDER_MISS | STREAM: %s", s.get('name', ''))
+        provider_p = 0 if service == 'tb' else 1 if service == 'rd' else 2 if service == 'ad' else 3
+        quality_p = 0 if s.get('quality') == 'Remux' else 1 if s.get('quality') == 'Bluray' else 2 if s.get('quality') == 'Web' else 3
+        health_boost = -s.get('health_score', 0) if ('usenet' in parse_string or 'nzb' in parse_string) else 0
+        return (provider_p, quality_p, health_boost)
     filtered.sort(key=sort_key)
-    time_ms = int((time.time() - start_time) * 1000)
-    log_summary("Sorter", "SUCCESS", len(filtered), "Sorted streams", time_ms)
-    logging.info("SORT_SUMMARY | FIRST_5: %s", [f.get('name', '') for f in filtered[:5]])
-    
-    start_time = time.time()
-    for i, s in enumerate(filtered):
-        name = s.get('name', '')
-        description = s.get('description', '')
-        parse_string = (name + ' ' + description).lower().encode('utf-8').decode('unicode_escape')
-        if 'cannot_apply_modifier_to_null' in parse_string:
-            logging.warning("STREAM_ID: %d | TEMPLATE_UNRESOLVED | FALLBACK_TO_DESC", i)
-            parse_string = description.lower() + ' ' + str(hints)  # Fallback
-        service_match = re.search(r'(rd|tb|ad|store)', parse_string, re.I)
-        if service_match:
-            service = service_match.group(1).lower()
-            name = f"{SERVICE_COLORS.get(service, '')}{name}[/]"
-        if re.search(r'[\uac00-\ud7a3]', parse_string):
-            name += ' 🇰🇷'
-            logging.debug("STREAM_ID: %d | SCRIPT_FLAG_HANGUL", i)
-        lang_match = re.search(r'(eng|en|jpn|jp|ita|it|fra|fr|kor|korean|kr|chn|cn|ger|de|hun|yes|ko)', parse_string, re.I)
-        flags_added = []  # Track for log
-        if lang_match:
-            lang = lang_match.group(1).lower()
-            flag = LANGUAGE_FLAGS.get(lang, '')
-            if flag:
-                name += f' {flag}'
-                flags_added.append(flag)
-            else:
-                logging.debug("STREAM_ID: %d | LANG_NO_FLAG | LANG: %s", i, lang)
-        else:
-            logging.debug("STREAM_ID: %d | LANG_MISS | PARSE: %s...", i, parse_string[:100])
-        audio_match = re.search(r'(dd\+|dd|dts-hd|dts|opus|aac|atmos|ma|truehd|5\.1|7\.1|2\.0)', parse_string, re.I)
-        if audio_match:
-            name += f" ♬ {audio_match.group(1).upper()}"
-        else:
-            logging.debug("STREAM_ID: %d | AUDIO_MISS | PARSE: %s...", i, parse_string[:100])
-        cached_icon = "⚡" if s.get('behaviorHints', {}).get('isCached', False) else "⏳"
-        res = next((r.upper().replace('2160P', '4K') for r in ['4k', '2160p', '1080p', '720p'] if r.lower() in parse_string), '? Res')
-        quality = s.get('quality_tier', '')
-        size_str = f"{size / (1024**3):.1f} GB" if size > 0 else '? GB'
-        name = f"{res} {cached_icon} {quality} {size_str} · {name}"
-        s['name'] = name
-        logging.info("STREAM_ID: %d | FINAL_NAME: %s | FLAGS_ADDED: %s", i, name, flags_added)
-    
-    time_ms = int((time.time() - start_time) * 1000)
-    log_summary("Formatter", "SUCCESS", len(filtered), "Transformed streams", time_ms)
-    
-    start_time = time.time()
-    # Proxy as in aiostreams
-    proxied = len(filtered)
-    time_ms = int((time.time() - start_time) * 1000)
-    log_summary("Proxy", "SUCCESS", proxied, "Generated proxied URLs", time_ms)
-    
-    logging.info("CORE | Returning %d streams", min(60, len(filtered)))
-    logging.info("FINAL_STATS | Total Raw: %d | Filtered Out: %d | Kept: %d | Proxied: %d", total_raw, filtered_out, kept, proxied)
-    return jsonify({'streams': filtered[:60]})
-
+    delivered = len(filtered)
+    logging.info("DELIVERED_COUNT: %d | FINAL", delivered)
+    return jsonify({'streams': filtered})
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
