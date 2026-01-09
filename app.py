@@ -1,3 +1,4 @@
+```python
 from flask import Flask, request, jsonify
 import requests
 import os
@@ -23,7 +24,7 @@ session.mount('https://', adapter)
 
 AIO_BASE = os.environ.get('AIO_URL', 'https://buubuu99-aiostreams.elfhosted.cc/stremio/acc199cb-6b12-4fa9-be4e-a8ff4c13fa50/eyJpIjoiRTJES0N1ZFBaWm8wb25aS05tNEFsUT09IiwiZSI6InhrVVFtdTFEWm5lcGVrcEh5VUZaejZlcEJLMEMrcXdLakY4UU9zUDJoOFE9IiwidCI6ImEifQ')
 STORE_BASE = os.environ.get('STORE_URL', 'https://buubuu99-stremthru.elfhosted.cc/stremio/store/eyJzdG9yZV9uYW1lIjoiIiwic3RvcmVfdG9rZW4iOiJZblYxWW5WMU9UazZUV0Z5YVhOellUazVRREV4Tnc9PSIsImhpZGVfY2F0YWxvZyI6dHJ1ZSwid2ViZGwiOnRydWV9')
-USE_STORE = os.environ.get('USE_STORE', 'false').lower() == 'true'  # Changed to false based on your clarification
+USE_STORE = os.environ.get('USE_STORE', 'false').lower() == 'true'
 
 MIN_SEEDERS = int(os.environ.get('MIN_SEEDERS', 0))
 MIN_SIZE_BYTES = int(os.environ.get('MIN_SIZE_BYTES', 500000000))
@@ -34,7 +35,7 @@ PING_TIMEOUT = 2
 API_POLL_TIMEOUT = 10
 RD_API_KEY = 'Z4C3UT777IK2U6EUZ5HLVVMO7BYQPDNEOJUGAFLUBXMGTSX2Z6RA'
 TB_API_KEY = '1046c773-9d0d-4d53-95ab-8976a559a5f6'
-AD_API_KEY = 'ZXzHvUmLsuuRmgyHg5zjFsk8'  # Updated to v2's key
+AD_API_KEY = 'ZXzHvUmLsuuRmgyHg5zjFsk8'
 
 LANGUAGE_FLAGS = {
     'eng': '🇬🇧', 'en': '🇬🇧', 'jpn': '🇯🇵', 'jp': '🇯🇵', 'ita': '🇮🇹', 'it': '🇮🇹',
@@ -114,6 +115,20 @@ def get_streams(type_, id_):
         except Exception as e:
             logging.error(f"Store fetch failed: {e}")
     return streams
+
+@app.route('/manifest.json')
+def manifest():
+    manifest_data = {
+        "id": "org.grok.wrapper",
+        "version": "1.0.45",
+        "name": "AIO Wrapper",
+        "description": "Wraps AIOStreams to filter and format streams (Store optional)",
+        "resources": ["stream"],
+        "types": ["movie", "series"],
+        "catalogs": [],
+        "idPrefixes": ["tt"]
+    }
+    return jsonify(manifest_data)
 
 @app.route('/stream/<type_>/<id_>.json')
 def stream(type_, id_):
@@ -228,7 +243,6 @@ def stream(type_, id_):
     
     logging.info(f"Final filtered: {len(filtered)}")
     
-    # New: Safe final JSON log
     final_streams = filtered[:60]
     try:
         logging.debug(f"Final streams JSON (sample if large): {json.dumps({'streams': final_streams[:5]}, indent=2)} ... (total {len(final_streams)})")
@@ -242,6 +256,7 @@ def stream(type_, id_):
 if __name__ == '__main__':
     try:
         port = int(os.environ.get('PORT', 5000))
-        app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)  # Force debug for full logs
+        app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)
     except Exception as e:
         logging.error(f"App startup error: {e}")
+```
