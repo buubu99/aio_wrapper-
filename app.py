@@ -116,6 +116,9 @@ def streams(media_type, media_id):
     logging.info("RAW_COUNT: %d", total_raw)
 
     filtered = []
+    discarded_bad = 0
+    discarded_low_size_res = 0
+    discarded_low_seed = 0
     uncached_hashes = []
     for i, s in enumerate(all_streams):
         parse_string = clean_string(s.get('name', '') + ' ' + s.get('description', ''))
@@ -123,17 +126,20 @@ def streams(media_type, media_id):
         
         quality = get_quality_tier(parse_string)
         if quality == 'Bad':
+            discarded_bad += 1
             logging.debug("DISCARD_BAD | ID: %d | QUALITY: %s", i, quality)
             continue
         
         seeders = int(re.search(r'seeders? ?(\d+)', parse_string, re.I).group(1) or hints.get('seeders', 0) or 0)
         size = hints.get('videoSize', 0) or (float(re.search(r'(\d+\.?\d*) ?(gb|mb)', parse_string, re.I).group(1) or 0) * (1024**3 if 'gb' else 1024**2))
-        res = re.search(r'(4k|2160p|1080p|720p)', parse_string, re.I).group(0).upper() if re.search else hints.get('resolution', 'Unknown').upper() if hints.get('resolution') else 'Unknown'
+        res = re.search(r'(4k|2160p|1080p|720p)', parse_string, re.I).group(0).upper() if re.search else hints.get('resolution', 'Unknown').upper()
         
         if size < MIN_SIZE_BYTES or (res in ['SD', 'UNKNOWN'] and any(r in ['4K', '1080P', '720P'] for r in [st.get('resolution', '') for st in all_streams])):
+            discarded_low_size_res += 1
             logging.debug("DISCARD_LOW_SIZE_RES | ID: %d | SIZE: %d | RES: %s", i, size, res)
             continue
         if seeders < MIN_SEEDERS:
+            discarded_low_seed += 1
             logging.debug("DISCARD_LOW_SEED | ID: %d | SEED: %d", i, seeders)
             continue
         
@@ -145,6 +151,10 @@ def streams(media_type, media_id):
         
         filtered.append(s)
         s['quality'] = quality
+
+    # Log filter stats
+    discarded_total = discarded_bad + discarded_low_size_res + discarded_low_seed
+    logging.info("FILTER_STATS | DISCARDED_BAD: %d | DISCARDED_LOW_SIZE_RES: %d | DISCARDED_LOW_SEED: %d | DISCARDED_TOTAL: %d | KEPT: %d", discarded_bad, discarded_low_size_res, discarded_low_seed, discarded_total, len(filtered))
 
     # Verify uncached (TB first)
     verified = verify_cached(uncached_hashes, 'tb')
