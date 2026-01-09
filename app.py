@@ -1,4 +1,3 @@
-```python
 from flask import Flask, request, jsonify
 import requests
 import os
@@ -259,4 +258,3 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)
     except Exception as e:
         logging.error(f"App startup error: {e}")
-```
