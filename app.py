@@ -9,11 +9,18 @@ import time
 from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from logging.handlers import RotatingFileHandler
 
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False
 CORS(app, resources={r"/*": {"origins": "*"}})
-logging.basicConfig(level=os.environ.get('LOG_LEVEL', 'DEBUG'))
+
+# Enhanced logging: Console + rotating file
+logging.basicConfig(level=os.environ.get('LOG_LEVEL', 'DEBUG'), format='%(asctime)s | %(levelname)s | %(message)s')
+file_handler = RotatingFileHandler('app.log', maxBytes=10000, backupCount=1)
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
+logging.getLogger().addHandler(file_handler)
 
 session = requests.Session()
 retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
@@ -55,6 +62,10 @@ SERVICE_COLORS = {
     'store': '[purple]', 'stremthru': '[purple]'
 }
 
+@app.before_request
+def log_request():
+    logging.info(f"Incoming request: {request.method} {request.url} from {request.remote_addr}")
+
 def debrid_check_cache(url, service='rd'):
     hash_match = re.search(r'(?:magnet:\?xt=urn:btih:)?([a-fA-F0-9]{40})', url, re.I)
     if not hash_match:
@@ -72,16 +83,18 @@ def debrid_check_cache(url, service='rd'):
         params = {'apikey': AD_API_KEY}
         try:
             response = session.get(api_url, params=params, timeout=REQUEST_TIMEOUT)
+            logging.debug(f"AD API response: status={response.status_code}, content={response.text[:200]}...")
             response.raise_for_status()
             data = response.json()
             return data.get('data', {}).get('magnets', {}).get('instant', False)
         except Exception as e:
-            logging.error(f"AD cache check failed: {e}")
+            logging.exception(f"AD cache check failed for URL {url}: {e}")
             return False
     else:
         return False
     try:
         response = session.get(api_url, headers=headers, timeout=REQUEST_TIMEOUT)
+        logging.debug(f"{service.upper()} API response: status={response.status_code}, content={response.text[:200]}...")
         response.raise_for_status()
         data = response.json()
         if service == 'rd':
@@ -89,7 +102,7 @@ def debrid_check_cache(url, service='rd'):
         elif service == 'tb':
             return data.get('data', {}).get('is_cached', False)
     except Exception as e:
-        logging.error(f"{service.upper()} cache check failed: {e}")
+        logging.exception(f"{service.upper()} cache check failed for URL {url}: {e}")
         return False
 
 def get_streams(type_, id_):
@@ -99,35 +112,45 @@ def get_streams(type_, id_):
     start = time.time()
     try:
         response = session.get(aio_url, timeout=REQUEST_TIMEOUT)
+        logging.debug(f"AIO response: status={response.status_code}, content={response.text[:200]}...")
         response.raise_for_status()
         data = response.json()
-        streams.extend(data.get('streams', []))
-        logging.info(f"Fetched {len(streams)} from AIO in {time.time() - start:.2f}s")
+        aio_streams = data.get('streams', [])
+        streams.extend(aio_streams)
+        logging.info(f"Fetched {len(aio_streams)} streams from AIO in {time.time() - start:.2f}s")
+        if len(aio_streams) == 0:
+            logging.warning("No streams fetched from AIO - check URL, network, or AIO service status")
     except Exception as e:
-        logging.error(f"AIO fetch failed: {e}")
+        logging.exception(f"AIO fetch failed: {e}")
     if USE_STORE:
         start_store = time.time()
         try:
             response_store = session.get(store_url, timeout=REQUEST_TIMEOUT)
+            logging.debug(f"Store response: status={response_store.status_code}, content={response_store.text[:200]}...")
             response_store.raise_for_status()
             data_store = response_store.json()
-            streams.extend(data_store.get('streams', []))
-            logging.info(f"Fetched {len(data_store.get('streams', []))} from Store in {time.time() - start_store:.2f}s")
+            store_streams = data_store.get('streams', [])
+            streams.extend(store_streams)
+            logging.info(f"Fetched {len(store_streams)} streams from Store in {time.time() - start_store:.2f}s")
+            if len(store_streams) == 0:
+                logging.warning("No streams fetched from Store - check URL, network, or Store service status")
         except Exception as e:
-            logging.error(f"Store fetch failed: {e}")
-    # Added: Log raw data for debugging
-    logging.info(f"Raw streams count from backends: {len(streams)}")
-    if streams:
-        logging.debug(f"Sample raw streams: {json.dumps(streams[:3], indent=2)}")
+            logging.exception(f"Store fetch failed: {e}")
+    total_raw = len(streams)
+    logging.info(f"Raw streams count from all backends: {total_raw}")
+    if total_raw > 0:
+        logging.debug(f"Sample raw streams (first 3): {json.dumps(streams[:3], indent=2)}")
+    elif total_raw == 0:
+        logging.warning("Zero raw streams fetched overall - potential issue with backends or query")
     return streams
 
 @app.route('/manifest.json')
 def manifest():
     manifest_data = {
         "id": "org.grok.wrapper",
-        "version": "1.0.45",
+        "version": "1.0.46",
         "name": "AIO Wrapper",
-        "description": "Wraps AIOStreams to filter and format streams (Store optional)",
+        "description": "Wraps AIOStreams to filter and format streams (Store optional) - Enhanced Logging Edition",
         "resources": ["stream"],
         "types": ["movie", "series"],
         "catalogs": [],
@@ -139,7 +162,8 @@ def manifest():
 def stream(type_, id_):
     logging.info(f"Stream request: {type_}/{id_}")
     streams = get_streams(type_, id_)
-    logging.debug(f"Raw streams fetched: {len(streams)}")
+    raw_count = len(streams)
+    logging.debug(f"Raw streams fetched: {raw_count}")
     filtered = []
     uncached_count = 0
     for i, s in enumerate(streams):
@@ -177,7 +201,10 @@ def stream(type_, id_):
         filtered.append(s)
         s['hints'] = hints
         logging.debug(f"Kept stream {i}: seeders={seeders}, size={size_bytes}, cached={hints.get('isCached', 'N/A')}")
-    logging.info(f"Filtered: {len(filtered)} (from {len(streams)} raw)")
+    filtered_count = len(filtered)
+    logging.info(f"Post-filter count: {filtered_count} (from {raw_count} raw)")
+    if filtered_count == 0 and raw_count > 0:
+        logging.warning(f"Zero streams after filtering - check filters (MIN_SEEDERS={MIN_SEEDERS}, MIN_SIZE={MIN_SIZE_BYTES}) or stream quality")
     res_order = {'4k': 5, '2160p': 5, '1440p': 4, '1080p': 3, '720p': 2, '480p': 1, 'sd': 0}
     def sort_key(s):
         parse = unicodedata.normalize('NFKD', s.get('name', '') + ' ' + s.get('title', '')).lower()
@@ -190,7 +217,10 @@ def stream(type_, id_):
         is_cached = s.get('hints', {}).get('isCached', False)
         return (-int(is_cached), -seeders, -size_gb, -res_score)
     filtered.sort(key=sort_key)
-    logging.info(f"Sorted {len(filtered)} streams: cached first, then seeders/size/res descending")
+    sorted_count = len(filtered)
+    logging.info(f"Post-sort count: {sorted_count} (cached first, then seeders/size/res descending)")
+    if sorted_count != filtered_count:
+        logging.warning(f"Count mismatch after sort: pre-sort {filtered_count}, post-sort {sorted_count} - potential bug")
     for i, s in enumerate(filtered):
         parse_string = unicodedata.normalize('NFKD', s.get('name', '') + ' ' + s.get('title', '') + ' ' + s.get('infoHash', '')).lower()
         hints = s.get('hints', {})
@@ -247,16 +277,19 @@ def stream(type_, id_):
             s['name'] = name
         logging.debug(f"Formatted stream {i}: final name='{s['name']}'")
     
-    logging.info(f"Final filtered: {len(filtered)}")
+    final_count = len(filtered)
+    logging.info(f"Final delivered count: {final_count}")
+    if final_count == 0:
+        logging.warning("Zero final streams - full pipeline stats: raw={raw_count}, filtered={filtered_count}, sorted={sorted_count}")
     
     final_streams = filtered[:60]
     try:
-        logging.debug(f"Final streams JSON (sample if large): {json.dumps({'streams': final_streams[:5]}, indent=2)} ... (total {len(final_streams)})")
-        if final_streams:
+        if final_count > 0:
+            logging.debug(f"Final streams JSON sample (first 5): {json.dumps({'streams': final_streams[:5]}, indent=2)} ... (total {final_count})")
             logging.info(f"Final delivered sample: Name '{final_streams[0].get('name', 'NO NAME')}'")
     except Exception as e:
-        logging.error(f"Final JSON log failed: {e} - Streams count {len(final_streams)}; possible large data issue - Mismatch with Stremio if >0")
-    
+        logging.exception(f"Final JSON log failed: {e} - Streams count {final_count}; possible large data issue")
+
     return jsonify({'streams': final_streams})
 
 if __name__ == '__main__':
@@ -264,4 +297,5 @@ if __name__ == '__main__':
         port = int(os.environ.get('PORT', 5000))
         app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)
     except Exception as e:
-        logging.error(f"App startup error: {e}")
+        logging.exception(f"App startup error: {e}")
+    
