@@ -14,6 +14,10 @@ from logging.handlers import RotatingFileHandler
 app = Flask(__name__)
 app.config['JSON_AS_ASCII'] = False
 CORS(app, resources={r"/*": {"origins": "*"}})
+@app.get("/health")
+def health():
+    # Tiny, fast response for uptime checks
+    return jsonify(ok=True, ts=int(time.time())), 200
 
 # Enhanced logging: Console + rotating file
 logging.basicConfig(level=os.environ.get('LOG_LEVEL', 'DEBUG'), format='%(asctime)s | %(levelname)s | %(message)s')
