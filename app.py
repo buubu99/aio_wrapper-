@@ -392,6 +392,7 @@ def filter_streams(type_: str, id_: str, streams: List[Dict[str, Any]]) -> Tuple
     stats.dropped_trakt = stats.merged_in - len(classified) - stats.dropped_error - stats.dropped_blacklist - stats.dropped_fake
     
     # TorBox verify (batch all at once)
+    cached_map = {}  # Default to empty if not verifying
     if VERIFY_STREAM:
         tb_hashes = [m["infohash"] for s, m in classified if m["provider"] == "TB" and m["infohash"]]
         stats.verify_checked = len(tb_hashes)
