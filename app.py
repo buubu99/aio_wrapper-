@@ -205,7 +205,7 @@ def dedup_key(s: Dict[str, Any], meta: Dict[str, Any]) -> str:
 # TorBox batch verify (updated)
 # ---------------------------
 
-TB_BATCH_SIZE = 50  # For Pro
+TB_BATCH_SIZE = 50  # Increased for Pro plan
 
 def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
     if not hashes or not TB_API_KEY:
@@ -248,15 +248,16 @@ def trakt_validate(s: Dict[str, Any], expected: Dict[str, Any]) -> bool:
     # Clean candidate: remove year and tech specs after title
     candidate = re.sub(r'\s*\(\d{4}\).*', '', candidate).strip()
     candidate = re.sub(r'[\._-]', ' ', candidate)  # Replace dots, underscores, hyphens with spaces
-    candidate_clean = re.sub(r'(1080p|720p|2160p|4k|uhd|web-?dl|web-?rip|blu-?ray|bdrip|hdtv|dvdrip|hdrip|hdcam|cam|ts|hdts|x264|x265|h264|h265|hevc|avc|vp9|av1|aac|ac3|ddp|dd|dts|truehd|atmos|5\.1|7\.1|2\.0|mkv|mp4|avi|srt|multi|dub|eng|fr|es|de|it|ja|hi|kor)', '', candidate, flags=re.I).strip()
+    candidate_clean = re.sub(r'(1080p|720p|2160p|4k|uhd|web-?dl|web-?rip|blu-?ray|bdrip|hdtv|dvdrip|hdrip|hdcam|cam|ts|hdts|x264|x265|h264|h265|hevc|avc|vp9|av1|aac|ac3|ddp|dd|dts|truehd|atmos|5\.1|7\.1|2\.0|mkv|mp4|avi|srt|multi|dub|eng|fr|es|de|it|ja|hi|kor|hdr|dv|hdr10|hdr10p|remux|hybrid|surcode|playbd|frame?stor|bhys|ourbits|diyhdhome|tmt)', '', candidate, flags=re.I).strip()
+    candidate_clean = re.sub(r'-[a-zA-Z0-9]+$', '', candidate_clean).strip()  # Remove releaser tag like -GROUP
     candidate_clean = re.sub(r'\s+', ' ', candidate_clean).lower()
     candidate_norm = unicodedata.normalize("NFKD", candidate_clean).encode("ascii", "ignore").decode()
     
     expected_title = expected.get("title", "").lower()
     expected_norm = unicodedata.normalize("NFKD", expected_title).encode("ascii", "ignore").decode()
     
-    # Extract year
-    candidate_year_match = re.search(r'\((\d{4})\)', candidate)
+    # Extract year (expanded)
+    candidate_year_match = re.search(r'[\.\-_ ](\d{4})[\.\-_ ]?', candidate)
     candidate_year = int(candidate_year_match.group(1)) if candidate_year_match else None
     
     # Similarity
@@ -289,19 +290,19 @@ def format_stream_inplace(s: Dict[str, Any], meta: Dict[str, Any], expected: Dic
     if not source_text and expected.get("title"):
         source_text = f"{expected['title']} ({expected.get('year', '')})"
     
-    # Expanded patterns for robustness
-    res_match = re.search(r'(\d{3,4}p|4k|uhd|hd|sd)', source_text, re.I)
-    source_match = re.search(r'(webrip|blu[- ]?ray|web[- ]?dl|web|ts|hd[- ]?cam|dvd[- ]?rip|cam|hdcam|hdrip|bdrip|hdtv|dvd)', source_text, re.I)
-    codec_match = re.search(r'(x264|x265|h264|h265|hevc|avc|vp9|av1)', source_text, re.I)
-    audio_match = re.search(r'(ddp|truehd|atmos|aac|dd|ac3|dts|5\.1|7\.1|2\.0)', source_text, re.I)
-    lang_match = re.search(r'(kor|eng|esub|multi|dub|fr|es|de|it|ja|hi)', source_text, re.I)  # Expand langs
+    # Expanded patterns for robustness, using findall for multiples where applicable
+    res_matches = re.findall(r'(\d{3,4}p|4k|uhd|hd|sd)', source_text, re.I)
+    source_matches = re.findall(r'(webrip|blu[- ]?ray|web[- ]?dl|web|ts|hd[- ]?cam|dvd[- ]?rip|cam|hdcam|hdrip|bdrip|hdtv|dvd)', source_text, re.I)
+    codec_matches = re.findall(r'(x264|x265|h264|h265|hevc|avc|vp9|av1)', source_text, re.I)
+    audio_matches = re.findall(r'(ddp|truehd|atmos|aac|dd|ac3|dts|5\.1|7\.1|2\.0)', source_text, re.I)
+    lang_matches = re.findall(r'(kor|eng|esub|multi|dub|fr|es|de|it|ja|hi)', source_text, re.I)  # Expand langs
     
     parts = []
-    if res_match: parts.append(res_match.group(1).upper())
-    if source_match: parts.append(source_match.group(1).upper().replace(' ', ''))
-    if codec_match: parts.append(codec_match.group(1).upper())
-    if audio_match: parts.append(audio_match.group(1).upper())
-    if lang_match: parts.append(lang_match.group(1).upper())
+    parts.extend(m.upper() for m in set(res_matches))  # Dedup
+    parts.extend(m.upper().replace(' ', '') for m in set(source_matches))
+    parts.extend(m.upper() for m in set(codec_matches))
+    parts.extend(m.upper() for m in set(audio_matches))
+    parts.extend(m.upper() for m in set(lang_matches))
     
     provider = meta.get("provider", s.get("description", ""))
     if provider: parts.append(provider)
@@ -405,10 +406,14 @@ def filter_streams(type_: str, id_: str, streams: List[Dict[str, Any]]) -> Tuple
             if not m["infohash"]:
                 stats.dropped_verify += 1
                 continue
-            if cached_map.get(m["infohash"], False):
+            is_cached = cached_map.get(m["infohash"], False)
+            if is_cached:
                 new_classified.append((s, m))
             else:
                 stats.dropped_verify += 1
+                # Optional: Log misclassification if AIO hinted cached but not
+                if "Cached" in s.get("name", "") or "cached" in s.get("description", "").lower():
+                    logging.warning(f"AIO misclassified uncached TB stream as cached: {s.get('url', 'unknown')[:50]}...")
         classified = new_classified
     
     # Seeders filter (assume min from env)
