@@ -34,7 +34,7 @@ USE_FAKES_DB = os.environ.get("USE_FAKES_DB", "true").lower() == "true"
 USE_SIZE_MISMATCH = os.environ.get("USE_SIZE_MISMATCH", "true").lower() == "true"
 USE_AGE_HEURISTIC = os.environ.get("USE_AGE_HEURISTIC", "false").lower() == "true"
 TRAKT_VALIDATE_TITLES = os.environ.get("TRAKT_VALIDATE_TITLES", "true").lower() == "true"
-TRAKT_TITLE_MIN_RATIO = float(os.environ.get("TRAKT_TITLE_MIN_RATIO", "0.85"))
+TRAKT_TITLE_MIN_RATIO = float(os.environ.get("TRAKT_TITLE_MIN_RATIO", "0.50"))
 TRAKT_STRICT_YEAR = os.environ.get("TRAKT_STRICT_YEAR", "true").lower() == "true"
 TRAKT_CLIENT_ID = os.environ.get("TRAKT_CLIENT_ID", "")
 VERIFY_STREAM = os.environ.get("VERIFY_STREAM", "true").lower() == "true"
@@ -246,17 +246,21 @@ def trakt_validate(s: Dict[str, Any], expected: Dict[str, Any]) -> bool:
         return False
     
     # Clean candidate: remove year and tech specs after title
-    candidate_clean = re.sub(r'\s*\(\d{4}\).*', '', candidate).strip().lower()
+    candidate = re.sub(r'\s*\(\d{4}\).*', '', candidate).strip()
+    candidate = re.sub(r'[\._-]', ' ', candidate)  # Replace dots, underscores, hyphens with spaces
+    candidate_clean = re.sub(r'(1080p|720p|2160p|4k|uhd|web-?dl|web-?rip|blu-?ray|bdrip|hdtv|dvdrip|hdrip|hdcam|cam|ts|hdts|x264|x265|h264|h265|hevc|avc|vp9|av1|aac|ac3|ddp|dd|dts|truehd|atmos|5\.1|7\.1|2\.0|mkv|mp4|avi|srt|multi|dub|eng|fr|es|de|it|ja|hi|kor)', '', candidate, flags=re.I).strip()
+    candidate_clean = re.sub(r'\s+', ' ', candidate_clean).lower()
     candidate_norm = unicodedata.normalize("NFKD", candidate_clean).encode("ascii", "ignore").decode()
     
     expected_title = expected.get("title", "").lower()
+    expected_norm = unicodedata.normalize("NFKD", expected_title).encode("ascii", "ignore").decode()
     
     # Extract year
     candidate_year_match = re.search(r'\((\d{4})\)', candidate)
     candidate_year = int(candidate_year_match.group(1)) if candidate_year_match else None
     
     # Similarity
-    ratio = SequenceMatcher(None, candidate_norm, expected_title).ratio()
+    ratio = SequenceMatcher(None, candidate_norm, expected_norm).ratio()
     if ratio < TRAKT_TITLE_MIN_RATIO:
         logging.debug(f"Dropping low ratio {ratio}: {candidate} vs {expected_title}")
         return False
@@ -269,7 +273,8 @@ def trakt_validate(s: Dict[str, Any], expected: Dict[str, Any]) -> bool:
     # Optional: Check aliases if low but close
     if ratio < 0.9 and "aliases" in expected:
         for alias in expected["aliases"]:
-            alias_norm = unicodedata.normalize("NFKD", alias.get("title", "").lower()).encode("ascii", "ignore").decode()
+            alias_title = alias.get("title", "").lower()
+            alias_norm = unicodedata.normalize("NFKD", alias_title).encode("ascii", "ignore").decode()
             if SequenceMatcher(None, candidate_norm, alias_norm).ratio() >= TRAKT_TITLE_MIN_RATIO:
                 return True
     
@@ -407,7 +412,7 @@ def filter_streams(type_: str, id_: str, streams: List[Dict[str, Any]]) -> Tuple
         classified = new_classified
     
     # Seeders filter (assume min from env)
-    min_seeders = int(os.environ.get("MIN_SEEDERS", "1"))
+    min_seeders = int(os.environ.get("MIN_SEEDERS", "0"))
     classified = [(s, m) for s, m in classified if m["kind"] != "torrent" or m["seeders"] >= min_seeders]
     stats.dropped_seeders = stats.merged_in - len(classified) - stats.dropped_error - stats.dropped_blacklist - stats.dropped_fake - stats.dropped_trakt - stats.dropped_verify
     
