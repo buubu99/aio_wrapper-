@@ -249,37 +249,37 @@ def trakt_validate(s: Dict[str, Any], expected: Dict[str, Any]) -> bool:
     candidate = re.sub(r'\s*\(\d{4}\).*', '', candidate).strip()
     candidate = re.sub(r'[\._-]', ' ', candidate)  # Replace dots, underscores, hyphens with spaces
     candidate_clean = re.sub(r'(1080p|720p|2160p|4k|uhd|web-?dl|web-?rip|blu-?ray|bdrip|hdtv|dvdrip|hdrip|hdcam|cam|ts|hdts|x264|x265|h264|h265|hevc|avc|vp9|av1|aac|ac3|ddp|dd|dts|truehd|atmos|5\.1|7\.1|2\.0|mkv|mp4|avi|srt|multi|dub|eng|fr|es|de|it|ja|hi|kor|hdr|dv|hdr10|hdr10p|remux|hybrid|surcode|playbd|frame?stor|bhys|ourbits|diyhdhome|tmt)', '', candidate, flags=re.I).strip()
-    candidate_clean = re.sub(r'-[a-zA-Z0-9]+$', '', candidate_clean).strip()  # Remove releaser tag like -GROUP
+    candidate_clean = re.sub(r'-[a-zA-Z0-9]+$', '', candidate_clean).strip()
     candidate_clean = re.sub(r'\s+', ' ', candidate_clean).lower()
     candidate_norm = unicodedata.normalize("NFKD", candidate_clean).encode("ascii", "ignore").decode()
     
     expected_title = expected.get("title", "").lower()
     expected_norm = unicodedata.normalize("NFKD", expected_title).encode("ascii", "ignore").decode()
     
-    # Extract year (expanded)
-    candidate_year_match = re.search(r'[\.\-_ ](\d{4})[\.\-_ ]?', candidate)
+    # Extract year (improved to avoid 1080p etc.)
+    candidate_year_match = re.search(r'[\.\-_ ](19\d{2}|20\d{2})[\.\-_ ]?(?!p)', candidate, re.I)
     candidate_year = int(candidate_year_match.group(1)) if candidate_year_match else None
     
     # Similarity
     ratio = SequenceMatcher(None, candidate_norm, expected_norm).ratio()
-    if ratio < TRAKT_TITLE_MIN_RATIO:
-        logging.debug(f"Dropping low ratio {ratio}: {candidate} vs {expected_title}")
-        return False
+    if ratio >= TRAKT_TITLE_MIN_RATIO:
+        if not TRAKT_STRICT_YEAR or not candidate_year or candidate_year == expected.get("year"):
+            return True
     
-    # Strict year
-    if TRAKT_STRICT_YEAR and expected.get("year") and candidate_year and candidate_year != expected["year"]:
-        logging.debug(f"Dropping year mismatch: {candidate_year} vs {expected['year']}")
-        return False
-    
-    # Optional: Check aliases if low but close
-    if ratio < 0.9 and "aliases" in expected:
+    # Check aliases
+    if "aliases" in expected:
         for alias in expected["aliases"]:
             alias_title = alias.get("title", "").lower()
             alias_norm = unicodedata.normalize("NFKD", alias_title).encode("ascii", "ignore").decode()
-            if SequenceMatcher(None, candidate_norm, alias_norm).ratio() >= TRAKT_TITLE_MIN_RATIO:
+            alias_ratio = SequenceMatcher(None, candidate_norm, alias_norm).ratio()
+            if alias_ratio >= TRAKT_TITLE_MIN_RATIO:
+                # Optional: Check country-specific year if available, but assume same
                 return True
     
-    return True
+    logging.debug(f"Dropping low ratio {ratio}: {candidate} vs {expected_title}")
+    if candidate_year and candidate_year != expected.get("year"):
+        logging.debug(f"Dropping year mismatch: {candidate_year} vs {expected['year']}")
+    return False
 
 # ---------------------------
 # Format stream (updated)
