@@ -1,10 +1,10 @@
 {
-  "id": "org.grok.wrapper",
-  "version": "1.0.45",
+  "id": "org.jason.wrapper",
+  "version": "1.1.0",
   "name": "AIO Wrapper",
-  "description": "Wraps AIOStreams to filter and format streams",
+  "description": "Wraps AIOStreams to filter and format streams w usenet",
   "resources": ["stream"],
   "types": ["movie", "series"],
   "catalogs": []
-  "idPrefixes": [tt]
+  "idPrefixes": ["tt"]
 }
