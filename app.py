@@ -1,475 +1,774 @@
-from flask import Flask, request, jsonify, g, has_request_context
-import requests
-import os
-import logging
-import re
+from __future__ import annotations
+
+import base64
 import json
-import unicodedata
+import logging
+import os
+import re
 import time
+import unicodedata
 import uuid
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
+import requests
+from flask import Flask, jsonify, request, g, has_request_context
 from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from logging.handlers import RotatingFileHandler
+
+
+# ---------------------------
+# App + logging
+# ---------------------------
 
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-
-@app.get("/health")
-def health():
-    return jsonify(ok=True, ts=int(time.time())), 200
-
-
-# ---------------------------
-# Logging helpers (SAFE)
-# ---------------------------
-def _coerce_log_level(value: str) -> int:
-    """
-    Accepts: debug/DEBUG/info/INFO/warn/WARNING/error/ERROR, etc, or numeric strings.
-    Returns python logging level int. Never throws.
-    """
-    if value is None:
-        return logging.DEBUG
-
-    v = str(value).strip()
-    if not v:
-        return logging.DEBUG
-
-    if v.isdigit():
-        try:
-            return int(v)
-        except Exception:
-            return logging.DEBUG
-
-    v = v.upper()
-    if v == "WARN":
-        v = "WARNING"
-    if v == "FATAL":
-        v = "CRITICAL"
-
-    return logging._nameToLevel.get(v, logging.DEBUG)
-
-
-def current_rid() -> str:
-    if has_request_context():
-        return getattr(g, "rid", "-")
-    return "-"
-
+def _log_level(v: str) -> int:
+    return {
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,
+        "WARNING": logging.WARNING,
+        "ERROR": logging.ERROR,
+        "CRITICAL": logging.CRITICAL,
+    }.get((v or "INFO").upper(), logging.INFO)
 
 class RequestIdFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.rid = current_rid()
+        record.rid = g.request_id if has_request_context() and hasattr(g, "request_id") else "NO_REQ"
         return True
 
+LOG_LEVEL = _log_level(os.environ.get("LOG_LEVEL", "INFO"))
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(rid)s | %(message)s")
+logging.getLogger().addFilter(RequestIdFilter())
 
-LOG_LEVEL_ENV = os.environ.get("LOG_LEVEL", "INFO")
-LOG_LEVEL = _coerce_log_level(LOG_LEVEL_ENV)
+@app.before_request
+def _before_request() -> None:
+    g.request_id = str(uuid.uuid4())[:8]
 
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s | %(levelname)s | %(rid)s | %(message)s",
-)
-
-root_logger = logging.getLogger()
-root_logger.addFilter(RequestIdFilter())
-
-file_handler = RotatingFileHandler("app.log", maxBytes=200000, backupCount=3)
-file_handler.setLevel(logging.DEBUG)
-file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(rid)s | %(message)s"))
-file_handler.addFilter(RequestIdFilter())
-root_logger.addHandler(file_handler)
+def _rid() -> str:
+    return g.request_id if has_request_context() and hasattr(g, "request_id") else "NO_REQ"
 
 
 # ---------------------------
-# HTTP session w/ retry
+# HTTP session
 # ---------------------------
+
+# NOTE: REQUEST_TIMEOUT is seconds. If you previously used milliseconds, reduce it (e.g. 20-40).
+REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "20"))
 session = requests.Session()
-retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+retry = Retry(total=3, backoff_factor=0.6, status_forcelist=[500, 502, 503, 504], allowed_methods=["GET", "POST"])
 adapter = HTTPAdapter(max_retries=retry)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
 
 
 # ---------------------------
-# Config / ENV (env-first)
+# ENV
 # ---------------------------
-AIO_BASE = os.environ.get(
-    "AIO_URL",
-    "https://buubuu99-aiostreams.elfhosted.cc/stremio/<uuid>/<token>",
-)
 
-STORE_BASE = os.environ.get(
-    "STORE_URL",
-    "https://buubuu99-stremthru.elfhosted.cc/stremio/store/<token>",
-)
+AIO_BASE = (os.environ.get("AIO_URL") or "").rstrip("/")
+AIOSTREAMS_AUTH = (os.environ.get("AIOSTREAMS_AUTH") or "").strip()  # "user:pass" optional
 
-USE_STORE = os.environ.get("USE_STORE", "false").lower() == "true"  # you said: false
+MAX_DELIVER = int(os.environ.get("MAX_DELIVER", "60"))
+INPUT_CAP = int(os.environ.get("INPUT_CAP", "4500"))
+WRAPPER_DEDUP = os.environ.get("WRAPPER_DEDUP", "true").lower() in ("1", "true", "yes", "on")
 
-MIN_SEEDERS = int(os.environ.get("MIN_SEEDERS", 10))
-MIN_SIZE_BYTES = int(os.environ.get("MIN_SIZE_BYTES", 2000000000))  # ~2GB min
-MAX_SIZE_BYTES = int(os.environ.get("MAX_SIZE_BYTES", 100000000000))
+# Usenet survival
+MIN_USENET_KEEP = int(os.environ.get("MIN_USENET_KEEP", "6"))
 
-REQUEST_TIMEOUT = int(os.environ.get("TIMEOUT", 60000)) / 1000  # seconds
-MAX_UNCACHED_KEEP = int(os.environ.get("MAX_UNCACHED_KEEP", 5))
+# Safety toggles
+USE_BLACKLISTS = os.environ.get("USE_BLACKLISTS", "true").lower() in ("1", "true", "yes", "on")
+USE_FAKES_DB = os.environ.get("USE_FAKES_DB", "true").lower() in ("1", "true", "yes", "on")
+USE_SIZE_MISMATCH = os.environ.get("USE_SIZE_MISMATCH", "true").lower() in ("1", "true", "yes", "on")
+USE_AGE_HEURISTIC = os.environ.get("USE_AGE_HEURISTIC", "false").lower() in ("1", "true", "yes", "on")
 
-RD_API_KEY = os.environ.get("RD_API_KEY", "").strip()
-TB_API_KEY = os.environ.get("TB_API_KEY", "").strip()
-AD_API_KEY = os.environ.get("AD_API_KEY", "").strip()
+# Torrent-only knobs
+MIN_TORRENT_SEEDERS = int(os.environ.get("MIN_TORRENT_SEEDERS", "1"))
 
-LANGUAGE_FLAGS = {
-    "eng": "🇬🇧",
-    "en": "🇬🇧",
-    "jpn": "🇯🇵",
-    "jp": "🇯🇵",
-    "ita": "🇮🇹",
-    "it": "🇮🇹",
-    "fra": "🇫🇷",
-    "fr": "🇫🇷",
-    "kor": "🇰🇷",
-    "kr": "🇰🇷",
-    "chn": "🇨🇳",
-    "cn": "🇨🇳",
-    "uk": "🇬🇧",
-    "ger": "🇩🇪",
-    "de": "🇩🇪",
-    "hun": "🇭🇺",
-    "yes": "📝",
-    "ko": "🇰🇷",
-    "rus": "🇷🇺",
-    "hin": "🇮🇳",
-    "multi": "🌍",
+# TorBox verify cached (torrent-only)
+VERIFY_STREAM = os.environ.get("VERIFY_STREAM", "false").lower() in ("1", "true", "yes", "on")
+REFORMAT_STREAMS = os.environ.get("REFORMAT_STREAMS", "true").lower() in ("1", "true", "yes", "on")
+MAX_DESC_CHARS = int(os.environ.get("MAX_DESC_CHARS", "180"))
+
+# Friendly provider labels for Stremio UI (keeps original code in behaviorHints)
+PROVIDER_LABEL = {
+    "TB": "TorBox",
+    "RD": "Real-Debrid",
+    "AD": "AllDebrid",
+    "ND": "Usenet",
+    "": "Unknown",
+}
+TB_API_KEY = (os.environ.get("TB_API_KEY") or "").strip()
+TB_BASE = (os.environ.get("TB_API_BASE") or "https://api.torbox.app").rstrip("/")
+TB_API_VERSION = (os.environ.get("TB_API_VERSION") or "v1").strip("/")
+TB_CHECKCACHED_BATCH = int(os.environ.get("TB_CHECKCACHED_BATCH", "25"))  # hashes per call
+
+# Trakt validation
+TRAKT_VALIDATE_TITLES = os.environ.get("TRAKT_VALIDATE_TITLES", "true").lower() in ("1", "true", "yes", "on")
+TRAKT_STRICT_YEAR = os.environ.get("TRAKT_STRICT_YEAR", "true").lower() in ("1", "true", "yes", "on")
+TRAKT_TITLE_MIN_RATIO = float(os.environ.get("TRAKT_TITLE_MIN_RATIO", "0.72"))
+TRAKT_CLIENT_ID = (os.environ.get("TRAKT_CLIENT_ID") or "").strip()
+
+# Blacklists / heuristics (same style as your originals)
+BLACKLISTED_EXTS = [x.strip().lower() for x in os.environ.get("BLACKLISTED_EXTS", ".rar,.exe,.zip").split(",") if x.strip()]
+BLACKLISTED_GROUPS = [x.strip().lower() for x in os.environ.get("BLACKLISTED_GROUPS", "GalaxyRG,beAst,COLLECTiVE,EPiC,iVy,KiNGDOM,Scene,SUNSCREEN,TGx,TVU").split(",") if x.strip()]
+MIN_AGE_DAYS = int(os.environ.get("MIN_AGE_DAYS", "7"))
+SIZE_MISMATCH_THRESHOLDS = {
+    "2160p": int(os.environ.get("MIN_2160P_BYTES", "4000000000")),
+    "1080p": int(os.environ.get("MIN_1080P_BYTES", "1000000000")),
+    "720p": int(os.environ.get("MIN_720P_BYTES", "500000000")),
+    "unknown": int(os.environ.get("MIN_UNKNOWN_BYTES", "200000000")),
 }
 
-SERVICE_COLORS = {
-    "rd": "[red]",
-    "realdebrid": "[red]",
-    "tb": "[blue]",
-    "torbox": "[blue]",
-    "ad": "[green]",
-    "alldebrid": "[green]",
-    "store": "[purple]",
-    "stremthru": "[purple]",
-}
+FAKE_DB_FILE = os.environ.get("FAKE_DB_FILE", "fakes.json")
+
+if not AIO_BASE:
+    logging.warning("AIO_URL is not set; wrapper will return empty streams.")
 
 
 # ---------------------------
-# Request logging (RID + latency)
+# Parsing + classification
 # ---------------------------
-@app.before_request
-def log_request():
-    g.rid = uuid.uuid4().hex[:10]
-    g.t0 = time.time()
-    logging.info(f"Incoming request: {request.method} {request.path} from {request.remote_addr}")
 
+_RES_RE = re.compile(r"\b(2160p|1080p|720p|480p)\b", re.I)
+_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(gb|mb)\b", re.I)
+_SEED_RE = re.compile(r"(?:👥|seeders?|seeds?|peers?)\s*[:\-]?\s*(\d+)\b", re.I)
 
-@app.after_request
-def log_response(resp):
-    try:
-        dt = (time.time() - getattr(g, "t0", time.time())) * 1000
-        logging.info(f"Response: {resp.status_code} {request.path} {dt:.2f}ms")
-    except Exception:
-        pass
-    return resp
+HEX40_RE = re.compile(r"\b[a-f0-9]{40}\b", re.I)
 
+def _norm(*parts: str) -> str:
+    txt = " ".join([p for p in parts if isinstance(p, str) and p])
+    return unicodedata.normalize("NFKD", txt).lower()
 
-# ---------------------------
-# Debrid cache check
-# ---------------------------
-def debrid_check_cache(url, service="rd"):
-    hash_match = re.search(r"(?:magnet:\?xt=urn:btih:)?([a-fA-F0-9]{40})", url, re.I)
-    if not hash_match:
-        logging.debug(f"No torrent hash found in URL: {url}")
-        return False
+def _bytes_from_name(name: str) -> int:
+    m = _SIZE_RE.search(name or "")
+    if not m:
+        return 0
+    val = float(m.group(1))
+    unit = m.group(2).lower()
+    if unit == "mb":
+        val = val / 1024.0
+    return int(val * 1024 * 1024 * 1024)
 
-    torrent_hash = hash_match.group(1).lower()
+def _res(blob: str) -> str:
+    m = _RES_RE.search(blob)
+    return (m.group(1).lower() if m else "unknown")
 
-    if service == "rd":
-        if not RD_API_KEY:
-            return False
-        api_url = f"https://api.real-debrid.com/rest/1.0/torrents/instantAvailability/{torrent_hash}"
-        headers = {"Authorization": f"Bearer {RD_API_KEY}"}
-        try:
-            response = session.get(api_url, headers=headers, timeout=REQUEST_TIMEOUT)
-            logging.debug(f"RD API response: status={response.status_code}, content={response.text[:200]}...")
-            response.raise_for_status()
-            data = response.json()
-            return bool(data.get(torrent_hash, {}).get("rd"))
-        except Exception as e:
-            logging.exception(f"RD cache check failed for URL {url}: {e}")
-            return False
+def _seeders(blob: str) -> int:
+    m = _SEED_RE.search(blob)
+    return int(m.group(1)) if m else 0
 
-    if service == "tb":
-        if not TB_API_KEY:
-            return False
-        api_url = f"https://api.torbox.app/v1/api/torrents/checkcached?hash={torrent_hash}&list_files=true"
-        headers = {"Authorization": f"Bearer {TB_API_KEY}"}
-        try:
-            response = session.get(api_url, headers=headers, timeout=REQUEST_TIMEOUT)
-            logging.debug(f"TB API response: status={response.status_code}, content={response.text[:200]}...")
-            response.raise_for_status()
-            data = response.json()
-            return bool(data.get("data", {}).get("is_cached", False))
-        except Exception as e:
-            logging.exception(f"TB cache check failed for URL {url}: {e}")
-            return False
+def _provider(stream: Dict[str, Any]) -> str:
+    # AIOStreams uses description as provider short-code ("TB","RD","AD","ND", ...)
+    return (stream.get("description") or "").strip().upper()
 
-    if service == "ad":
-        if not AD_API_KEY:
-            return False
-        api_url = (
-            "https://api.alldebrid.com/v4/magnet/instant"
-            f"?agent=StremioWrapper&version=1.0&magnet={requests.utils.quote(url)}"
-        )
-        params = {"apikey": AD_API_KEY}
-        try:
-            response = session.get(api_url, params=params, timeout=REQUEST_TIMEOUT)
-            logging.debug(f"AD API response: status={response.status_code}, content={response.text[:200]}...")
-            response.raise_for_status()
-            data = response.json()
-            return bool(data.get("data", {}).get("magnets", {}).get("instant", False))
-        except Exception as e:
-            logging.exception(f"AD cache check failed for URL {url}: {e}")
-            return False
+def _link(stream: Dict[str, Any]) -> str:
+    return stream.get("url") or stream.get("externalUrl") or ""
 
-    return False
+def _title_candidate(stream: Dict[str, Any]) -> str:
+    bh = stream.get("behaviorHints") or {}
+    return (bh.get("filename") or stream.get("name") or "").strip()
 
+def _is_error_stream(stream: Dict[str, Any]) -> bool:
+    # AIOStreams sometimes returns addon errors as "streams" (no URL, error text)
+    url = _link(stream)
+    if not url:
+        return True
+    d = (stream.get("description") or "").lower()
+    n = (stream.get("name") or "").lower()
+    bad = ("timed out" in d) or ("internal server error" in d) or ("unexpected end of json" in d) or ("timed out" in n)
+    return bad
 
-# ---------------------------
-# Fetch streams (AIO + optional Store) + wrapper-input count
-# ---------------------------
-def get_streams(type_, id_):
-    aio_url = f"{AIO_BASE}/stream/{type_}/{id_}.json"
-    store_url = f"{STORE_BASE}/stream/{type_}/{id_}.json" if USE_STORE else None
+def extract_infohash(url: str) -> Optional[str]:
+    """
+    Extract torrent infohash from URLs commonly seen in AIOStreams output:
+    - Comet: .../playback/<40hex>/...
+    - Torrentio: .../resolve/torbox/<apikey>/<40hex>/...
+    - Any URL containing a standalone 40-hex token
+    """
+    if not url:
+        return None
+    u = url.lower()
 
-    streams = []
-    aio_in = 0  # <-- THIS is your wrapper input count from AIO (post-AIO-dedupe)
-    store_in = 0
+    # Comet playback pattern
+    m = re.search(r"/playback/([a-f0-9]{40})(?:/|$)", u)
+    if m:
+        return m.group(1)
 
-    # Safe measure: send rid for correlation (harmless even if you won't use it)
-    req_headers = {
-        "X-Request-Id": current_rid(),
-        "User-Agent": "AIOWrapper/1.0",
+    # Torrentio resolve pattern
+    m = re.search(r"/resolve/torbox/[^/]+/([a-f0-9]{40})(?:/|$)", u)
+    if m:
+        return m.group(1)
+
+    # Fallback: any 40-hex in the URL
+    m = HEX40_RE.search(u)
+    if m:
+        return m.group(0)
+
+    return None
+
+def classify(stream: Dict[str, Any]) -> Dict[str, Any]:
+    prov = _provider(stream)
+    url = _link(stream)
+    blob = _norm(stream.get("name", ""), _title_candidate(stream), prov, url)
+    kind = "usenet" if prov == "ND" else "torrent" if prov in ("TB", "RD", "AD") else "other"
+    return {
+        "provider": prov,
+        "kind": kind,
+        "url": url,
+        "blob": blob,
+        "res": _res(blob),
+        "size": _bytes_from_name(blob),
+        "seeders": _seeders(blob),
+        "infohash": extract_infohash(url) if kind == "torrent" else None,
     }
 
+def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> Tuple[str, str]:
+    # Dedup torrents by infohash when available; otherwise by (provider, url) to avoid collapsing different providers.
+    if meta["kind"] == "torrent" and meta.get("infohash"):
+        return ("torrent", meta["infohash"])
+    if meta["url"]:
+        return (meta["kind"], meta["provider"] + "|" + meta["url"])
+    return (meta["kind"], meta["provider"] + "|" + (stream.get("name") or ""))
+
+
+
+# ---------------------------
+# Optional stream reformatting (keeps behaviorHints intact)
+# ---------------------------
+
+_TAGS = [
+    ("REMUX", r"\bremux\b"),
+    ("BluRay", r"\bbluray\b|\bblu-ray\b"),
+    ("WEB-DL", r"\bweb[- ]?dl\b"),
+    ("WEBRip", r"\bwebrip\b"),
+    ("HDTV", r"\bhdtv\b"),
+    ("HDR", r"\bhdr\b"),
+    ("DV", r"\bdv\b|\bdolby[ ._-]?vision\b"),
+    ("HEVC", r"\bhevc\b|\bx265\b|\bh\.?265\b"),
+    ("AVC", r"\bx264\b|\bh\.?264\b"),
+    ("DD+", r"\bddp\b|\bdd\+\b"),
+    ("DTS", r"\bdts\b"),
+    ("AAC", r"\baac\b"),
+    ("Atmos", r"\batmos\b"),
+]
+
+def _safe_one_line(s: str) -> str:
+    s = (s or "").replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _human_size(n_bytes: int) -> str:
+    if not n_bytes:
+        return ""
+    gb = n_bytes / (1024**3)
+    if gb >= 100:
+        return f"{gb:.0f} GB"
+    if gb >= 10:
+        return f"{gb:.1f} GB"
+    return f"{gb:.2f} GB"
+
+def _pick_tags(blob: str) -> str:
+    blob = blob or ""
+    tags = []
+    for label, rx in _TAGS:
+        if re.search(rx, blob, flags=re.I):
+            tags.append(label)
+    # Keep a stable, compact order and avoid duplicates
+    seen = set()
+    tags2 = []
+    for t in tags:
+        if t not in seen:
+            seen.add(t)
+            tags2.append(t)
+    return " • ".join(tags2[:5])
+
+def _expected_title(expected: Optional[Dict[str, Any]]) -> str:
+    if not expected:
+        return ""
+    t = (expected.get("title") or "").strip()
+    y = expected.get("year")
+    return f"{t} ({y})" if t and y else t
+
+def format_stream_inplace(stream: Dict[str, Any], meta: Dict[str, Any], expected: Optional[Dict[str, Any]], cached_hint: str = "") -> None:
+    """
+    Rewrites stream['name'] and stream['description'] to be consistent + compact.
+    Leaves URLs + behaviorHints untouched.
+    """
+    prov = meta.get("provider") or ""
+    kind = meta.get("kind") or "other"
+    res = meta.get("res") or ""
+    size = meta.get("size") or 0
+    seeders = meta.get("seeders") or 0
+
+    # Left column label in Stremio is typically stream.name
+    label = PROVIDER_LABEL.get(prov, prov or "Source")
+    stream["name"] = _safe_one_line(f"{label} {('• ' + res) if res else ''}".strip(" •"))
+
+    # Build one-line description (avoid multi-line blowups)
+    title = _expected_title(expected) or ""
+    tags = _pick_tags(meta.get("blob") or "")
+    size_s = _human_size(size)
+    parts = []
+    if title:
+        parts.append(title)
+    if tags:
+        parts.append(tags)
+    if size_s:
+        parts.append(f"📦 {size_s}")
+    if kind == "torrent" and seeders:
+        parts.append(f"👥 {seeders}")
+    if cached_hint:
+        parts.append(cached_hint)
+
+    desc = " • ".join(parts) if parts else _safe_one_line(stream.get("name", ""))
+
+    # Hard cap for UI cleanliness
+    if MAX_DESC_CHARS and len(desc) > MAX_DESC_CHARS:
+        desc = desc[: MAX_DESC_CHARS - 1].rstrip() + "…"
+
+    stream["description"] = _safe_one_line(desc) or prov or ""
+
+# ---------------------------
+# Fakes DB persistence (same as v2, but safe for json)
+# ---------------------------
+
+def load_fakes() -> Dict[str, set]:
+    if not USE_FAKES_DB:
+        return {"hashes": set(), "groups": set()}
+    if os.path.exists(FAKE_DB_FILE):
+        try:
+            with open(FAKE_DB_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            return {"hashes": set(data.get("hashes") or []), "groups": set(data.get("groups") or [])}
+        except Exception as e:
+            logging.warning(f"Failed to load fakes DB: {e}")
+    return {"hashes": set(), "groups": set()}
+
+def save_fakes(fakes: Dict[str, set]) -> None:
+    if not USE_FAKES_DB:
+        return
     try:
-        start = time.time()
-        response = session.get(aio_url, timeout=REQUEST_TIMEOUT, headers=req_headers)
-        logging.debug(f"AIO response: status={response.status_code}, content={response.text[:200]}...")
-        response.raise_for_status()
-        data = response.json()
-
-        aio_streams = data.get("streams", [])
-        aio_in = len(aio_streams)
-        streams.extend(aio_streams)
-
-        logging.info(f"Fetched {aio_in} streams from AIO in {time.time() - start:.2f}s")
-
+        with open(FAKE_DB_FILE, "w", encoding="utf-8") as f:
+            json.dump({"hashes": sorted(list(fakes.get("hashes") or set())),
+                       "groups": sorted(list(fakes.get("groups") or set()))}, f)
     except Exception as e:
-        logging.exception(f"AIO fetch failed: {e}")
+        logging.warning(f"Failed to save fakes DB: {e}")
 
-    if USE_STORE and store_url:
-        try:
-            start_store = time.time()
-            response_store = session.get(store_url, timeout=REQUEST_TIMEOUT, headers=req_headers)
-            logging.debug(f"Store response: status={response_store.status_code}, content={response_store.text[:200]}...")
-            response_store.raise_for_status()
-            data_store = response_store.json()
-            store_streams = data_store.get("streams", [])
-            store_in = len(store_streams)
-            streams.extend(store_streams)
-            logging.info(f"Fetched {store_in} streams from Store in {time.time() - start_store:.2f}s")
-        except Exception as e:
-            logging.exception(f"Store fetch failed: {e}")
-
-    return streams, aio_in, store_in
-
-
-@app.route("/manifest.json")
-def manifest():
-    manifest_data = {
-        "id": "org.grok.wrapper",
-        "version": "1.0.46",
-        "name": "AIO Wrapper",
-        "description": "Wraps AIOStreams to filter and format streams (Store optional) - Enhanced Logging Edition",
-        "resources": ["stream"],
-        "types": ["movie", "series"],
-        "catalogs": [],
-        "idPrefixes": ["tt"],
-    }
-    return jsonify(manifest_data)
+FAKES = load_fakes()
 
 
 # ---------------------------
-# Stream endpoint + GUARANTEED final stats line
-# Final line is ONLY: {"aio_in":X,"delivered":Y}
+# Trakt validator (read-only, client id only)
 # ---------------------------
-@app.route("/stream/<type_>/<id_>.json")
-def stream(type_, id_):
-    logging.info(f"Stream request: {type_}/{id_}")
 
-    # Minimal stats ONLY (as requested)
-    stats = {"aio_in": 0, "delivered": 0}
+def _norm_title(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[\[\]\(\)\{\}]", " ", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = re.sub(r"\b(the|a|an|and|of|to|in|on|for|with)\b", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
+def _title_ratio(a: str, b: str) -> float:
+    from difflib import SequenceMatcher
+    a_n, b_n = _norm_title(a), _norm_title(b)
+    if not a_n or not b_n:
+        return 0.0
+    return SequenceMatcher(None, a_n, b_n).ratio()
+
+@lru_cache(maxsize=4096)
+def trakt_lookup_imdb(imdb: str, type_: str) -> Optional[Dict[str, Any]]:
+    if not (TRAKT_CLIENT_ID and imdb):
+        return None
+    type_param = "movie" if type_ == "movie" else "show"
+    url = f"https://api.trakt.tv/search/imdb/{imdb}"
+    headers = {"Content-Type": "application/json", "trakt-api-version": "2", "trakt-api-key": TRAKT_CLIENT_ID}
     try:
-        streams, aio_in, store_in = get_streams(type_, id_)
-        stats["aio_in"] = aio_in
+        r = session.get(url, headers=headers, params={"type": type_param, "extended": "full"}, timeout=REQUEST_TIMEOUT)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        data = r.json() or []
+        if not data:
+            return None
+        obj = data[0].get(type_param) or {}
+        return {"title": obj.get("title"), "year": obj.get("year")}
+    except Exception as e:
+        logging.warning(f"Trakt lookup failed: {e}")
+        return None
 
-        filtered = []
-        uncached_count = 0
 
-        for i, s in enumerate(streams):
-            try:
-                parse_string = unicodedata.normalize(
-                    "NFKD",
-                    (s.get("name", "") + " " + s.get("title", "") + " " + s.get("infoHash", "")),
-                ).lower()
+@lru_cache(maxsize=4096)
+def trakt_lookup_tmdb(tmdb_id: str, type_: str) -> Optional[Dict[str, Any]]:
+    if not (TRAKT_CLIENT_ID and tmdb_id):
+        return None
+    type_param = "movie" if type_ == "movie" else "show"
+    url = f"https://api.trakt.tv/search/tmdb/{tmdb_id}"
+    headers = {"Content-Type": "application/json", "trakt-api-version": "2", "trakt-api-key": TRAKT_CLIENT_ID}
+    try:
+        r = session.get(url, headers=headers, params={"type": type_param, "extended": "full"}, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json() or []
+        if not data:
+            return None
+        obj = data[0].get(type_param) or {}
+        return {"title": obj.get("title"), "year": obj.get("year")}
+    except Exception as e:
+        logging.warning(f"Trakt TMDB lookup failed: {e}")
+        return None
 
-                # Size filter
-                size_match = re.search(r"(\d+(?:\.\d+)?)\s*(gb|mb)", parse_string, re.I)
-                if size_match:
-                    size_gb = (
-                        float(size_match.group(1))
-                        if size_match.group(2).lower() == "gb"
-                        else float(size_match.group(1)) / 1024
-                    )
-                    size_bytes = size_gb * 1073741824
-                else:
-                    size_bytes = 0
+def trakt_lookup_id(id_: str, type_: str) -> Optional[Dict[str, Any]]:
+    """
+    Prefer IMDB ids (tt...), fallback to tmdb:12345
+    """
+    if not id_:
+        return None
+    if id_.startswith("tt"):
+        return trakt_lookup_imdb(id_, type_)
+    if id_.startswith("tmdb:"):
+        tmdb_id = id_.split(":", 1)[1]
+        if tmdb_id.isdigit():
+            return trakt_lookup_tmdb(tmdb_id, type_)
+    return None
 
-                if size_bytes and (size_bytes < MIN_SIZE_BYTES or size_bytes > MAX_SIZE_BYTES):
-                    continue
+def trakt_title_ok(candidate: str, expected: Optional[Dict[str, Any]]) -> bool:
+    if not TRAKT_VALIDATE_TITLES or not expected:
+        return True
+    exp_title = expected.get("title") or ""
+    exp_year = expected.get("year")
+    cand = candidate or ""
+    m = re.search(r"\b(19\d{2}|20\d{2})\b", cand)
+    if TRAKT_STRICT_YEAR and exp_year and m:
+        try:
+            if int(m.group(1)) != int(exp_year):
+                return False
+        except Exception:
+            pass
+    if exp_title:
+        return _title_ratio(exp_title, cand) >= TRAKT_TITLE_MIN_RATIO
+    return True
 
-                # Seeder filter
-                seeder_match = re.search(
-                    r"(?:👥|seeders?|seeds?|⇋|peers?) ?(\d+)(?:𖧧)?|(\d+)\s*(?:seed|𖧧)",
-                    parse_string,
-                    re.I | re.U,
-                )
-                seeders = int(seeder_match.group(1) or seeder_match.group(2)) if seeder_match else 0
-                if seeders < MIN_SEEDERS:
-                    continue
 
-                hints = {}
-                service = next((k for k in SERVICE_COLORS if k in parse_string), None)
-                if service:
-                    hints["service"] = service
-                    url = s.get("url", "") or s.get("behaviorHints", {}).get("proxyUrl", "")
-                    if url:
-                        is_cached = debrid_check_cache(url, service)
-                        hints["isCached"] = is_cached
-                        if not is_cached:
-                            uncached_count += 1
-                            if uncached_count > MAX_UNCACHED_KEEP:
-                                continue
+# ---------------------------
+# TorBox cached verification (torrent-only, batch)
+# Docs: /v1/api/torrents/checkcached (GET/POST)
+# ---------------------------
 
-                s["hints"] = hints
-                filtered.append(s)
+@lru_cache(maxsize=2048)
+def torbox_checkcached_batch(hashes_csv: str) -> Dict[str, bool]:
+    """
+    hashes_csv: comma-separated 40-hex hashes (lowercase)
+    Returns {hash: True/False} for those hashes we could determine.
+    """
+    if not (VERIFY_STREAM and TB_API_KEY):
+        return {}
+    hashes = [h for h in hashes_csv.split(",") if h]
+    if not hashes:
+        return {}
 
-            except Exception:
-                logging.exception(f"Exception while processing stream[{i}] (keeping it OUT)")
+    url = f"{TB_BASE}/{TB_API_VERSION}/api/torrents/checkcached"
+    headers = {"Authorization": f"Bearer {TB_API_KEY}"}
+    # TorBox supports GET and POST; POST is safer for batches.
+    try:
+        r = session.post(url, headers=headers, json={"hashes": hashes, "format": "object", "list_files": False},
+                         timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        j = r.json() or {}
+        data = j.get("data")
+        out: Dict[str, bool] = {}
+        # API has had breaking changes; handle dict/list/None. See TorBox changelog.
+        if data is None:
+            return {h: False for h in hashes}
+        if isinstance(data, dict):
+            # format=object: keys are hashes that are cached
+            for h in hashes:
+                out[h] = bool(data.get(h))
+            return out
+        if isinstance(data, list):
+            # format=list variant: contains cached objects
+            cached_set = set()
+            for item in data:
+                if isinstance(item, dict) and item.get("hash"):
+                    cached_set.add(str(item["hash"]).lower())
+            for h in hashes:
+                out[h] = h in cached_set
+            return out
+        return {}
+    except Exception as e:
+        logging.warning(f"TorBox checkcached failed (kept streams, fail-open): {e}")
+        return {}
+
+
+def torbox_is_cached(infohash: str) -> Optional[bool]:
+    """
+    Returns True/False if determinable. None if cannot verify (missing key, etc.).
+    """
+    if not infohash:
+        return None
+    if not (VERIFY_STREAM and TB_API_KEY):
+        return None
+    # Use cached batch function with single element (still cached by lru_cache)
+    res = torbox_checkcached_batch(infohash.lower())
+    return res.get(infohash.lower())
+
+
+# ---------------------------
+# Fetch AIOStreams
+# ---------------------------
+
+def _aio_auth() -> Optional[Tuple[str, str]]:
+    if not AIOSTREAMS_AUTH or ":" not in AIOSTREAMS_AUTH:
+        return None
+    u, p = AIOSTREAMS_AUTH.split(":", 1)
+    return (u, p)
+
+def get_streams(type_: str, id_: str) -> Tuple[List[Dict[str, Any]], int]:
+    if not AIO_BASE:
+        return [], 0
+    aio_url = f"{AIO_BASE}/stream/{type_}/{id_}.json"
+    headers = {"X-Request-Id": _rid(), "User-Agent": "AIOWrapper/4.0"}
+    try:
+        r = session.get(aio_url, headers=headers, auth=_aio_auth(), timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json() or {}
+        streams = data.get("streams") or []
+        if len(streams) > INPUT_CAP:
+            streams = streams[:INPUT_CAP]
+        return streams, len(streams)
+    except Exception as e:
+        logging.warning(f"AIO fetch failed: {e}")
+        return [], 0
+
+
+# ---------------------------
+# Pipeline + stats
+# ---------------------------
+
+@dataclass
+class PipeStats:
+    aio_in: int = 0
+    merged_in: int = 0
+    dropped_error: int = 0
+    dropped_blacklist: int = 0
+    dropped_fake: int = 0
+    dropped_size: int = 0
+    dropped_age: int = 0
+    dropped_trakt: int = 0
+    dropped_verify: int = 0
+    dropped_seeders: int = 0
+    deduped: int = 0
+    delivered: int = 0
+    delivered_usenet: int = 0
+    delivered_torrent: int = 0
+    verify_checked: int = 0
+    verify_missing_hash: int = 0
+
+
+def filter_streams(type_: str, id_: str, streams: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], PipeStats]:
+    st = PipeStats(merged_in=len(streams), aio_in=len(streams))
+    expected = trakt_lookup_id(id_, type_) if TRAKT_VALIDATE_TITLES else None
+
+    kept: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+
+    # Precompute hashes for TorBox verification (torrent-only, provider TB only)
+    # We check TB only; RD/AD won't be verified.
+    tb_hashes: List[str] = []
+    metas: List[Dict[str, Any]] = []
+    for s in streams:
+        meta = classify(s)
+        metas.append(meta)
+        if VERIFY_STREAM and meta["kind"] == "torrent" and meta["provider"] == "TB":
+            ih = meta.get("infohash")
+            if ih:
+                tb_hashes.append(ih.lower())
+
+    # Batch check in chunks
+    tb_cached: Dict[str, bool] = {}
+    if VERIFY_STREAM and TB_API_KEY and tb_hashes:
+        # de-dup hashes before querying
+        uniq = sorted(set(tb_hashes))
+        for i in range(0, len(uniq), TB_CHECKCACHED_BATCH):
+            chunk = uniq[i:i+TB_CHECKCACHED_BATCH]
+            res = torbox_checkcached_batch(",".join(chunk))
+            tb_cached.update(res)
+
+    for s, meta in zip(streams, metas):
+        if _is_error_stream(s):
+            st.dropped_error += 1
+            continue
+
+        blob = meta["blob"]
+
+        # Blacklists
+        if USE_BLACKLISTS:
+            if any(ext in blob for ext in BLACKLISTED_EXTS) or any(g in blob for g in BLACKLISTED_GROUPS):
+                st.dropped_blacklist += 1
                 continue
 
-        # Sort
-        res_order = {"4k": 5, "2160p": 5, "1440p": 4, "1080p": 3, "720p": 2, "480p": 1, "sd": 0}
+        # Fakes DB
+        if USE_FAKES_DB and meta["kind"] == "torrent":
+            ih = meta.get("infohash")
+            if ih and ih in FAKES["hashes"]:
+                st.dropped_fake += 1
+                continue
+            if any(g in blob for g in FAKES["groups"]):
+                st.dropped_fake += 1
+                continue
 
-        def sort_key(s):
-            parse = unicodedata.normalize("NFKD", (s.get("name", "") + " " + s.get("title", ""))).lower()
-            res_match = re.search(r"(4k|2160p|1440p|1080p|720p|480p|sd)", parse, re.I)
-            res_score = res_order.get(res_match.group(1).lower() if res_match else "sd", 0)
+        # Size mismatch (optional)
+        if USE_SIZE_MISMATCH and meta["size"]:
+            if meta["size"] < SIZE_MISMATCH_THRESHOLDS.get(meta["res"], SIZE_MISMATCH_THRESHOLDS["unknown"]):
+                st.dropped_size += 1
+                continue
 
-            size_match = re.search(r"(\d+(?:\.\d+)?)\s*(gb|mb)", parse, re.I)
-            size_gb = (
-                float(size_match.group(1))
-                if size_match and size_match.group(2).lower() == "gb"
-                else (float(size_match.group(1)) / 1024 if size_match else 0)
-            )
+        # Age heuristic (optional)
+        if USE_AGE_HEURISTIC:
+            m = re.search(r"(\d{4}-\d{2}-\d{2})", blob)
+            if m:
+                try:
+                    age_days = (time.time() - time.mktime(time.strptime(m.group(1), "%Y-%m-%d"))) / 86400
+                    if age_days > MIN_AGE_DAYS:
+                        st.dropped_age += 1
+                        continue
+                except Exception:
+                    pass
 
-            seeder_match = re.search(
-                r"(?:👥|seeders?|seeds?|⇋|peers?) ?(\d+)(?:𖧧)?|(\d+)\s*(?:seed|𖧧)",
-                parse,
-                re.I | re.U,
-            )
-            seeders = int(seeder_match.group(1) or seeder_match.group(2)) if seeder_match else 0
+        # Trakt validation
+        cand = _title_candidate(s)
+        if expected and not trakt_title_ok(cand, expected):
+            st.dropped_trakt += 1
+            continue
 
-            is_cached = s.get("hints", {}).get("isCached", False)
-            return (-int(is_cached), -seeders, -size_gb, -res_score)
-
-        filtered.sort(key=sort_key)
-
-        # Formatting (same behavior you had)
-        for s in filtered:
-            parse_string = unicodedata.normalize(
-                "NFKD",
-                (s.get("name", "") + " " + s.get("title", "") + " " + s.get("infoHash", "")),
-            ).lower()
-
-            hints = s.get("hints", {})
-            service = hints.get("service", "")
-            color = SERVICE_COLORS.get(service, "")
-            name = f"{color} " if color else ""
-
-            res_match = re.search(r"(4k|2160p|1440p|1080p|720p|480p|sd)", parse_string, re.I)
-            if res_match:
-                name += f"📺 {res_match.group(1).upper()}"
-
-            size_match = re.search(r"(\d+(?:\.\d+)?)\s*(gb|mb)", parse_string, re.I)
-            if size_match:
-                name += f" 💿 {size_match.group(1)} {size_match.group(2).upper()}"
-
-            seeder_match = re.search(
-                r"(?:👥|seeders?|seeds?|⇋|peers?) ?(\d+)(?:𖧧)?|(\d+)\s*(?:seed|𖧧)",
-                parse_string,
-                re.I | re.U,
-            )
-            if seeder_match:
-                seeders = seeder_match.group(1) or seeder_match.group(2)
-                name += f" 👥 {seeders}"
-
-            lang_match = re.search(r"([a-z]{2,3}(?:[ ·,·-]*[a-z]{2,3})*)", parse_string, re.I | re.U)
-            if lang_match:
-                langs = re.findall(r"[a-z]{2,3}", lang_match.group(1), re.I)
-                flags_added = [LANGUAGE_FLAGS[lang] for lang in langs if lang in LANGUAGE_FLAGS]
-                if flags_added:
-                    name += " " + " ".join(sorted(set(flags_added)))
-
-            audio_match = re.search(
-                r"(dd\+|dd|dts-hd|dts|opus|aac|atmos|ma|5\.1|7\.1|2\.0|h\.26[4-5]|hev|dv|hdr)",
-                parse_string,
-                re.I | re.U,
-            )
-            channel_match = re.search(r"(\d\.\d)", parse_string, re.I | re.U)
-            if audio_match:
-                audio = audio_match.group(1).upper()
-                channels = channel_match.group(1) if channel_match else ""
-                name += f" ♬ {audio} {channels}".strip()
-
-            if "store" in parse_string or "4k" in parse_string or "stremthru" in parse_string:
-                name = f"★ {name}"
-
-            if "⏳" in name or not hints.get("isCached", False):
-                s["name"] = f"[dim]{name} (Unverified ⏳)[/dim]"
+        # TorBox cached verify (TB torrents only)
+        if VERIFY_STREAM and meta["kind"] == "torrent" and meta["provider"] == "TB":
+            ih = meta.get("infohash")
+            if not ih:
+                st.verify_missing_hash += 1
             else:
-                s["name"] = name
+                st.verify_checked += 1
+                cached = tb_cached.get(ih.lower())
+                if cached is False:
+                    st.dropped_verify += 1
+                    # optionally record as fake
+                    if USE_FAKES_DB:
+                        FAKES["hashes"].add(ih.lower())
+                        save_fakes(FAKES)
+                    continue
 
-        final_streams = filtered[:60]
-        stats["delivered"] = len(final_streams)
+        # Seeder rule (torrent-only; does not apply to usenet)
+        if meta["kind"] == "torrent" and meta["seeders"] < MIN_TORRENT_SEEDERS:
+            st.dropped_seeders += 1
+            continue
 
-        return jsonify({"streams": final_streams})
+        kept.append((s, meta))
 
+    # Dedup
+    if WRAPPER_DEDUP:
+        seen = set()
+        out: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        for s, meta in kept:
+            k = dedup_key(s, meta)
+            if k in seen:
+                st.deduped += 1
+                continue
+            seen.add(k)
+            out.append((s, meta))
+        kept = out
+
+    # Sort: simple quality-first, then provider
+    def sort_key(pair: Tuple[Dict[str, Any], Dict[str, Any]]):
+        s, meta = pair
+        bh = s.get("behaviorHints") or {}
+        cached_hint = bool(bh.get("isCached", False))
+        res_weight = {"2160p": 4, "1080p": 3, "720p": 2, "480p": 1}.get(meta["res"], 0)
+        return (cached_hint, res_weight, meta["size"], meta["seeders"], 1 if meta["kind"]=="usenet" else 0)
+
+    kept.sort(key=sort_key, reverse=True)
+
+    # Usenet reserve
+    usenet = [p for p in kept if p[1]["kind"] == "usenet"]
+    chosen: List[Dict[str, Any]] = []
+    if MIN_USENET_KEEP > 0 and usenet:
+        chosen.extend([s for s, _ in usenet[:MIN_USENET_KEEP]])
+
+    chosen_ids = {id(x) for x in chosen}
+    for s, _ in kept:
+        if len(chosen) >= MAX_DELIVER:
+            break
+        if id(s) in chosen_ids:
+            continue
+        chosen.append(s)
+
+    st.delivered = len(chosen)
+    st.delivered_usenet = sum(1 for s in chosen if classify(s)["kind"] == "usenet")
+    st.delivered_torrent = sum(1 for s in chosen if classify(s)["kind"] == "torrent")
+
+    if REFORMAT_STREAMS:
+        for s in chosen:
+            meta2 = classify(s)
+            ch = ""
+            if meta2.get("kind") == "torrent" and meta2.get("provider") == "TB" and VERIFY_STREAM:
+                ch = "✅ Cached"
+            elif meta2.get("kind") == "usenet":
+                ch = "📰 NZB"
+            format_stream_inplace(s, meta2, expected, cached_hint=ch)
+
+    return chosen, st
+
+
+# ---------------------------
+# Routes
+# ---------------------------
+
+@app.get("/health")
+def health():
+    return jsonify(ok=True, ts=int(time.time())), 200
+
+@app.get("/manifest.json")
+def manifest():
+    return jsonify(
+        {
+            "id": "org.buubuu.aiostreams.wrapper",
+            "version": "4.0.0",
+            "name": "AIOStreams Wrapper (v5 TB verify + format)",
+            "description": "Validates titles via Trakt, filters junk, preserves Usenet, and (optionally) verifies TorBox cached torrents by extracting infohash from AIOStreams URLs.",
+            "resources": ["stream"],
+            "types": ["movie", "series"],
+            "catalogs": [],
+            "idPrefixes": ["tt", "tmdb:"],
+        }
+    )
+
+@app.get("/stream/<type_>/<id_>.json")
+def stream(type_: str, id_: str):
+    t0 = time.time()
+    stats = PipeStats()
+    try:
+        streams, aio_in = get_streams(type_, id_)
+        stats.aio_in = aio_in
+        out, stats = filter_streams(type_, id_, streams)
+        return jsonify({"streams": out}), 200
     except Exception:
         logging.exception("Unhandled exception in stream endpoint")
         return jsonify({"streams": []}), 200
-
     finally:
-        # EXACT one-line output, easy to grep/parse in Render logs
-        logging.info("WRAP_FINAL_STATS " + json.dumps(stats, ensure_ascii=False, separators=(",", ":")))
-
+        logging.info(
+            "WRAP_STATS rid=%s type=%s id=%s aio_in=%s merged_in=%s dropped_error=%s dropped_blacklist=%s dropped_fake=%s dropped_size=%s dropped_age=%s dropped_trakt=%s dropped_verify=%s dropped_seeders=%s deduped=%s verify_checked=%s verify_missing_hash=%s delivered=%s usenet=%s torrent=%s ms=%s",
+            _rid(), type_, id_,
+            stats.aio_in, stats.merged_in,
+            stats.dropped_error, stats.dropped_blacklist, stats.dropped_fake,
+            stats.dropped_size, stats.dropped_age, stats.dropped_trakt,
+            stats.dropped_verify, stats.dropped_seeders, stats.deduped,
+            stats.verify_checked, stats.verify_missing_hash,
+            stats.delivered, stats.delivered_usenet, stats.delivered_torrent,
+            int((time.time() - t0)*1000)
+        )
 
 if __name__ == "__main__":
-    try:
-        port = int(os.environ.get("PORT", 5000))
-        app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)
-    except Exception as e:
-        logging.exception(f"App startup error: {e}")
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)
