@@ -364,12 +364,12 @@ def filter_streams(type_: str, id_: str, streams: List[Dict[str, Any]]) -> Tuple
     # Blacklists
     if USE_BLACKLISTS:
         classified = [(s, m) for s, m in classified if not any(re.search(bl, s.get("name", "") + s.get("description", "")) for bl in BLACKLISTS)]
-        stats.dropped_blacklist = len(classified) - (len(classified) + stats.dropped_blacklist)  # Adjust count
+        stats.dropped_blacklist = stats.merged_in - len(classified) - stats.dropped_error  # Adjust count
     
     # Fakes
     if USE_FAKES_DB:
         classified = [(s, m) for s, m in classified if m.get("infohash") not in FAKES_DB]
-        stats.dropped_fake = len(classified) - (len(classified) + stats.dropped_fake)
+        stats.dropped_fake = stats.merged_in - len(classified) - stats.dropped_error - stats.dropped_blacklist
     
     # Size mismatch (original heuristic - assume implemented)
     if USE_SIZE_MISMATCH:
@@ -383,7 +383,7 @@ def filter_streams(type_: str, id_: str, streams: List[Dict[str, Any]]) -> Tuple
     
     # Trakt validate
     classified = [(s, m) for s, m in classified if trakt_validate(s, expected)]
-    stats.dropped_trakt = len(classified) - (len(classified) + stats.dropped_trakt)
+    stats.dropped_trakt = stats.merged_in - len(classified) - stats.dropped_error - stats.dropped_blacklist - stats.dropped_fake
     
     # TorBox verify (batch all at once)
     if VERIFY_STREAM:
@@ -409,7 +409,7 @@ def filter_streams(type_: str, id_: str, streams: List[Dict[str, Any]]) -> Tuple
     # Seeders filter (assume min from env)
     min_seeders = int(os.environ.get("MIN_SEEDERS", "1"))
     classified = [(s, m) for s, m in classified if m["kind"] != "torrent" or m["seeders"] >= min_seeders]
-    stats.dropped_seeders = len(classified) - (len(classified) + stats.dropped_seeders)
+    stats.dropped_seeders = stats.merged_in - len(classified) - stats.dropped_error - stats.dropped_blacklist - stats.dropped_fake - stats.dropped_trakt - stats.dropped_verify
     
     # Dedup
     if WRAPPER_DEDUP:
@@ -424,20 +424,21 @@ def filter_streams(type_: str, id_: str, streams: List[Dict[str, Any]]) -> Tuple
                 stats.deduped += 1
         classified = new_classified
     
-    # Sort (cached > res > size > seeders > usenet last? No, preserve Usenet)
+    # Sort with boosts
     def sort_key(item):
         s, m = item
-        cached = 1 if "Cached" in s.get("name", "") else 0
+        cached = 2 if m["provider"] == "TB" and "Cached" in s.get("name", "") else 1 if "Cached" in s.get("name", "") else 0  # Boost TB cached
         res_val = {'4k': 4, '2160p': 4, '1080p': 3, '720p': 2, '480p': 1}.get(m["res"], 0)
-        return (-cached, -res_val, -m["size"], -m["seeders"], 1 if m["kind"] == "usenet" else 0)
+        usenet_boost = 1 if m["kind"] == "usenet" and res_val >= 3 and m["size"] > 2*1024**3 else 0  # Boost good Usenet
+        non_tb_penalty = -1 if m["provider"] in ["RD", "AD"] and any(im[1]["provider"] == "TB" for im in classified) else 0  # Deprioritize if TB available
+        return (-cached - usenet_boost, -res_val, -m["size"], -m["seeders"], non_tb_penalty)
     
     classified.sort(key=sort_key)
     
-    # Preserve Usenet
-    usenet = [item for item in classified if item[1]["kind"] == "usenet"]
-    torrent = [item for item in classified if item[1]["kind"] == "torrent"]
-    usenet = usenet[:MIN_USENET_KEEP]
-    out = (usenet + torrent)[:MAX_DELIVER]
+    # Preserve/Insert Usenet at top if valid
+    usenet = [item for item in classified if item[1]["kind"] == "usenet"][:MIN_USENET_KEEP]
+    torrent = [item for item in classified if item[1]["kind"] != "usenet"]
+    out = usenet + torrent[:MAX_DELIVER - len(usenet)]  # Usenet first, then fill with torrents
     
     # Format final
     if REFORMAT_STREAMS:
