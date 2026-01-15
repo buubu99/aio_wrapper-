@@ -1,3 +1,4 @@
+```python
 from __future__ import annotations
 
 import base64
@@ -648,3 +649,4 @@ def stream(type_: str, id_: str):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=LOG_LEVEL == logging.DEBUG, use_reloader=False)
+```
