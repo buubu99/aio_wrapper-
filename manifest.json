@@ -5,6 +5,6 @@
   "description": "Wraps AIOStreams to filter and format streams w usenet",
   "resources": ["stream"],
   "types": ["movie", "series"],
-  "catalogs": []
+  "catalogs": [],
   "idPrefixes": ["tt"]
 }
