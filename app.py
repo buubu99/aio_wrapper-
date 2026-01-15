@@ -18,6 +18,22 @@ from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+def _parse_bool(v: str, default: bool = False) -> bool:
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in ("1","true","yes","y","on"):
+        return True
+    if s in ("0","false","no","n","off"):
+        return False
+    return default
+
+def _normalize_base(raw: str) -> str:
+    raw = (raw or "").strip().rstrip("/")
+    if raw.endswith("/manifest.json"):
+        raw = raw[: -len("/manifest.json")].rstrip("/")
+    return raw
+
 # ---------------------------
 # Config (keep env names compatible with your existing Render setup)
 # ---------------------------
@@ -77,23 +93,6 @@ class RequestIdFilter(logging.Filter):
 LOG_LEVEL = _log_level(os.environ.get("LOG_LEVEL", "INFO"))
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(rid)s | %(message)s")
 logging.getLogger().addFilter(RequestIdFilter())
-
-def _parse_bool(v: str, default: bool = False) -> bool:
-    if v is None:
-        return default
-    s = str(v).strip().lower()
-    if s in ("1","true","yes","y","on"):
-        return True
-    if s in ("0","false","no","n","off"):
-        return False
-    return default
-
-def _normalize_base(raw: str) -> str:
-    raw = (raw or "").strip().rstrip("/")
-    if raw.endswith("/manifest.json"):
-        raw = raw[: -len("/manifest.json")].rstrip("/")
-    return raw
-
 
 logger = logging.getLogger("aio-wrapper")
 
