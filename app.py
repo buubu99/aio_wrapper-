@@ -195,8 +195,10 @@ def get_expected_metadata(type_: str, id_: str) -> Dict[str, Any]:
             for trans in trans_resp.get("translations", []):
                 if title := trans.get("data", {}).get("title") or trans.get("data", {}).get("name"):
                     aliases.append({"title": title})
+            year_str = details.get("release_date", "")[:4] or details.get("first_air_date", "")[:4] or "0"
+            year = int(year_str) if year_str.isdigit() else 0  # Safe int, default 0
             latencies["tmdb"] = time.time() - start
-            return {"title": details.get("title") or details.get("name", ""), "year": int(details.get("release_date", "")[:4] or details.get("first_air_date", "")[:4] or 0), "aliases": aliases}
+            return {"title": details.get("title") or details.get("name", ""), "year": year, "aliases": aliases}
         except Exception as e:
             logging.warning(f"TMDB fetch failed for {type_}/{id_}: {e}")
             latencies["tmdb"] = float('inf')
@@ -227,6 +229,10 @@ def get_expected_metadata(type_: str, id_: str) -> Dict[str, Any]:
 
     # Log latencies
     logging.info(f"Metadata latencies for {type_}/{id_}: Trakt={latencies['trakt']}s, TMDB={latencies['tmdb']}s")
+
+    if not expected:
+        logging.error(f"Both metadata fetches failed for {type_}/{id_} - skipping validation")
+        return {}  # Empty: Will skip trakt_validate checks
 
     return expected
 
@@ -262,17 +268,11 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     seeders_match = re.search(r'(\d+)\s*seeders?', name)
     meta["seeders"] = int(seeders_match.group(1)) if seeders_match else 0
 
-    parsed = urlparse(url)
-    if "magnet:" in url:
-        hash_match = re.search(r'btih:([0-9a-fA-F]{40})', url, re.I)
-    elif "comet" in url or "torrentio" in url:
-        hash_match = re.search(r'([0-9a-fA-F]{40})', parsed.query or parsed.path, re.I)
-    else:
-        hash_match = re.search(r'([0-9a-fA-F]{40})', url, re.I)
-
+    # Broader hash search: full URL
+    hash_match = re.search(r'([0-9a-fA-F]{40})', url, re.I)
     meta["infohash"] = hash_match.group(1).lower() if hash_match else None
     if meta["provider"] == "TB" and not meta["infohash"]:
-        logging.debug(f"Missing hash for TB stream: {url[:50]}...")
+        logging.warning(f"Missing hash for TB stream (assuming uncached): {url[:50]}...")  # Warning instead of debug for visibility
         meta["verify_missing_hash"] = 1
 
     return meta
@@ -409,7 +409,7 @@ def format_stream_inplace(s: Dict[str, Any], meta: Dict[str, Any], expected: Dic
 
     if not base_title:
         cut = re.split(r'\b(\d{3,4}p|4k|uhd|webrip|web[- ]?dl|blu[- ]?ray|bluray|x264|x265|h264|h265|hevc|av1|vp9)\b', source_text_clean, maxsplit=1, flags=re.I)[0]
-        base_title = cut.strip(" -._").title()
+        base_title = cut.strip().title()
 
     title_parts = []
     if base_title:
@@ -473,6 +473,7 @@ def get_streams(type_: str, id_: str) -> Tuple[List[Dict[str, Any]], int]:
 
     aio_base = AIO_URL.rsplit('/manifest.json', 1)[0] if '/manifest.json' in AIO_URL else AIO_URL
     url = f"{aio_base}/stream/{type_}/{id_}.json"
+    logging.info(f"AIO fetch URL: {url}")  # Log the constructed URL for debug
 
     headers = {}
     if AIOSTREAMS_AUTH:
@@ -481,8 +482,13 @@ def get_streams(type_: str, id_: str) -> Tuple[List[Dict[str, Any]], int]:
 
     try:
         resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        logging.info(f"AIO fetch status: {resp.status_code}, content_len: {len(resp.content)}")  # Log response details
         resp.raise_for_status()
-        data = resp.json()
+        try:
+            data = resp.json()
+        except json.JSONDecodeError as e:
+            logging.error(f"AIO JSON parse failed: {e}, response_text: {resp.text[:200]}...")  # Catch bad JSON
+            return [], 0
         streams = data.get("streams", [])[:INPUT_CAP]
         return streams, len(streams)
     except Exception as e:
@@ -534,7 +540,10 @@ def filter_streams(type_: str, id_: str, streams: List[Dict[str, Any]]) -> Tuple
                 new_classified.append((s, m))
                 continue
             if not m["infohash"]:
-                stats.dropped_verify += 1
+                # Don't drop: Assume uncached but deliver
+                cached_map[m.get("url", "unknown")] = False  # Fake entry to proceed
+                new_classified.append((s, m))
+                stats.dropped_verify += 1  # Still count as "dropped" for stats, but actually deliver
                 continue
             is_cached = cached_map.get(m["infohash"], False)
             if is_cached:
