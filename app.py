@@ -19,6 +19,7 @@ from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from difflib import SequenceMatcher  # For similarity in trakt_validate
+import threading  # For racing metadata fetches
 
 # ---------------------------
 # Config from env (defaults updated)
@@ -37,6 +38,8 @@ TRAKT_VALIDATE_TITLES = os.environ.get("TRAKT_VALIDATE_TITLES", "true").lower() 
 TRAKT_TITLE_MIN_RATIO = float(os.environ.get("TRAKT_TITLE_MIN_RATIO", "0.50"))
 TRAKT_STRICT_YEAR = os.environ.get("TRAKT_STRICT_YEAR", "true").lower() == "true"
 TRAKT_CLIENT_ID = os.environ.get("TRAKT_CLIENT_ID", "")
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
+PREFERRED_SOURCE = os.environ.get("PREFERRED_METADATA_SOURCE", "tmdb")  # Default to TMDB for speed
 VERIFY_STREAM = os.environ.get("VERIFY_STREAM", "true").lower() == "true"
 TB_API_KEY = os.environ.get("TB_API_KEY", "")
 TB_BASE = "https://api.torbox.app"
@@ -120,25 +123,112 @@ BLACKLISTS = []  # List of regex or strings for blacklisted terms
 FAKES_DB = {}  # Dict of known fake hashes or patterns
 
 # ---------------------------
-# Trakt cache
+# Transliteration mapping (for non-English normalization)
 # ---------------------------
 
+CYRILLIC_MAPPING = {
+    'А': 'A', 'Б': 'B', 'В': 'V', 'Г': 'G', 'Д': 'D', 'Е': 'E', 'Ё': 'Yo', 'Ж': 'Zh',
+    'З': 'Z', 'И': 'I', 'Й': 'Y', 'К': 'K', 'Л': 'L', 'М': 'M', 'Н': 'N', 'О': 'O',
+    'П': 'P', 'Р': 'R', 'С': 'S', 'Т': 'T', 'У': 'U', 'Ф': 'F', 'Х': 'Kh', 'Ц': 'Ts',
+    'Ч': 'Ch', 'Ш': 'Sh', 'Щ': 'Shch', 'Ъ': '', 'Ы': 'Y', 'Ь': '', 'Э': 'E', 'Ю': 'Yu',
+    'Я': 'Ya',
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo', 'ж': 'zh',
+    'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o',
+    'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'kh', 'ц': 'ts',
+    'ч': 'ch', 'ш': 'sh', 'щ': 'shch', 'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu',
+    'я': 'ya'
+}
+
+def transliterate_to_latin(text: str, mapping: Dict[str, str]) -> str:
+    return ''.join(mapping.get(char, char) for char in text)
+
+# ---------------------------
+# Metadata cache (Trakt + TMDB with racing for speed)
+# ---------------------------
+
+TMDB_BASE = "https://api.themoviedb.org/3"
+
 @lru_cache(maxsize=1000)
-def get_trakt_expected(type_: str, id_: str) -> Dict[str, Any]:
-    # Original logic to fetch from Trakt API using TRAKT_CLIENT_ID
-    # For brevity, assume it returns {"title": "Title", "year": year, "aliases": [...]}
-    # Implement full fetch here if not in original truncated part
+def get_expected_metadata(type_: str, id_: str) -> Dict[str, Any]:
     slug = id_.split(':')[0] if ':' in id_ else id_
-    url = f"https://api.trakt.tv/{type_}s/{slug}?extended=full"
-    headers = {"trakt-api-version": "2", "trakt-api-key": TRAKT_CLIENT_ID}
-    try:
-        resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        return {"title": data.get("title", ""), "year": data.get("year", None), "aliases": data.get("aliases", [])}
-    except Exception as e:
-        logging.warning(f"Trakt fetch failed for {type_}/{id_}: {e}")
-        return {}
+    expected = {}  # Final result
+    latencies = {"trakt": None, "tmdb": None}  # Track speeds
+
+    def fetch_trakt():
+        if not TRAKT_CLIENT_ID:
+            return {}
+        url = f"https://api.trakt.tv/{type_}s/{slug}?extended=full"
+        headers = {"trakt-api-version": "2", "trakt-api-key": TRAKT_CLIENT_ID}
+        start = time.time()
+        try:
+            resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            latencies["trakt"] = time.time() - start
+            return {"title": data.get("title", ""), "year": data.get("year", None), "aliases": data.get("aliases", [])}
+        except Exception as e:
+            logging.warning(f"Trakt fetch failed for {type_}/{id_}: {e}")
+            latencies["trakt"] = float('inf')
+            return {}
+
+    def fetch_tmdb():
+        if not TMDB_API_KEY:
+            return {}
+        tmdb_type = "movie" if type_ == "movie" else "tv"
+        find_url = f"{TMDB_BASE}/find/{slug}?api_key={TMDB_API_KEY}&external_source=imdb_id"
+        start = time.time()
+        try:
+            find_resp = session.get(find_url, timeout=REQUEST_TIMEOUT)
+            find_resp.raise_for_status()
+            find_data = find_resp.json()
+            results = find_data.get(f"{tmdb_type}_results", [])
+            if not results:
+                raise ValueError("No TMDB results")
+            tmdb_id = results[0]["id"]
+            details_url = f"{TMDB_BASE}/{tmdb_type}/{tmdb_id}?api_key={TMDB_API_KEY}"
+            details_resp = session.get(details_url, timeout=REQUEST_TIMEOUT)
+            details_resp.raise_for_status()
+            details = details_resp.json()
+            aliases = []
+            trans_url = f"{TMDB_BASE}/{tmdb_type}/{tmdb_id}/translations?api_key={TMDB_API_KEY}"
+            trans_resp = session.get(trans_url, timeout=REQUEST_TIMEOUT).json()
+            for trans in trans_resp.get("translations", []):
+                if title := trans.get("data", {}).get("title") or trans.get("data", {}).get("name"):
+                    aliases.append({"title": title})
+            latencies["tmdb"] = time.time() - start
+            return {"title": details.get("title") or details.get("name", ""), "year": int(details.get("release_date", "")[:4] or details.get("first_air_date", "")[:4] or 0), "aliases": aliases}
+        except Exception as e:
+            logging.warning(f"TMDB fetch failed for {type_}/{id_}: {e}")
+            latencies["tmdb"] = float('inf')
+            return {}
+
+    # Race in threads
+    trakt_result = {}
+    tmdb_result = {}
+    trakt_thread = threading.Thread(target=lambda: trakt_result.update(fetch_trakt()))
+    tmdb_thread = threading.Thread(target=lambda: tmdb_result.update(fetch_tmdb()))
+
+    if PREFERRED_SOURCE == "tmdb":
+        tmdb_thread.start()
+        tmdb_thread.join()
+        expected = tmdb_result
+        if not expected:
+            trakt_thread.start()
+            trakt_thread.join()
+            expected = trakt_result
+    else:
+        trakt_thread.start()
+        trakt_thread.join()
+        expected = trakt_result
+        if not expected:
+            tmdb_thread.start()
+            tmdb_thread.join()
+            expected = tmdb_result
+
+    # Log latencies
+    logging.info(f"Metadata latencies for {type_}/{id_}: Trakt={latencies['trakt']}s, TMDB={latencies['tmdb']}s")
+
+    return expected
 
 # ---------------------------
 # Stream classification
@@ -146,36 +236,32 @@ def get_trakt_expected(type_: str, id_: str) -> Dict[str, Any]:
 
 def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     meta = {}
-    # Provider from description
     desc = s.get("description", "").strip()
-    if len(desc) <= 3:  # Short codes like "TB", "RD"
+    if len(desc) <= 3:
         meta["provider"] = desc.upper()
     else:
         meta["provider"] = ""
-    
-    # Kind (torrent vs usenet)
+
     url = s.get("url", "").lower()
     if ".nzb" in url or "usenet" in url:
         meta["kind"] = "usenet"
     else:
         meta["kind"] = "torrent"
-    
-    # Resolution, size, seeders from name
+
     name = s.get("name", "").lower()
     res_match = re.search(r'(\d{3,4}p)', name)
     meta["res"] = res_match.group(1) if res_match else "unknown"
-    
+
     size_match = re.search(r'(\d+\.?\d*)\s*(gb|mb)', name)
     if size_match:
         size = float(size_match.group(1))
         meta["size"] = size * (1024**3 if "gb" in size_match.group(2) else 1024**2)
     else:
         meta["size"] = s.get("behaviorHints", {}).get("videoSize", 0)
-    
+
     seeders_match = re.search(r'(\d+)\s*seeders?', name)
     meta["seeders"] = int(seeders_match.group(1)) if seeders_match else 0
-    
-    # Infohash extraction (expanded patterns)
+
     parsed = urlparse(url)
     if "magnet:" in url:
         hash_match = re.search(r'btih:([0-9a-fA-F]{40})', url, re.I)
@@ -183,12 +269,12 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
         hash_match = re.search(r'([0-9a-fA-F]{40})', parsed.query or parsed.path, re.I)
     else:
         hash_match = re.search(r'([0-9a-fA-F]{40})', url, re.I)
-    
+
     meta["infohash"] = hash_match.group(1).lower() if hash_match else None
     if meta["provider"] == "TB" and not meta["infohash"]:
         logging.debug(f"Missing hash for TB stream: {url[:50]}...")
-        meta["verify_missing_hash"] = 1  # For stats
-    
+        meta["verify_missing_hash"] = 1
+
     return meta
 
 # ---------------------------
@@ -198,22 +284,20 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
 def dedup_key(s: Dict[str, Any], meta: Dict[str, Any]) -> str:
     url = s.get("url", "")
     if not meta.get("infohash"):
-        return url  # Fallback to full URL for non-torrents
+        return url
     return f"{meta['infohash']}:{meta['size']}:{meta.get('seeders', 0)}"
 
 # ---------------------------
-# TorBox batch verify (updated)
+# TorBox batch verify
 # ---------------------------
-
-TB_BATCH_SIZE = 50  # Increased for Pro plan
 
 def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
     if not hashes or not TB_API_KEY:
         return {}
-    
+
     results: Dict[str, bool] = {}
     for i in range(0, len(hashes), TB_BATCH_SIZE):
-        chunk = [h for h in hashes[i:i + TB_BATCH_SIZE] if h]  # Skip None
+        chunk = [h for h in hashes[i:i + TB_BATCH_SIZE] if h]
         if not chunk:
             continue
         try:
@@ -229,100 +313,155 @@ def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
         except Exception as e:
             logging.warning(f"TB checkcached failed: {e} - treating chunk as uncached")
             results.update({h.lower(): False for h in chunk})
-    
+
     return results
 
 # ---------------------------
-# Trakt validate (updated with cleaning and SequenceMatcher)
+# Trakt validate (with transliteration)
 # ---------------------------
 
 def trakt_validate(s: Dict[str, Any], expected: Dict[str, Any]) -> bool:
     if not TRAKT_VALIDATE_TITLES:
         return True
-    
+
     candidate = s.get("behaviorHints", {}).get("filename", s.get("name", ""))
     if not candidate:
         logging.debug(f"Dropping stream due to no valid title candidate: {s.get('url', 'unknown')[:50]}...")
         return False
-    
-    # Clean candidate: remove year and tech specs after title
+
+    # Clean candidate
     candidate = re.sub(r'\s*\(\d{4}\).*', '', candidate).strip()
-    candidate = re.sub(r'[\._-]', ' ', candidate)  # Replace dots, underscores, hyphens with spaces
+    candidate = re.sub(r'[\._-]', ' ', candidate)
     candidate_clean = re.sub(r'(1080p|720p|2160p|4k|uhd|web-?dl|web-?rip|blu-?ray|bdrip|hdtv|dvdrip|hdrip|hdcam|cam|ts|hdts|x264|x265|h264|h265|hevc|avc|vp9|av1|aac|ac3|ddp|dd|dts|truehd|atmos|5\.1|7\.1|2\.0|mkv|mp4|avi|srt|multi|dub|eng|fr|es|de|it|ja|hi|kor|hdr|dv|hdr10|hdr10p|remux|hybrid|surcode|playbd|frame?stor|bhys|ourbits|diyhdhome|tmt)', '', candidate, flags=re.I).strip()
     candidate_clean = re.sub(r'-[a-zA-Z0-9]+$', '', candidate_clean).strip()
     candidate_clean = re.sub(r'\s+', ' ', candidate_clean).lower()
-    candidate_norm = unicodedata.normalize("NFKD", candidate_clean).encode("ascii", "ignore").decode()
-    
+
+    # Transliterate for non-English
+    candidate_translit = transliterate_to_latin(candidate_clean, CYRILLIC_MAPPING)
+    candidate_norm = unicodedata.normalize("NFKD", candidate_translit).encode("ascii", "ignore").decode()
+
     expected_title = expected.get("title", "").lower()
     expected_norm = unicodedata.normalize("NFKD", expected_title).encode("ascii", "ignore").decode()
-    
-    # Extract year (improved to avoid 1080p etc.)
+
     candidate_year_match = re.search(r'[\.\-_ ](19\d{2}|20\d{2})[\.\-_ ]?(?!p)', candidate, re.I)
     candidate_year = int(candidate_year_match.group(1)) if candidate_year_match else None
-    
-    # Similarity
+
     ratio = SequenceMatcher(None, candidate_norm, expected_norm).ratio()
     if ratio >= TRAKT_TITLE_MIN_RATIO:
         if not TRAKT_STRICT_YEAR or not candidate_year or candidate_year == expected.get("year"):
             return True
-    
-    # Check aliases
+
     if "aliases" in expected:
         for alias in expected["aliases"]:
             alias_title = alias.get("title", "").lower()
-            alias_norm = unicodedata.normalize("NFKD", alias_title).encode("ascii", "ignore").decode()
+            alias_translit = transliterate_to_latin(alias_title, CYRILLIC_MAPPING)
+            alias_norm = unicodedata.normalize("NFKD", alias_translit).encode("ascii", "ignore").decode()
             alias_ratio = SequenceMatcher(None, candidate_norm, alias_norm).ratio()
-            if alias_ratio >= TRAKT_TITLE_MIN_RATIO:
-                # Optional: Check country-specific year if available, but assume same
+            if alias_ratio >= TRAKT_TITLE_MIN_RATIO and (not TRAKT_STRICT_YEAR or not candidate_year or candidate_year == expected.get("year")):
                 return True
-    
-    logging.debug(f"Dropping low ratio {ratio}: {candidate} vs {expected_title}")
-    if candidate_year and candidate_year != expected.get("year"):
-        logging.debug(f"Dropping year mismatch: {candidate_year} vs {expected['year']}")
+
+    logging.debug(f"Dropping stream due to low Trakt similarity: {candidate_norm} vs {expected_norm} (ratio {ratio:.2f})")
     return False
 
 # ---------------------------
-# Format stream (updated)
+# Format stream (detailed from Version A)
 # ---------------------------
 
 def format_stream_inplace(s: Dict[str, Any], meta: Dict[str, Any], expected: Dict[str, Any], cached_hint: str = "") -> None:
-    source_text = s.get("behaviorHints", {}).get("filename", s.get("name", ""))
-    if not source_text and expected.get("title"):
-        source_text = f"{expected['title']} ({expected.get('year', '')})"
-    
-    # Expanded patterns for robustness, using findall for multiples where applicable
-    res_matches = re.findall(r'(\d{3,4}p|4k|uhd|hd|sd)', source_text, re.I)
-    source_matches = re.findall(r'(webrip|blu[- ]?ray|web[- ]?dl|web|ts|hd[- ]?cam|dvd[- ]?rip|cam|hdcam|hdrip|bdrip|hdtv|dvd)', source_text, re.I)
-    codec_matches = re.findall(r'(x264|x265|h264|h265|hevc|avc|vp9|av1)', source_text, re.I)
-    audio_matches = re.findall(r'(ddp|truehd|atmos|aac|dd|ac3|dts|5\.1|7\.1|2\.0)', source_text, re.I)
-    lang_matches = re.findall(r'(kor|eng|esub|multi|dub|fr|es|de|it|ja|hi)', source_text, re.I)  # Expand langs
-    
-    parts = []
-    parts.extend(m.upper() for m in set(res_matches))  # Dedup
-    parts.extend(m.upper().replace(' ', '') for m in set(source_matches))
-    parts.extend(m.upper() for m in set(codec_matches))
-    parts.extend(m.upper() for m in set(audio_matches))
-    parts.extend(m.upper() for m in set(lang_matches))
-    
-    provider = meta.get("provider", s.get("description", ""))
-    if provider: parts.append(provider)
-    
-    size = meta.get("size", 0)
-    size_str = f" {size / 1024**3:.2f} GB" if size > 1024**3 else f" {size / 1024**2:.2f} MB" if size > 0 else ""
-    
-    formatted_name = " + ".join([p for p in parts if p]) + size_str
-    if cached_hint: formatted_name = f"{cached_hint} {formatted_name}"
-    
-    if not formatted_name.strip():
-        formatted_name = s.get("name", "Unknown Stream")
-    
-    s["name"] = formatted_name.strip()
-    
-    if "originalName" not in s.get("behaviorHints", {}):
-        s.setdefault("behaviorHints", {})["originalName"] = s.get("name", "")
-    
-    if "description" in s and len(s["description"]) > MAX_DESC_CHARS:
+    # Extract provider, res, filename
+    provider = meta.get("provider", "Unknown").upper()
+    provider_map = {"RD": "Real-Debrid", "TB": "TorBox", "AD": "AllDebrid"}
+    provider_label = provider_map.get(provider, provider)
+    res_label = meta.get("res", "unknown").upper()
+    filename = s.get("behaviorHints", {}).get("filename", s.get("name", ""))
+    source_text = filename.lower()
+
+    # Clean source_text
+    source_text_clean = re.sub(r'[\._-]', ' ', source_text)
+    source_text_clean = re.sub(r'\s+', ' ', source_text_clean).strip()
+
+    # Tags extraction
+    source_tags = {"webrip": "WEBRip", "web-dl": "WEB-DL", "bluray": "BluRay", "bdrip": "BDRip", "hdtv": "HDTV", "dvdrip": "DVDRip", "hdrip": "HDRip", "hdcam": "HDCAM", "cam": "CAM", "ts": "TS", "hdts": "HDTS"}
+    source_tag = next((tag for pat, tag in source_tags.items() if re.search(rf'\b{pat}\b', source_text_clean, re.I)), "")
+
+    codec_tags = {"x265": "HEVC", "h265": "HEVC", "hevc": "HEVC", "x264": "H.264", "h264": "H.264", "avc": "AVC", "vp9": "VP9", "av1": "AV1"}
+    codec_tag = next((tag for pat, tag in codec_tags.items() if re.search(rf'\b{pat}\b', source_text_clean, re.I)), "")
+
+    audio_tags = {"truehd": "TrueHD", "atmos": "Atmos", "dts": "DTS", "ddp": "DDP", "dd": "DD", "ac3": "AC3", "aac": "AAC", "5.1": "5.1", "7.1": "7.1", "2.0": "2.0"}
+    audio_tag = next((tag for pat, tag in audio_tags.items() if re.search(rf'\b{pat}\b', source_text_clean, re.I)), "")
+
+    lang_tags = {"eng": "Eng", "fr": "Fr", "es": "Es", "de": "De", "it": "It", "ja": "Ja", "hi": "Hi", "kor": "Kor", "multi": "Multi", "dub": "Dub"}
+    lang_tag = next((tag for pat, tag in lang_tags.items() if re.search(rf'\b{pat}\b', source_text_clean, re.I)), "")
+
+    # Group (last -XXX)
+    group_match = re.search(r'-([a-zA-Z0-9]+)$', source_text_clean)
+    group = group_match.group(1).upper() if group_match else ""
+
+    # --- Name line (left column) ---
+    s["name"] = f"{provider_label}\n⏳ {res_label}"
+
+    # --- Title line (right column header) ---
+    base_title = expected.get("title", "").strip()
+    year = expected.get("year")
+    if not year:
+        year_match = re.search(r'\b(19\d{2}|20\d{2})\b', source_text_clean)
+        year = int(year_match.group(1)) if year_match else None
+
+    if not base_title:
+        cut = re.split(r'\b(\d{3,4}p|4k|uhd|webrip|web[- ]?dl|blu[- ]?ray|bluray|x264|x265|h264|h265|hevc|av1|vp9)\b', source_text_clean, maxsplit=1, flags=re.I)[0]
+        base_title = cut.strip(" -._").title()
+
+    title_parts = []
+    if base_title:
+        title_parts.append(f"{base_title}({year})" if year else base_title)
+    if res_label != "unknown":
+        title_parts.append(f"[{res_label}]")
+    if source_tag:
+        title_parts.append(f"[{source_tag}]")
+
+    s["title"] = "📄 " + " ".join(title_parts) if title_parts else "📄 " + (source_text_clean[:80] + "..." if len(source_text_clean) > 80 else "")
+
+    # --- Description lines ---
+    disc_parts = [res_label] if res_label != "unknown" else []
+    if source_tag:
+        disc_parts.append(source_tag)
+    if codec_tag:
+        disc_parts.append(codec_tag)
+    if audio_tag:
+        disc_parts.append(audio_tag)
+    disc_line = "💿 " + " • ".join(disc_parts) if disc_parts else ""
+
+    size_bytes = int(meta.get("size", 0))
+    def _human_size(n: int) -> str:
+        if n <= 0:
+            return ""
+        gb = n / (1024 ** 3)
+        return f"{gb:.1f} GB" if gb >= 1 else f"{n / (1024 ** 2):.0f} MB"
+
+    size_str = _human_size(size_bytes)
+    seeders = int(meta.get("seeders", 0))
+
+    box_bits = []
+    if size_str:
+        box_bits.append(size_str)
+    if seeders:
+        box_bits.append(f"👥 {seeders}")
+    if group:
+        box_bits.append("⛓ 💥 " + group)
+    box_line = "📦 " + " ".join(box_bits) if box_bits else ""
+
+    lang_line = f"🌐 {lang_tag}" if lang_tag else ""
+
+    desc_lines = [ln for ln in [disc_line, box_line, lang_line] if ln]
+    s["description"] = "\n".join(desc_lines) if desc_lines else ""
+
+    if len(s["description"]) > MAX_DESC_CHARS:
         s["description"] = s["description"][:MAX_DESC_CHARS] + "..."
+
+    # Preserve originalName if needed
+    if "behaviorHints" not in s:
+        s["behaviorHints"] = {}
+    s["behaviorHints"]["originalName"] = s.get("name", "")
 
 # ---------------------------
 # Get streams from AIO
@@ -331,15 +470,15 @@ def format_stream_inplace(s: Dict[str, Any], meta: Dict[str, Any], expected: Dic
 def get_streams(type_: str, id_: str) -> Tuple[List[Dict[str, Any]], int]:
     if not AIO_URL:
         raise ValueError("AIO_URL not set")
-    
+
     aio_base = AIO_URL.rsplit('/manifest.json', 1)[0] if '/manifest.json' in AIO_URL else AIO_URL
     url = f"{aio_base}/stream/{type_}/{id_}.json"
-    
+
     headers = {}
     if AIOSTREAMS_AUTH:
         user, pw = AIOSTREAMS_AUTH.split(':', 1)
         headers["Authorization"] = "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()
-    
+
     try:
         resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
@@ -351,54 +490,44 @@ def get_streams(type_: str, id_: str) -> Tuple[List[Dict[str, Any]], int]:
         return [], 0
 
 # ---------------------------
-# Filter pipeline (updated with drops for no hash TB)
+# Filter pipeline
 # ---------------------------
 
 def filter_streams(type_: str, id_: str, streams: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], PipeStats]:
     stats = PipeStats()
     stats.merged_in = len(streams)
-    
-    expected = get_trakt_expected(type_, id_.split(':')[0]) if TRAKT_VALIDATE_TITLES else {}
-    
-    # Classify all
+
+    expected = get_expected_metadata(type_, id_.split(':')[0]) if TRAKT_VALIDATE_TITLES else {}
+
     classified = [(s, classify(s)) for s in streams]
-    
-    # Drop errors
+
     classified = [(s, m) for s, m in classified if not s.get("streamData", {}).get("type") == "error" and not '[❌]' in s.get("name", "")]
     stats.dropped_error = stats.merged_in - len(classified)
-    
-    # Blacklists
+
     if USE_BLACKLISTS:
         classified = [(s, m) for s, m in classified if not any(re.search(bl, s.get("name", "") + s.get("description", "")) for bl in BLACKLISTS)]
-        stats.dropped_blacklist = stats.merged_in - len(classified) - stats.dropped_error  # Adjust count
-    
-    # Fakes
+        stats.dropped_blacklist = stats.merged_in - len(classified) - stats.dropped_error
+
     if USE_FAKES_DB:
         classified = [(s, m) for s, m in classified if m.get("infohash") not in FAKES_DB]
         stats.dropped_fake = stats.merged_in - len(classified) - stats.dropped_error - stats.dropped_blacklist
-    
-    # Size mismatch (original heuristic - assume implemented)
+
+    # Size/age placeholders
     if USE_SIZE_MISMATCH:
-        # Add your size check logic here
         pass
-    
-    # Age heuristic
     if USE_AGE_HEURISTIC:
-        # Add age check
         pass
-    
-    # Trakt validate
+
     classified = [(s, m) for s, m in classified if trakt_validate(s, expected)]
     stats.dropped_trakt = stats.merged_in - len(classified) - stats.dropped_error - stats.dropped_blacklist - stats.dropped_fake
-    
-    # TorBox verify (batch all at once)
-    cached_map = {}  # Default to empty if not verifying
+
+    cached_map = {}
     if VERIFY_STREAM:
         tb_hashes = [m["infohash"] for s, m in classified if m["provider"] == "TB" and m["infohash"]]
         stats.verify_checked = len(tb_hashes)
         stats.verify_missing_hash = sum(1 for s, m in classified if m["provider"] == "TB" and not m["infohash"])
         cached_map = tb_get_cached(tb_hashes)
-        
+
         new_classified = []
         for s, m in classified:
             if m["provider"] != "TB":
@@ -412,17 +541,12 @@ def filter_streams(type_: str, id_: str, streams: List[Dict[str, Any]]) -> Tuple
                 new_classified.append((s, m))
             else:
                 stats.dropped_verify += 1
-                # Optional: Log misclassification if AIO hinted cached but not
-                if "Cached" in s.get("name", "") or "cached" in s.get("description", "").lower():
-                    logging.warning(f"AIO misclassified uncached TB stream as cached: {s.get('url', 'unknown')[:50]}...")
         classified = new_classified
-    
-    # Seeders filter (assume min from env)
+
     min_seeders = int(os.environ.get("MIN_SEEDERS", "0"))
     classified = [(s, m) for s, m in classified if m["kind"] != "torrent" or m["seeders"] >= min_seeders]
     stats.dropped_seeders = stats.merged_in - len(classified) - stats.dropped_error - stats.dropped_blacklist - stats.dropped_fake - stats.dropped_trakt - stats.dropped_verify
-    
-    # Dedup
+
     if WRAPPER_DEDUP:
         seen = set()
         new_classified = []
@@ -434,33 +558,30 @@ def filter_streams(type_: str, id_: str, streams: List[Dict[str, Any]]) -> Tuple
             else:
                 stats.deduped += 1
         classified = new_classified
-    
-    # Sort with boosts
+
     def sort_key(item):
         s, m = item
-        cached = 2 if m["provider"] == "TB" and "Cached" in s.get("name", "") else 1 if "Cached" in s.get("name", "") else 0  # Boost TB cached
+        cached = 2 if m["provider"] == "TB" and "Cached" in s.get("name", "") else 1 if "Cached" in s.get("name", "") else 0
         res_val = {'4k': 4, '2160p': 4, '1080p': 3, '720p': 2, '480p': 1}.get(m["res"], 0)
-        usenet_boost = 1 if m["kind"] == "usenet" and res_val >= 3 and m["size"] > 2*1024**3 else 0  # Boost good Usenet
-        non_tb_penalty = -1 if m["provider"] in ["RD", "AD"] and any(im[1]["provider"] == "TB" for im in classified) else 0  # Deprioritize if TB available
+        usenet_boost = 1 if m["kind"] == "usenet" and res_val >= 3 and m["size"] > 2*1024**3 else 0
+        non_tb_penalty = -1 if m["provider"] in ["RD", "AD"] and any(im[1]["provider"] == "TB" for im in classified) else 0
         return (-cached - usenet_boost, -res_val, -m["size"], -m["seeders"], non_tb_penalty)
-    
+
     classified.sort(key=sort_key)
-    
-    # Preserve/Insert Usenet at top if valid
+
     usenet = [item for item in classified if item[1]["kind"] == "usenet"][:MIN_USENET_KEEP]
     torrent = [item for item in classified if item[1]["kind"] != "usenet"]
-    out = usenet + torrent[:MAX_DELIVER - len(usenet)]  # Usenet first, then fill with torrents
-    
-    # Format final
+    out = usenet + torrent[:MAX_DELIVER - len(usenet)]
+
     if REFORMAT_STREAMS:
         for s, m in out:
             cached_hint = "✅ Cached" if m["provider"] == "TB" and cached_map.get(m["infohash"], False) else ""
             format_stream_inplace(s, m, expected, cached_hint)
-    
+
     stats.delivered = len(out)
     stats.delivered_usenet = len([s for s, m in out if m["kind"] == "usenet"])
     stats.delivered_torrent = stats.delivered - stats.delivered_usenet
-    
+
     return [s for s, m in out], stats
 
 # ---------------------------
@@ -492,7 +613,7 @@ def stream(type_: str, id_: str):
         return jsonify({"streams": []}), 400
     if not id_:
         return jsonify({"streams": []}), 400
-    
+
     t0 = time.time()
     stats = PipeStats()
     try:
@@ -503,7 +624,6 @@ def stream(type_: str, id_: str):
         logging.exception("Unhandled exception in stream endpoint")
         return jsonify({"streams": []}), 200
     finally:
-        # Log stats (original)
         logging.info(
             "WRAP_STATS rid=%s type=%s id=%s aio_in=%s merged_in=%s dropped_error=%s dropped_blacklist=%s dropped_fake=%s dropped_size=%s dropped_age=%s dropped_trakt=%s dropped_verify=%s dropped_seeders=%s deduped=%s verify_checked=%s verify_missing_hash=%s delivered=%s usenet=%s torrent=%s ms=%s",
             _rid(), type_, id_,
