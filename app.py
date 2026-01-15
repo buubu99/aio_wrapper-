@@ -68,7 +68,7 @@ def _log_level(v: str) -> int:
 
 class RequestIdFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.rid = g.request_id if has_request_context() and hasattr(g, "request_id") else "NO_REQ"
+        record.rid = g.request_id if has_request_context() and hasattr(g, "request_id") else "GLOBAL"  # Default to GLOBAL if no context
         return True
 
 LOG_LEVEL = _log_level(os.environ.get("LOG_LEVEL", "INFO"))
@@ -80,7 +80,7 @@ def _before_request() -> None:
     g.request_id = str(uuid.uuid4())[:8]
 
 def _rid() -> str:
-    return g.request_id if has_request_context() and hasattr(g, "request_id") else "NO_REQ"
+    return g.request_id if has_request_context() and hasattr(g, "request_id") else "GLOBAL"
 
 # ---------------------------
 # HTTP session
@@ -330,7 +330,7 @@ def trakt_validate(s: Dict[str, Any], expected: Dict[str, Any]) -> bool:
         return False
 
     # Clean candidate
-    candidate = re.sub(r'\s*\(\d{4}\).*', '', candidate).strip()
+    candidate = re.sub(r'\s*$$   \d{4}   $$.*', '', candidate).strip()
     candidate = re.sub(r'[\._-]', ' ', candidate)
     candidate_clean = re.sub(r'(1080p|720p|2160p|4k|uhd|web-?dl|web-?rip|blu-?ray|bdrip|hdtv|dvdrip|hdrip|hdcam|cam|ts|hdts|x264|x265|h264|h265|hevc|avc|vp9|av1|aac|ac3|ddp|dd|dts|truehd|atmos|5\.1|7\.1|2\.0|mkv|mp4|avi|srt|multi|dub|eng|fr|es|de|it|ja|hi|kor|hdr|dv|hdr10|hdr10p|remux|hybrid|surcode|playbd|frame?stor|bhys|ourbits|diyhdhome|tmt)', '', candidate, flags=re.I).strip()
     candidate_clean = re.sub(r'-[a-zA-Z0-9]+$', '', candidate_clean).strip()
@@ -486,10 +486,12 @@ def get_streams(type_: str, id_: str) -> Tuple[List[Dict[str, Any]], int]:
         resp.raise_for_status()
         try:
             data = resp.json()
+            logging.info(f"AIO JSON keys: {list(data.keys())}")  # Log keys to see structure
         except json.JSONDecodeError as e:
             logging.error(f"AIO JSON parse failed: {e}, response_text: {resp.text[:200]}...")  # Catch bad JSON
             return [], 0
         streams = data.get("streams", [])[:INPUT_CAP]
+        logging.info(f"AIO streams found: {len(streams)}")  # Log actual streams len
         return streams, len(streams)
     except Exception as e:
         logging.error(f"AIO fetch failed: {e}")
