@@ -85,18 +85,25 @@ def _log_level(v: str) -> int:
         "CRITICAL": logging.CRITICAL,
     }.get((v or "INFO").upper(), logging.INFO)
 
+class SafeFormatter(logging.Formatter):
+    def format(self, record):
+        if not hasattr(record, 'rid'):
+            record.rid = '-'
+        return super().format(record)
+
 class RequestIdFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         if has_request_context() and hasattr(g, "request_id"):
             record.rid = g.request_id
         else:
             record.rid = "GLOBAL"
-        if not hasattr(record, 'rid'):
-            record.rid = '-'
         return True
 
 LOG_LEVEL = _log_level(os.environ.get("LOG_LEVEL", "INFO"))
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(rid)s | %(message)s")
+handler = logging.StreamHandler()
+handler.setFormatter(SafeFormatter("%(asctime)s | %(levelname)s | %(rid)s | %(message)s"))
+logging.getLogger().addHandler(handler)
+logging.getLogger().setLevel(LOG_LEVEL)
 logging.getLogger().addFilter(RequestIdFilter())
 
 logger = logging.getLogger("aio-wrapper")
