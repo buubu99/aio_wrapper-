@@ -87,7 +87,12 @@ def _log_level(v: str) -> int:
 
 class RequestIdFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.rid = g.request_id if has_request_context() and hasattr(g, "request_id") else "GLOBAL"
+        if has_request_context() and hasattr(g, "request_id"):
+            record.rid = g.request_id
+        else:
+            record.rid = "GLOBAL"
+        if not hasattr(record, 'rid'):
+            record.rid = '-'
         return True
 
 LOG_LEVEL = _log_level(os.environ.get("LOG_LEVEL", "INFO"))
