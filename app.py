@@ -25,14 +25,10 @@ def _parse_bool(v: str, default: bool = False) -> bool:
         return False
     return default
 def _normalize_base(raw: str) -> str:
-    raw = (raw or "").strip()
-    # Accept either a base addon URL or a full manifest URL.
-    # If the user pastes something like .../manifest.json/ (or with extra slashes), strip it.
-    raw = raw.rstrip('/')
-    idx = raw.find('/manifest.json')
-    if idx != -1:
-        raw = raw[:idx]
-    return raw.rstrip('/')
+    raw = (raw or "").strip().rstrip("/")
+    if raw.endswith("/manifest.json"):
+        raw = raw[: -len("/manifest.json")].rstrip("/")
+    return raw
 # ---------------------------
 # Config (keep env names compatible with your existing Render setup)
 # ---------------------------
@@ -40,26 +36,21 @@ AIO_URL = os.environ.get("AIO_URL", "")
 AIO_BASE = _normalize_base(os.environ.get("AIO_BASE", "") or AIO_URL)
 # can be base url or .../manifest.json
 AIOSTREAMS_AUTH = os.environ.get("AIOSTREAMS_AUTH", "") # "user:pass"
-
-# Optional second provider (another AIOStreams-compatible addon)
-PROV2_URL = os.environ.get("PROV2_URL", "")
-PROV2_BASE = _normalize_base(os.environ.get("PROV2_BASE", "") or PROV2_URL)
-PROV2_AUTH = os.environ.get("PROV2_AUTH", "")  # 'user:pass' for Basic auth if needed
-PROV2_TAG = os.environ.get("PROV2_TAG", "P2")
 INPUT_CAP = int(os.environ.get("INPUT_CAP", "4500"))
 MAX_DELIVER = int(os.environ.get("MAX_DELIVER", "80"))
 # Formatting / UI constraints
 REFORMAT_STREAMS = _parse_bool(os.environ.get("REFORMAT_STREAMS", "true"), True)
-FORCE_ASCII_TITLE = _parse_bool(os.environ.get("FORCE_ASCII_TITLE", "true"), True)
+FORCE_ASCII_TITLE = os.environ.get("FORCE_ASCII_TITLE", "true").lower() == "true"
 MAX_TITLE_CHARS = int(os.environ.get("MAX_TITLE_CHARS", "110"))
 MAX_DESC_CHARS = int(os.environ.get("MAX_DESC_CHARS", "180"))
 # Validation/testing toggles
-VALIDATE_OFF = _parse_bool(os.environ.get("VALIDATE_OFF", "false"), False)  # pass-through for format testing
+VALIDATE_OFF = _parse_bool(os.environ.get("VALIDATE_OFF", "false"), False)  # bypass strict filters when True
 DROP_POLLUTED = _parse_bool(os.environ.get("DROP_POLLUTED", "false"), False)  # optional
 # TorBox cache hint (optional; safe if unset)
 TB_API_KEY = os.environ.get("TB_API_KEY", "")
 TB_BASE = "https://api.torbox.app"
 TB_BATCH_SIZE = int(os.environ.get("TB_BATCH_SIZE", "50"))
+TB_CACHE_HINTS = _parse_bool(os.environ.get("TB_CACHE_HINTS", "false"), False)  # enable TorBox cache hint lookups
 REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "30"))
 # TMDB for metadata
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
@@ -266,9 +257,18 @@ def is_premium_plan(provider: str, api_key: str) -> bool:
 # TorBox cache check (optional)
 # ---------------------------
 def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
-    if not hashes or not TB_API_KEY:
+    """Return mapping of info-hash -> cached boolean.
+
+    TorBox checkcached responses are typically shaped like:
+      {"success": true, "data": {"<hash>": { ... torrent details ... }, ...}}
+
+    Some edge cases may return an empty dict, or a bool in the "data" field.
+    This wrapper tolerates all of those without throwing.
+    """
+    if (not hashes) or (not TB_API_KEY) or (not TB_CACHE_HINTS):
         return {}
-    cached = {}
+
+    cached: Dict[str, bool] = {}
     for i in range(0, len(hashes), TB_BATCH_SIZE):
         batch = hashes[i:i + TB_BATCH_SIZE]
         try:
@@ -276,14 +276,48 @@ def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
                 f"{TB_BASE}/v1/api/torrents/checkcached",
                 json={"hashes": batch},
                 headers={"Authorization": f"Bearer {TB_API_KEY}"},
-                timeout=REQUEST_TIMEOUT / 2,
+                timeout=min(REQUEST_TIMEOUT / 2, 10),
             )
             r.raise_for_status()
-            data = r.json() or {}
-            for h, info in data.items():
-                cached[h.lower()] = info.get("is_cached", False)
+            raw = r.json() or {}
+
+            # New API shape: {success: bool, data: {...}}
+            if isinstance(raw, dict) and ("success" in raw or "data" in raw):
+                if not raw.get("success", True):
+                    logger.warning("TB cache check API returned success=false: %s", raw.get("detail") or raw)
+                    continue
+                data = raw.get("data", {})
+                if isinstance(data, bool):
+                    # Rare case: treat as all cached / none cached
+                    for h in batch:
+                        cached[h.lower()] = bool(data)
+                    continue
+                if isinstance(data, dict):
+                    for h in batch:
+                        info = data.get(h) or data.get(h.lower())
+                        if isinstance(info, dict):
+                            # Prefer explicit flags if present, else presence means cached
+                            if "is_cached" in info:
+                                cached[h.lower()] = bool(info.get("is_cached"))
+                            elif "cached" in info:
+                                cached[h.lower()] = bool(info.get("cached"))
+                            else:
+                                cached[h.lower()] = True
+                        else:
+                            cached[h.lower()] = bool(info)
+                    continue
+
+            # Legacy/alt shape: {"<hash>": {...}} or {"<hash>": true}
+            if isinstance(raw, dict):
+                for h, info in raw.items():
+                    if isinstance(info, dict):
+                        cached[h.lower()] = bool(info.get("is_cached") or info.get("cached") or True)
+                    else:
+                        cached[h.lower()] = bool(info)
+
         except Exception as e:
             logger.warning(f"TB cache check failed: {e}")
+
     return cached
 # ---------------------------
 # Pollution detection (optional; v20-style)
@@ -477,58 +511,35 @@ def format_stream_inplace(
 # ---------------------------
 # Fetch streams
 # ---------------------------
-def _auth_headers(auth: str) -> Dict[str, str]:
-    headers: Dict[str, str] = {}
-    if not auth:
-        return headers
-    # Support Basic auth in the form user:pass
-    if ':' in auth and not auth.lower().startswith('bearer '):
-        user, pw = auth.split(':', 1)
-        headers['Authorization'] = 'Basic ' + base64.b64encode(f'{user}:{pw}'.encode()).decode()
-        return headers
-    # Otherwise treat it as a ready-to-use Authorization value (e.g., 'Bearer ...')
-    headers['Authorization'] = auth
-    return headers
-
-def _fetch_streams_from_base(base: str, auth: str, type_: str, id_: str, tag: str) -> List[Dict[str, Any]]:
-    if not base:
-        return []
-    url = f"{base}/stream/{type_}/{id_}.json"
-    headers = _auth_headers(auth)
-    logger.info(f'{tag} fetch URL: {url}')
+def get_streams(type_: str, id_: str) -> Tuple[List[Dict[str, Any]], int]:
+    if not AIO_BASE:
+        return [], 0
+    url = f"{AIO_BASE}/stream/{type_}/{id_}.json"
+    headers = {}
+    if AIOSTREAMS_AUTH:
+        user, pw = AIOSTREAMS_AUTH.split(":", 1)
+        headers["Authorization"] = "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()
+    logger.info(f"AIO fetch URL: {url}")
     try:
         resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        logger.info(f'{tag} status={resp.status_code} bytes={len(resp.content)}')
+        logger.info(f"AIO status={resp.status_code} bytes={len(resp.content)}")
         if resp.status_code != 200:
-            return []
+            return [], 0
         data = resp.json() if resp.content else {}
-        streams = (data.get('streams') or [])[:INPUT_CAP]
-        # Lightweight tagging for debug (does not expose tokens)
-        for s in streams:
-            if isinstance(s, dict):
-                s.setdefault('behaviorHints', {})
-                s['behaviorHints'].setdefault('source', tag)
-        return streams
+        streams = (data.get("streams") or [])[:INPUT_CAP]
+        return streams, len(streams)
     except json.JSONDecodeError as e:
-        logger.error(f'{tag} JSON error: {e}; head={resp.text[:200] if "resp" in locals() else ""}')
-        return []
+        logger.error(f"AIO JSON error: {e}; head={resp.text[:200] if 'resp' in locals() else ''}")
+        return [], 0
     except Exception as e:
-        logger.error(f'{tag} fetch error: {e}')
-        return []
-
-def get_streams(type_: str, id_: str) -> Tuple[List[Dict[str, Any]], int, int]:
-    s1 = _fetch_streams_from_base(AIO_BASE, AIOSTREAMS_AUTH, type_, id_, 'AIO')
-    s2 = _fetch_streams_from_base(PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG) if PROV2_BASE else []
-    merged = (s1 + s2)[:INPUT_CAP]
-    return merged, len(s1), len(s2)
-
+        logger.error(f"AIO fetch error: {e}")
+        return [], 0
 # ---------------------------
 # Pipeline
 # ---------------------------
 @dataclass
 class PipeStats:
     aio_in: int = 0
-    prov2_in: int = 0
     merged_in: int = 0
     dropped_error: int = 0
     dropped_missing_url: int = 0
@@ -540,10 +551,9 @@ class PipeStats:
     delivered: int = 0
 def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
     return f"{meta.get('infohash','')}:{meta.get('size',0)}:{stream.get('url','') or stream.get('externalUrl','')}:{meta.get('language','')}:{meta.get('audio','')}"
-def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0) -> Tuple[List[Dict[str, Any]], PipeStats]:
+def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], PipeStats]:
     stats = PipeStats()
-    stats.aio_in = aio_in
-    stats.prov2_in = prov2_in
+    stats.aio_in = len(streams)
     stats.merged_in = len(streams)
     expected = get_expected_metadata(type_, id_)
     # parse season/episode from id for series (tmdb:123:1:3 or tt..:1:3)
@@ -568,21 +578,18 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             stats.dropped_error += 1
             continue
         m = classify(s)
-        # When VALIDATE_OFF is enabled, we only sanitize and (optionally) format.
-        # Still drop missing URLs and explicit error streams above.
-        if not VALIDATE_OFF:
-            if m['seeders'] < MIN_SEEDERS:
-                stats.dropped_low_seeders += 1
-                continue
-            if PREFERRED_LANG and m['language'] != PREFERRED_LANG:
-                stats.dropped_lang += 1
-                continue
-            if DROP_POLLUTED and is_polluted(s, type_, season, episode):
-                stats.dropped_pollution += 1
-                continue
-            if VERIFY_PREMIUM and m["premium_level"] == 0:
-                stats.dropped_low_premium += 1
-                continue
+        if m['seeders'] < MIN_SEEDERS:
+            stats.dropped_low_seeders += 1
+            continue
+        if PREFERRED_LANG and m['language'] != PREFERRED_LANG:
+            stats.dropped_lang += 1
+            continue
+        if DROP_POLLUTED and is_polluted(s, type_, season, episode):
+            stats.dropped_pollution += 1
+            continue
+        if VERIFY_PREMIUM and m["premium_level"] == 0:
+            stats.dropped_low_premium += 1
+            continue
         cleaned.append((s, m))
     # Dedup
     out_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
@@ -623,8 +630,8 @@ def manifest():
         {
             "id": "org.buubuu.aio.wrapper.merge",
             "version": "1.0.0",
-            "name": "AIO Wrapper (Unified 2 Providers)",
-            "description": "Unified 2 providers into one stream list with hardened normalization + strict Stremio formatting. VALIDATE_OFF bypass supported.",
+            "name": "AIO Wrapper (Merged 16+20 - Stremio Strict)",
+            "description": "Merged formatting (2-left, 3-right) + hardened normalization; validation pass-through for testing.",
             "resources": ["stream"],
             "types": ["movie", "series"],
             "catalogs": [],
@@ -638,19 +645,17 @@ def stream(type_: str, id_: str):
     t0 = time.time()
     stats = PipeStats()
     try:
-        streams, aio_in, prov2_in = get_streams(type_, id_)
-        stats.aio_in = aio_in
-        stats.prov2_in = prov2_in
-        out, stats = filter_and_format(type_, id_, streams, aio_in=aio_in, prov2_in=prov2_in)
+        streams, stats.aio_in = get_streams(type_, id_)
+        out, stats = filter_and_format(type_, id_, streams)
         return jsonify({"streams": out}), 200
     except Exception as e:
         logger.exception(f"Stream error: {e}")
         return jsonify({"streams": []}), 200
     finally:
         logger.info(
-            "WRAP_STATS rid=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s deduped=%s delivered=%s ms=%s",
+            "WRAP_STATS rid=%s type=%s id=%s aio_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s deduped=%s delivered=%s ms=%s",
             _rid(), type_, id_,
-            stats.aio_in, stats.prov2_in, stats.merged_in,
+            stats.aio_in, stats.merged_in,
             stats.dropped_error, stats.dropped_missing_url, stats.dropped_pollution,
             stats.dropped_low_seeders, stats.dropped_lang,
             stats.dropped_low_premium,
