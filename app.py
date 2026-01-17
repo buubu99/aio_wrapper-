@@ -8,6 +8,7 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 import requests
@@ -575,8 +576,26 @@ def _fetch_streams_from_base(base: str, auth: str, type_: str, id_: str, tag: st
         return []
 
 def get_streams(type_: str, id_: str) -> Tuple[List[Dict[str, Any]], int, int]:
-    s1 = _fetch_streams_from_base(AIO_BASE, AIOSTREAMS_AUTH, type_, id_, 'AIO')
-    s2 = _fetch_streams_from_base(PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG) if PROV2_BASE else []
+    """Fetch both providers in parallel (best-effort) and return merged streams + counts."""
+    s1: List[Dict[str, Any]] = []
+    s2: List[Dict[str, Any]] = []
+
+    tasks = []
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        tasks.append(("AIO", ex.submit(_fetch_streams_from_base, AIO_BASE, AIOSTREAMS_AUTH, type_, id_, 'AIO')))
+        if PROV2_BASE:
+            tasks.append(("P2", ex.submit(_fetch_streams_from_base, PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG)))
+        for tag, fut in tasks:
+            try:
+                res = fut.result(timeout=REQUEST_TIMEOUT + 2)
+            except Exception as e:
+                logger.error(f'{tag} fetch error (parallel): {e}')
+                res = []
+            if tag == 'AIO':
+                s1 = res
+            else:
+                s2 = res
+
     merged = (s1 + s2)[:INPUT_CAP]
     return merged, len(s1), len(s2)
 
@@ -652,27 +671,49 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             continue
         seen.add(k)
         out_pairs.append((s, m))
-    # Cache hints (optional)
+    # Fast path sorting (without TorBox) to pick candidates first.
+    priority_order = {p: len(PREMIUM_PRIORITY + USENET_PRIORITY) - i for i, p in enumerate(PREMIUM_PRIORITY + USENET_PRIORITY)}
+    out_pairs.sort(
+        key=lambda p: (
+            p[1].get("premium_level", 0),
+            p[1].get('seeders', 0),
+            priority_order.get(p[1].get('provider', 'UNK'), 0),
+        ),
+        reverse=True,
+    )
+
+    # Cache hints (optional) - only for the candidates we will actually return.
     cached_map: Dict[str, bool] = {}
-    if TB_API_KEY and TB_CACHE_HINTS:
-        # Preserve order for cache checks; only check up to TB_MAX_HASHES hashes
+    candidates = out_pairs[:MAX_DELIVER]
+    if TB_API_KEY and TB_CACHE_HINTS and candidates:
         hashes: list[str] = []
         seen_h: set[str] = set()
-        for _, m in out_pairs:
+        # We only ever deliver MAX_DELIVER items, so never check more than that.
+        max_check = min(TB_MAX_HASHES, MAX_DELIVER)
+        for _, m in candidates:
             h = (m.get("infohash") or "").lower()
             if not h or h in seen_h:
                 continue
             seen_h.add(h)
             hashes.append(h)
-            if len(hashes) >= TB_MAX_HASHES:
+            if len(hashes) >= max_check:
                 break
         cached_map = tb_get_cached(hashes)
-    # Sort by priority: premium_level > cached > seeders > provider
-    priority_order = {p: len(PREMIUM_PRIORITY + USENET_PRIORITY) - i for i, p in enumerate(PREMIUM_PRIORITY + USENET_PRIORITY)}
-    out_pairs.sort(key=lambda p: (p[1].get("premium_level", 0), cached_map.get((p[1].get('infohash', '') or '').lower(), False), p[1].get('seeders', 0), priority_order.get(p[1].get('provider', 'UNK'), 0)), reverse=True)
+
+        # Re-sort the candidate set using cached hint as a tiebreaker (cheap, small list).
+        candidates.sort(
+            key=lambda p: (
+                p[1].get("premium_level", 0),
+                cached_map.get((p[1].get('infohash', '') or '').lower(), False),
+                p[1].get('seeders', 0),
+                priority_order.get(p[1].get('provider', 'UNK'), 0),
+            ),
+            reverse=True,
+        )
+
     # Format (last step)
     delivered: List[Dict[str, Any]] = []
-    for s, m in out_pairs[:MAX_DELIVER]:
+    for s, m in candidates[:MAX_DELIVER]:
         cached_hint = "CACHED" if cached_map.get((m.get("infohash", "") or "").lower(), False) else ""
         if REFORMAT_STREAMS:
             format_stream_inplace(s, m, expected, cached_hint, type_, season, episode)
