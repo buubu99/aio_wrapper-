@@ -7,12 +7,13 @@ import re
 import time
 import unicodedata
 import uuid
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 import requests
-from flask import Flask, jsonify, g, has_request_context
+from flask import Flask, jsonify, g, has_request_context, request
 from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -74,6 +75,56 @@ PREMIUM_PRIORITY = os.environ.get("PREMIUM_PRIORITY", "RD,TB,AD").split(",")
 USENET_PRIORITY = os.environ.get("USENET_PRIORITY", "ND,EW,NG").split(",")
 VERIFY_PREMIUM = _parse_bool(os.environ.get("VERIFY_PREMIUM", "false"), False)
 ASSUME_PREMIUM_ON_FAIL = _parse_bool(os.environ.get("ASSUME_PREMIUM_ON_FAIL", "false"), False)
+
+# Optional: cached/instant validation for RD/AD (heuristics by default; strict workflow is opt-in)
+VERIFY_CACHED_ONLY = _parse_bool(os.environ.get("VERIFY_CACHED_ONLY", "false"), False)
+MIN_CACHE_CONFIDENCE = float(os.environ.get("MIN_CACHE_CONFIDENCE", "0.8"))
+VALIDATE_CACHE_TIMEOUT = float(os.environ.get("VALIDATE_CACHE_TIMEOUT", "10"))
+
+RD_STRICT_CACHE_CHECK = _parse_bool(os.environ.get("RD_STRICT_CACHE_CHECK", "false"), False)
+RD_API_KEY = os.environ.get("RD_API_KEY", "")
+
+AD_STRICT_CACHE_CHECK = _parse_bool(os.environ.get("AD_STRICT_CACHE_CHECK", "false"), False)
+AD_API_KEY = os.environ.get("AD_API_KEY", "")
+
+# Limit strict cache checks per request to avoid excessive API churn
+STRICT_CACHE_MAX = int(os.environ.get("STRICT_CACHE_MAX", "18"))
+
+
+# --- Add-ons / extensions (optional) ---
+DEPRIORITIZE_RD = _parse_bool(os.environ.get("DEPRIORITIZE_RD", "false"), False)
+DROP_RD = _parse_bool(os.environ.get("DROP_RD", "false"), False)
+
+MIN_RES = int(os.environ.get("MIN_RES", "0"))  # e.g. 720, 1080, 2160
+MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", "0"))  # 0 = off
+USE_AGE_HEURISTIC = _parse_bool(os.environ.get("USE_AGE_HEURISTIC", "false"), False)
+
+ADD_CACHE_HINT = _parse_bool(os.environ.get("ADD_CACHE_HINT", "false"), False)
+
+# TorBox strict cache filtering (different from TB_CACHE_HINTS which only adds a hint)
+TORBOX_CACHE_CHECK = _parse_bool(os.environ.get("TORBOX_CACHE_CHECK", "false"), False)
+VERIFY_TB_CACHE_OFF = _parse_bool(os.environ.get("VERIFY_TB_CACHE_OFF", "false"), False)
+
+# Wrapper behavior toggles
+WRAPPER_DEDUP = _parse_bool(os.environ.get("WRAPPER_DEDUP", "true"), True)
+
+VERIFY_STREAM = _parse_bool(os.environ.get("VERIFY_STREAM", "false"), False)
+VERIFY_STREAM_TIMEOUT = float(os.environ.get("VERIFY_STREAM_TIMEOUT", "4"))
+
+# Force a minimum share of usenet results (if they exist)
+MIN_USENET_KEEP = int(os.environ.get("MIN_USENET_KEEP", "0"))
+MIN_USENET_DELIVER = int(os.environ.get("MIN_USENET_DELIVER", "0"))
+
+# Optional local/remote filtering sources
+USE_BLACKLISTS = _parse_bool(os.environ.get("USE_BLACKLISTS", "false"), False)
+BLACKLIST_URLS = [u.strip() for u in (os.environ.get("BLACKLIST_URLS", "") or "").split(",") if u.strip()]
+BLACKLIST_TERMS = [t.strip().lower() for t in (os.environ.get("BLACKLIST_TERMS", "") or "").split(",") if t.strip()]
+USE_FAKES_DB = _parse_bool(os.environ.get("USE_FAKES_DB", "false"), False)
+FAKES_DB_URL = os.environ.get("FAKES_DB_URL", "")
+USE_SIZE_MISMATCH = _parse_bool(os.environ.get("USE_SIZE_MISMATCH", "false"), False)
+
+# Simple in-process rate limit for the wrapper itself (no extra deps). Example: RATE_LIMIT=120/minute
+RATE_LIMIT = (os.environ.get("RATE_LIMIT", "") or "").strip()
 # ---------------------------
 # Lang normalization map (fix mismatch bug)
 # ---------------------------
@@ -127,6 +178,11 @@ logger = logging.getLogger("aio-wrapper")
 @app.before_request
 def _before_request() -> None:
     g.request_id = str(uuid.uuid4())[:8]
+    rl = _enforce_rate_limit()
+    if rl:
+        body, code = rl
+        return jsonify(body), code
+
 def _rid() -> str:
     return g.request_id if has_request_context() and hasattr(g, "request_id") else "GLOBAL"
 # ---------------------------
@@ -137,6 +193,270 @@ retry = Retry(total=3, backoff_factor=0.6, status_forcelist=[500, 502, 503, 504]
 adapter = HTTPAdapter(max_retries=retry)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
+
+
+# ---------------------------
+# Optional: simple in-process rate limiting (no extra deps)
+# ---------------------------
+_rate_buckets: dict[str, deque] = defaultdict(deque)
+
+
+def _parse_rate_limit(limit: str) -> tuple[int, int]:
+    """Parse strings like '100/minute', '20/second', '300/hour'."""
+    s = (limit or '').strip().lower()
+    m = re.match(r'^(\d+)\s*/\s*(second|sec|minute|min|hour|hr)$', s)
+    if not m:
+        raise ValueError(s)
+    n = int(m.group(1))
+    unit = m.group(2)
+    window = 1 if unit in ('second', 'sec') else 60 if unit in ('minute', 'min') else 3600
+    return n, window
+
+
+def _enforce_rate_limit() -> Optional[tuple[Dict[str, Any], int]]:
+    if not RATE_LIMIT:
+        return None
+    try:
+        max_req, window = _parse_rate_limit(RATE_LIMIT)
+    except Exception:
+        return None
+    ip = (request.headers.get('X-Forwarded-For', '').split(',')[0].strip() or request.remote_addr or 'unknown')
+    now = time.time()
+    q = _rate_buckets[ip]
+    while q and (now - q[0]) > window:
+        q.popleft()
+    if len(q) >= max_req:
+        return ({'streams': []}, 429)
+    q.append(now)
+    return None
+
+
+# ---------------------------
+# Parsing helpers (resolution / age)
+# ---------------------------
+
+def _res_to_int(res: str) -> int:
+    r = (res or '').upper()
+    if r in ('4K', '2160P'):
+        return 2160
+    m = re.search(r'(\d{3,4})P', r)
+    if m:
+        return int(m.group(1))
+    return 0
+
+
+def _extract_age_days(text: str) -> Optional[int]:
+    if not text:
+        return None
+    t = text.lower()
+    m = re.search(r'\b(\d{1,4})\s*d\b', t)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'\b(\d{1,4})\s*days?\b', t)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _looks_instant(text: str) -> bool:
+    t = (text or '').lower()
+    return any(tok in t for tok in ['cached', 'instant', '⚡', 'tb+', 'tb⚡', 'rd+', 'ad+', 'nd+'])
+
+
+def _cache_confidence(s: Dict[str, Any], meta: Dict[str, Any]) -> float:
+    """Heuristic confidence that a stream is instant/cached.
+
+    This is intentionally conservative: if we can't infer much, we return a low score.
+    """
+    try:
+        text = f"{s.get('name','')} {s.get('description','')} {meta.get('title_raw','')}"
+        size_gb = float(meta.get('size', 0)) / (1024 ** 3) if meta.get('size') else 0.0
+        age = _extract_age_days(text)  # None if unknown
+        instant = _looks_instant(text)
+        score = 0.0
+        if size_gb >= 2.0:
+            score += 0.4
+        if age is not None and age <= 30:
+            score += 0.3
+        if instant:
+            score += 0.3
+        return min(1.0, max(0.0, score))
+    except Exception:
+        return 0.0
+
+
+def _heuristic_cached(s: Dict[str, Any], meta: Dict[str, Any]) -> bool:
+    return _cache_confidence(s, meta) >= MIN_CACHE_CONFIDENCE
+
+
+def _rd_strict_is_cached(infohash: str) -> Optional[bool]:
+    """Strict RD cache test (mutates account state).
+
+    Uses addMagnet -> selectFiles(all) -> info -> delete.
+    Returns True/False if it can determine, or None if it cannot.
+    """
+    if not RD_API_KEY or not infohash or not re.fullmatch(r"[0-9a-fA-F]{40}", infohash):
+        return None
+    magnet = f"magnet:?xt=urn:btih:{infohash.upper()}"
+    torrent_id: Optional[str] = None
+    try:
+        add = session.post(
+            "https://api.real-debrid.com/rest/1.0/torrents/addMagnet",
+            params={"auth_token": RD_API_KEY},
+            data={"magnet": magnet},
+            timeout=VALIDATE_CACHE_TIMEOUT,
+        )
+        add.raise_for_status()
+        add_data = add.json() or {}
+        torrent_id = add_data.get("id")
+        if not torrent_id:
+            return None
+
+        # select all files
+        try:
+            session.post(
+                f"https://api.real-debrid.com/rest/1.0/torrents/selectFiles/{torrent_id}",
+                params={"auth_token": RD_API_KEY},
+                data={"files": "all"},
+                timeout=VALIDATE_CACHE_TIMEOUT,
+            )
+        except Exception:
+            pass
+
+        info = session.get(
+            f"https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}",
+            params={"auth_token": RD_API_KEY},
+            timeout=VALIDATE_CACHE_TIMEOUT,
+        )
+        info.raise_for_status()
+        info_data = info.json() or {}
+        links = info_data.get("links") or []
+        if isinstance(links, list) and len(links) > 0:
+            return True
+        # If no links, treat as not cached/instant.
+        return False
+    except Exception as e:
+        logger.debug("RD strict cache check failed: %s", e)
+        return None
+    finally:
+        if torrent_id:
+            try:
+                session.delete(
+                    f"https://api.real-debrid.com/rest/1.0/torrents/delete/{torrent_id}",
+                    params={"auth_token": RD_API_KEY},
+                    timeout=min(VALIDATE_CACHE_TIMEOUT, 6),
+                )
+            except Exception:
+                pass
+
+
+def _verify_stream_url(s: Dict[str, Any]) -> bool:
+    if not VERIFY_STREAM:
+        return True
+    url = s.get('url') or s.get('externalUrl')
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        r = session.head(url, allow_redirects=True, timeout=VERIFY_STREAM_TIMEOUT)
+        if r.status_code in (200, 206, 302, 303, 307, 308):
+            return True
+        if r.status_code in (403, 405, 400):
+            r2 = session.get(url, headers={'Range': 'bytes=0-0'}, stream=True, allow_redirects=True, timeout=VERIFY_STREAM_TIMEOUT)
+            ok = r2.status_code in (200, 206)
+            try:
+                r2.close()
+            except Exception:
+                pass
+            return ok
+        return False
+    except Exception:
+        return False
+
+
+# ---------------------------
+# Optional: external blacklists / fakes DB
+# ---------------------------
+
+@lru_cache(maxsize=8)
+def _load_blacklist_patterns() -> list[re.Pattern]:
+    pats: list[re.Pattern] = []
+    for term in BLACKLIST_TERMS:
+        try:
+            pats.append(re.compile(re.escape(term), re.I))
+        except Exception:
+            continue
+    for url in BLACKLIST_URLS:
+        try:
+            r = session.get(url, timeout=6)
+            if r.status_code != 200:
+                continue
+            for line in (r.text or '').splitlines():
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                try:
+                    pats.append(re.compile(line, re.I))
+                except Exception:
+                    try:
+                        pats.append(re.compile(re.escape(line), re.I))
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+    return pats
+
+
+@lru_cache(maxsize=4)
+def _load_fakes_db() -> set[str]:
+    bad: set[str] = set()
+    if not USE_FAKES_DB or not FAKES_DB_URL:
+        return bad
+    try:
+        r = session.get(FAKES_DB_URL, timeout=6)
+        if r.status_code != 200:
+            return bad
+        ct = (r.headers.get('content-type') or '').lower()
+        if 'json' in ct:
+            data = r.json()
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = data.get('hashes') or []
+            else:
+                items = []
+            for h in items:
+                if isinstance(h, str) and re.fullmatch(r'[0-9a-fA-F]{40}', h.strip()):
+                    bad.add(h.strip().lower())
+        else:
+            for line in (r.text or '').splitlines():
+                h = line.strip()
+                if re.fullmatch(r'[0-9a-fA-F]{40}', h):
+                    bad.add(h.lower())
+    except Exception:
+        return bad
+    return bad
+
+
+def _is_blacklisted(text: str) -> bool:
+    if not USE_BLACKLISTS:
+        return False
+    for pat in _load_blacklist_patterns():
+        try:
+            if pat.search(text or ''):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _is_valid_stream_id(type_: str, id_: str) -> bool:
+    if type_ not in ('movie', 'series'):
+        return False
+    if not id_ or not isinstance(id_, str):
+        return False
+    if type_ == 'movie':
+        return bool(re.match(r'^(tt\d+|tmdb:\d+)$', id_, re.I))
+    return bool(re.match(r'^(tt\d+|tmdb:\d+)(:\d{1,4}:\d{1,4})?$', id_, re.I))
 # ---------------------------
 # Helpers: text sanitation + title normalization (borrowed from v16 superior & v20 hardening)
 # ---------------------------
@@ -613,6 +933,14 @@ class PipeStats:
     dropped_low_seeders: int = 0
     dropped_lang: int = 0
     dropped_low_premium: int = 0
+    dropped_rd: int = 0
+    dropped_low_res: int = 0
+    dropped_old_age: int = 0
+    dropped_blacklist: int = 0
+    dropped_fakes_db: int = 0
+    dropped_dead_url: int = 0
+    dropped_uncached: int = 0
+    dropped_uncached_tb: int = 0
     deduped: int = 0
     delivered: int = 0
 def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
@@ -622,7 +950,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     stats.aio_in = aio_in
     stats.prov2_in = prov2_in
     stats.merged_in = len(streams)
+
     expected = get_expected_metadata(type_, id_)
+
     # parse season/episode from id for series (tmdb:123:1:3 or tt..:1:3)
     season = episode = None
     if type_ == "series" and ":" in id_:
@@ -633,6 +963,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 episode = int(parts[-1])
             except Exception:
                 season = episode = None
+
+    bad_hashes = _load_fakes_db() if USE_FAKES_DB else set()
+
     cleaned: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     for s in streams:
         if not isinstance(s, dict):
@@ -640,58 +973,113 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         if not sanitize_stream_inplace(s):
             stats.dropped_missing_url += 1
             continue
-        # Drop explicit error streams
         if (s.get("streamData") or {}).get("type") == "error":
             stats.dropped_error += 1
             continue
+
         m = classify(s)
-        # When VALIDATE_OFF is enabled, we only sanitize and (optionally) format.
-        # Still drop missing URLs and explicit error streams above.
+
+        # Optional hard drops first
+        if DROP_RD and m.get("provider") == "RD":
+            stats.dropped_rd += 1
+            continue
+
         if not VALIDATE_OFF:
-            if m['seeders'] < MIN_SEEDERS:
+            # Seeders
+            if m.get('seeders', 0) < MIN_SEEDERS:
                 stats.dropped_low_seeders += 1
                 continue
-            if PREFERRED_LANG and m['language'] != PREFERRED_LANG:
+            # Language
+            if PREFERRED_LANG and m.get('language') != PREFERRED_LANG:
                 stats.dropped_lang += 1
                 continue
+            # Pollution
             if DROP_POLLUTED and is_polluted(s, type_, season, episode):
                 stats.dropped_pollution += 1
                 continue
-            if VERIFY_PREMIUM and m["premium_level"] == 0:
+            # Premium plan (best-effort)
+            if VERIFY_PREMIUM and m.get("premium_level", 0) == 0:
                 stats.dropped_low_premium += 1
                 continue
+
+            # Resolution
+            if MIN_RES > 0:
+                if _res_to_int(m.get('res', '')) < MIN_RES:
+                    stats.dropped_low_res += 1
+                    continue
+
+            # Age heuristic
+            if USE_AGE_HEURISTIC and MAX_AGE_DAYS > 0:
+                age = _extract_age_days((s.get('description') or '') + ' ' + (s.get('name') or ''))
+                if age is not None and age > MAX_AGE_DAYS:
+                    stats.dropped_old_age += 1
+                    continue
+
+            # Blacklists
+            if USE_BLACKLISTS:
+                text = f"{s.get('name','')} {s.get('description','')} {m.get('release','')}"
+                if _is_blacklisted(text):
+                    stats.dropped_blacklist += 1
+                    continue
+
+            # Fakes DB (infohash)
+            if USE_FAKES_DB:
+                h = (m.get('infohash') or '').lower()
+                if h and h in bad_hashes:
+                    stats.dropped_fakes_db += 1
+                    continue
+
+            # Optional URL verification (expensive)
+            if VERIFY_STREAM and not _verify_stream_url(s):
+                stats.dropped_dead_url += 1
+                continue
+
         cleaned.append((s, m))
+
     # Dedup
     out_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-    seen = set()
-    for s, m in cleaned:
-        k = dedup_key(s, m)
-        if k in seen:
-            stats.deduped += 1
-            continue
-        seen.add(k)
-        out_pairs.append((s, m))
-    # Fast path sorting (without TorBox) to pick candidates first.
-    priority_order = {p: len(PREMIUM_PRIORITY + USENET_PRIORITY) - i for i, p in enumerate(PREMIUM_PRIORITY + USENET_PRIORITY)}
-    out_pairs.sort(
-        key=lambda p: (
-            p[1].get("premium_level", 0),
-            p[1].get('seeders', 0),
-            priority_order.get(p[1].get('provider', 'UNK'), 0),
-        ),
-        reverse=True,
-    )
+    if WRAPPER_DEDUP:
+        seen = set()
+        for s, m in cleaned:
+            k = dedup_key(s, m)
+            if k in seen:
+                stats.deduped += 1
+                continue
+            seen.add(k)
+            out_pairs.append((s, m))
+    else:
+        out_pairs = cleaned[:]
 
-    # Cache hints (optional) - only for the candidates we will actually return.
+    # Fast path sorting (cheap) to pick candidates first.
+    priority_order = {p: len(PREMIUM_PRIORITY + USENET_PRIORITY) - i for i, p in enumerate(PREMIUM_PRIORITY + USENET_PRIORITY)}
+
+    def _sort_key(pair: Tuple[Dict[str, Any], Dict[str, Any]]):
+        _s, _m = pair
+        provider = _m.get('provider', 'UNK')
+        size = _m.get('size', 0)
+        rd_penalty = -1 if (DEPRIORITIZE_RD and provider == 'RD') else 0
+        return (
+            _m.get('premium_level', 0),
+            rd_penalty,
+            size,
+            _m.get('seeders', 0),
+            priority_order.get(provider, 0),
+        )
+
+    out_pairs.sort(key=_sort_key, reverse=True)
+
+    # Candidate window: a little bigger so we can satisfy usenet quotas.
+    window = max(MAX_DELIVER, MIN_USENET_KEEP, MIN_USENET_DELIVER, 1)
+    candidates = out_pairs[: window * 4]
+
+    # TorBox cache hints / enforcement
     cached_map: Dict[str, bool] = {}
-    candidates = out_pairs[:MAX_DELIVER]
     if TB_API_KEY and TB_CACHE_HINTS and candidates:
         hashes: list[str] = []
         seen_h: set[str] = set()
-        # We only ever deliver MAX_DELIVER items, so never check more than that.
-        max_check = min(TB_MAX_HASHES, MAX_DELIVER)
-        for _, m in candidates:
-            h = (m.get("infohash") or "").lower()
+        max_check = min(TB_MAX_HASHES, len(candidates))
+        for _, meta in candidates:
+            h = (meta.get('infohash') or '').lower()
             if not h or h in seen_h:
                 continue
             seen_h.add(h)
@@ -700,26 +1088,137 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 break
         cached_map = tb_get_cached(hashes)
 
-        # Re-sort the candidate set using cached hint as a tiebreaker (cheap, small list).
+        # Re-sort candidates using cached hint as a tiebreaker.
         candidates.sort(
             key=lambda p: (
-                p[1].get("premium_level", 0),
-                cached_map.get((p[1].get('infohash', '') or '').lower(), False),
+                p[1].get('premium_level', 0),
+                cached_map.get((p[1].get('infohash') or '').lower(), False),
+                -1 if (DEPRIORITIZE_RD and p[1].get('provider') == 'RD') else 0,
+                p[1].get('size', 0),
                 p[1].get('seeders', 0),
                 priority_order.get(p[1].get('provider', 'UNK'), 0),
             ),
             reverse=True,
         )
 
+        # Optional: enforce TorBox cached-only (drop TB streams that are not cached).
+        if TORBOX_CACHE_CHECK and not VERIFY_TB_CACHE_OFF:
+            before = len(candidates)
+            def _is_tb_cached(pair):
+                _s, _m = pair
+                if _m.get('provider') != 'TB':
+                    return True
+                h = (_m.get('infohash') or '').lower()
+                return bool(h) and cached_map.get(h, False)
+            candidates = [p for p in candidates if _is_tb_cached(p)]
+            stats.dropped_uncached_tb += before - len(candidates)
+
+    # Optional: cached/instant-only enforcement across providers.
+    # - TB: requires TB_CACHE_HINTS + TB_API_KEY (otherwise we can't confirm)
+    # - RD: heuristic by default; strict workflow if RD_STRICT_CACHE_CHECK=true and RD_API_KEY is set
+    # - AD: heuristic only (strict workflow not implemented here)
+    if VERIFY_CACHED_ONLY and not VALIDATE_OFF:
+        before = len(candidates)
+        strict_used = 0
+
+        def _is_cached(pair: Tuple[Dict[str, Any], Dict[str, Any]]) -> bool:
+            nonlocal strict_used
+            _s, _m = pair
+            provider = _m.get('provider', 'UNK')
+            h = (_m.get('infohash') or '').lower()
+
+            # Usenet / unknown providers are treated as playable without cache confirmation.
+            if provider in USENET_PRIORITY or provider not in ('RD', 'AD', 'TB'):
+                _m['cached'] = True
+                return True
+
+            if provider == 'TB':
+                if h and cached_map:
+                    ok = bool(cached_map.get(h, False))
+                    _m['cached'] = ok
+                    return ok
+                # If we can't check TB cache status, be conservative unless the user opted to assume.
+                if ASSUME_PREMIUM_ON_FAIL:
+                    _m['cached'] = True
+                    return True
+                return False
+
+            if provider == 'RD':
+                # Strict check is expensive and mutates RD state; cap it per request.
+                if RD_STRICT_CACHE_CHECK and RD_API_KEY and h and strict_used < STRICT_CACHE_MAX:
+                    strict_used += 1
+                    res = _rd_strict_is_cached(h)
+                    if res is not None:
+                        _m['cached'] = bool(res)
+                        return bool(res)
+                # Fallback heuristic
+                ok = _heuristic_cached(_s, _m)
+                _m['cached'] = ok
+                return ok
+
+            if provider == 'AD':
+                if AD_STRICT_CACHE_CHECK and AD_API_KEY:
+                    # Not implemented: AllDebrid strict cache workflow differs per API.
+                    # Fallback to heuristics.
+                    pass
+                ok = _heuristic_cached(_s, _m)
+                _m['cached'] = ok
+                return ok
+
+            return True
+
+        candidates = [p for p in candidates if _is_cached(p)]
+        stats.dropped_uncached += before - len(candidates)
+
+    # Ensure we keep/deliver some usenet entries (if configured).
+    def _is_usenet(pair):
+        return pair[1].get('provider') in USENET_PRIORITY
+
+    if MIN_USENET_KEEP or MIN_USENET_DELIVER:
+        # KEEP: ensure at least MIN_USENET_KEEP in the pool
+        if MIN_USENET_KEEP:
+            have = sum(1 for p in candidates if _is_usenet(p))
+            if have < MIN_USENET_KEEP:
+                for p2 in out_pairs[len(candidates):]:
+                    if _is_usenet(p2) and p2 not in candidates:
+                        candidates.append(p2)
+                        have += 1
+                        if have >= MIN_USENET_KEEP:
+                            break
+        # DELIVER: ensure at least MIN_USENET_DELIVER within the first MAX_DELIVER
+        if MIN_USENET_DELIVER:
+            slice_ = candidates[:MAX_DELIVER]
+            have = sum(1 for p in slice_ if _is_usenet(p))
+            if have < MIN_USENET_DELIVER:
+                extras = [p for p in candidates[MAX_DELIVER:] + out_pairs[len(candidates):] if _is_usenet(p) and p not in slice_]
+                i = 0
+                while have < MIN_USENET_DELIVER and i < len(extras):
+                    for j in range(len(slice_) - 1, -1, -1):
+                        if not _is_usenet(slice_[j]):
+                            slice_[j] = extras[i]
+                            i += 1
+                            have += 1
+                            break
+                    else:
+                        break
+                candidates = slice_ + candidates[MAX_DELIVER:]
+
     # Format (last step)
     delivered: List[Dict[str, Any]] = []
     for s, m in candidates[:MAX_DELIVER]:
-        cached_hint = "CACHED" if cached_map.get((m.get("infohash", "") or "").lower(), False) else ""
+        h = (m.get('infohash') or '').lower()
+        is_cached = bool(m.get('cached')) or (h and cached_map.get(h, False))
+        cached_hint = "CACHED" if is_cached else ""
+        if ADD_CACHE_HINT and not cached_hint:
+            if _looks_instant((s.get('name','') or '') + ' ' + (s.get('description','') or '')):
+                cached_hint = "LIKELY"
         if REFORMAT_STREAMS:
             format_stream_inplace(s, m, expected, cached_hint, type_, season, episode)
         delivered.append(s)
+
     stats.delivered = len(delivered)
     return delivered, stats
+
 # ---------------------------
 # Endpoints
 # ---------------------------
@@ -742,7 +1241,7 @@ def manifest():
     )
 @app.get("/stream/<type_>/<id_>.json")
 def stream(type_: str, id_: str):
-    if type_ not in ["movie", "series"] or not id_:
+    if not _is_valid_stream_id(type_, id_):
         return jsonify({"streams": []}), 400
     t0 = time.time()
     stats = PipeStats()
@@ -757,12 +1256,14 @@ def stream(type_: str, id_: str):
         return jsonify({"streams": []}), 200
     finally:
         logger.info(
-            "WRAP_STATS rid=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s deduped=%s delivered=%s ms=%s",
+            "WRAP_STATS rid=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s deduped=%s delivered=%s ms=%s",
             _rid(), type_, id_,
             stats.aio_in, stats.prov2_in, stats.merged_in,
             stats.dropped_error, stats.dropped_missing_url, stats.dropped_pollution,
             stats.dropped_low_seeders, stats.dropped_lang,
             stats.dropped_low_premium,
+            stats.dropped_rd, stats.dropped_low_res, stats.dropped_old_age,
+            stats.dropped_blacklist, stats.dropped_fakes_db, stats.dropped_dead_url, stats.dropped_uncached, stats.dropped_uncached_tb,
             stats.deduped, stats.delivered,
             int((time.time() - t0) * 1000),
         )
