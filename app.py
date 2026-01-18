@@ -43,13 +43,15 @@ def _normalize_base(raw: str) -> str:
 # Config (keep env names compatible with your existing Render setup)
 # ---------------------------
 AIO_URL = os.environ.get("AIO_URL", "")
-AIO_BASE = _normalize_base(os.environ.get("AIO_BASE", "") or AIO_URL)
+# Safer fallback: preserves path if the user uses token-in-path URLs
+AIO_BASE = (os.environ.get("AIO_BASE", "") or AIO_URL).rstrip("/")
 # can be base url or .../manifest.json
 AIOSTREAMS_AUTH = os.environ.get("AIOSTREAMS_AUTH", "") # "user:pass"
 
 # Optional second provider (another AIOStreams-compatible addon)
 PROV2_URL = os.environ.get("PROV2_URL", "")
-PROV2_BASE = _normalize_base(os.environ.get("PROV2_BASE", "") or PROV2_URL)
+# Safer fallback: preserves path if the user uses token-in-path URLs
+PROV2_BASE = (os.environ.get("PROV2_BASE", "") or PROV2_URL).rstrip("/")
 PROV2_AUTH = os.environ.get("PROV2_AUTH", "")  # 'user:pass' for Basic auth if needed
 PROV2_TAG = os.environ.get("PROV2_TAG", "P2")
 INPUT_CAP = int(os.environ.get("INPUT_CAP", "4500"))
@@ -316,19 +318,28 @@ def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
     for i in range(0, len(hashes), max(1, TB_BATCH_SIZE)):
         batch = hashes[i:i+TB_BATCH_SIZE]
         try:
-            r = session.post(url, params={'format': 'hash', 'list_files': '0'}, json={'hashes': batch}, headers=headers, timeout=REQUEST_TIMEOUT)
+            # TorBox `format` supports "object" or "list" ("list" is fastest). Using "hash" causes a 400.
+            r = session.post(url, params={'format': 'list', 'list_files': '0'}, json={'hashes': batch}, headers=headers, timeout=REQUEST_TIMEOUT)
             if r.status_code != 200:
                 continue
             data = r.json()
             # Common response style: {success: bool, data: {hash: {...}}}
             d = data.get('data') if isinstance(data, dict) else None
             if isinstance(d, dict):
-                for h in batch:
-                    out[h] = h in d
+                cached = set(d.keys())
+            elif isinstance(d, list):
+                cached = set()
+                for x in d:
+                    if isinstance(x, str):
+                        cached.add(x)
+                    elif isinstance(x, dict):
+                        hx = x.get('hash') or x.get('info_hash')
+                        if isinstance(hx, str):
+                            cached.add(hx)
             else:
-                # Fallback: treat any truthy response as cached
-                for h in batch:
-                    out[h] = False
+                cached = set()
+            for h in batch:
+                out[h] = h in cached
         except Exception:
             continue
     return out
@@ -858,17 +869,23 @@ def _fetch_streams_from_base(base: str, auth: str, type_: str, id_: str, tag: st
         logger.error(f'{tag} fetch error: {e}')
         return []
 
-def get_streams(type_: str, id_: str) -> Tuple[List[Dict[str, Any]], int, int]:
+def get_streams(type_: str, id_: str) -> Tuple[List[Dict[str, Any]], int, int, int, int]:
     """Fetch both providers in parallel (best-effort) and return merged streams + counts."""
     s1: List[Dict[str, Any]] = []
     s2: List[Dict[str, Any]] = []
 
+    ms_aio = 0
+    ms_p2 = 0
+
     tasks = []
     with ThreadPoolExecutor(max_workers=2) as ex:
-        tasks.append(("AIO", ex.submit(_fetch_streams_from_base, AIO_BASE, AIOSTREAMS_AUTH, type_, id_, 'AIO')))
+        t_aio0 = time.time()
+        tasks.append(("AIO", t_aio0, ex.submit(_fetch_streams_from_base, AIO_BASE, AIOSTREAMS_AUTH, type_, id_, 'AIO')))
         if PROV2_BASE:
-            tasks.append(("P2", ex.submit(_fetch_streams_from_base, PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG)))
-        for tag, fut in tasks:
+            t_p20 = time.time()
+            tasks.append(("P2", t_p20, ex.submit(_fetch_streams_from_base, PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG)))
+
+        for tag, t_start, fut in tasks:
             try:
                 res = fut.result(timeout=REQUEST_TIMEOUT + 2)
             except Exception as e:
@@ -876,11 +893,13 @@ def get_streams(type_: str, id_: str) -> Tuple[List[Dict[str, Any]], int, int]:
                 res = []
             if tag == 'AIO':
                 s1 = res
+                ms_aio = int((time.time() - t_start) * 1000)
             else:
                 s2 = res
+                ms_p2 = int((time.time() - t_start) * 1000)
 
     merged = (s1 + s2)[:INPUT_CAP]
-    return merged, len(s1), len(s2)
+    return merged, len(s1), len(s2), ms_aio, ms_p2
 
 # ---------------------------
 # Pipeline
@@ -908,6 +927,17 @@ class PipeStats:
     dropped_uncached_tb: int = 0
     deduped: int = 0
     delivered: int = 0
+
+    # Timing/diagnostics (ms)
+    ms_fetch_aio: int = 0
+    ms_fetch_p2: int = 0
+    ms_tmdb: int = 0
+    ms_tb_api: int = 0
+    ms_tb_webdav: int = 0
+
+    # Hash counts (diagnostics)
+    tb_api_hashes: int = 0
+    tb_webdav_hashes: int = 0
 
 def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
     """Stable dedup key.
@@ -941,7 +971,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     stats.prov2_in = prov2_in
     stats.merged_in = len(streams)
 
+    t_tmdb0 = time.time()
     expected = get_expected_metadata(type_, id_)
+    stats.ms_tmdb = int((time.time() - t_tmdb0) * 1000)
 
     # parse season/episode from id for series (tmdb:123:1:3 or tt..:1:3)
     season = episode = None
@@ -1096,7 +1128,10 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 break
         if tb_hashes:
             try:
+                stats.tb_webdav_hashes = len(tb_hashes)
+                t_wd0 = time.time()
                 webdav_ok = tb_webdav_batch_check(tb_hashes)
+                stats.ms_tb_webdav = int((time.time() - t_wd0) * 1000)
             except Exception:
                 webdav_ok = {}
             before = len(candidates)
@@ -1123,7 +1158,10 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             hashes.append(h)
             if len(hashes) >= max_check:
                 break
+        stats.tb_api_hashes = len(hashes)
+        t_api0 = time.time()
         cached_map = tb_get_cached(hashes)
+        stats.ms_tb_api = int((time.time() - t_api0) * 1000)
 
         # Re-sort candidates using cached hint as a tiebreaker.
         def _cand_key(p):
@@ -1273,15 +1311,23 @@ def stream(type_: str, id_: str):
     t0 = time.time()
     stats = PipeStats()
     try:
-        streams, aio_in, prov2_in = get_streams(type_, id_)
+        streams, aio_in, prov2_in, ms_aio, ms_p2 = get_streams(type_, id_)
         stats.aio_in = aio_in
         stats.prov2_in = prov2_in
+        stats.ms_fetch_aio = ms_aio
+        stats.ms_fetch_p2 = ms_p2
         out, stats = filter_and_format(type_, id_, streams, aio_in=aio_in, prov2_in=prov2_in)
         return jsonify({"streams": out}), 200
     except Exception as e:
         logger.exception(f"Stream error: {e}")
         return jsonify({"streams": []}), 200
     finally:
+        logger.info(
+            "WRAP_TIMING rid=%s type=%s id=%s aio_ms=%s p2_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_api_hashes=%s tb_wd_hashes=%s",
+            _rid(), type_, id_,
+            stats.ms_fetch_aio, stats.ms_fetch_p2, stats.ms_tmdb, stats.ms_tb_api, stats.ms_tb_webdav,
+            stats.tb_api_hashes, stats.tb_webdav_hashes,
+        )
         logger.info(
             "WRAP_STATS rid=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s deduped=%s delivered=%s ms=%s",
             _rid(), type_, id_,
