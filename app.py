@@ -83,6 +83,7 @@ TB_API_MIN_HASHES = int(os.environ.get("TB_API_MIN_HASHES", "20"))  # skip TorBo
 TB_CACHE_HINTS = _parse_bool(os.environ.get("TB_CACHE_HINTS", "true"), True)  # enable TorBox cache hint lookups
 TB_USENET_CHECK = _parse_bool(os.environ.get("TB_USENET_CHECK", "false"), False)  # optional usenet cache checks (requires identifiers)
 REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "30"))
+TMDB_TIMEOUT = float(os.environ.get("TMDB_TIMEOUT", "8"))
 # TMDB for metadata
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
 # Additional filters
@@ -608,6 +609,12 @@ def _before_request() -> None:
 def _rid() -> str:
     return g.request_id if has_request_context() and hasattr(g, "request_id") else "GLOBAL"
 
+def is_android_client() -> bool:
+    """Best-effort detection of Android/Google TV Stremio clients."""
+    ua = request.headers.get("User-Agent", "") if has_request_context() else ""
+    return ("Android" in ua) or ("okhttp" in ua.lower())
+
+
 # ---------------------------
 # HTTP session (retries)
 # ---------------------------
@@ -1109,7 +1116,7 @@ def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
     return f"{infohash or 'nohash'}:{size_part}:{res}:{lang}:{audio}:{prov}:{normalized_label}"
 
 
-def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0) -> Tuple[List[Dict[str, Any]], PipeStats]:
+def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0, is_android: bool = False) -> Tuple[List[Dict[str, Any]], PipeStats]:
     stats = PipeStats()
     stats.aio_in = aio_in
     stats.prov2_in = prov2_in
@@ -1432,6 +1439,39 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     else:
                         break
                 candidates = slice_ + candidates[MAX_DELIVER:]
+    # Android/Google TV clients can't handle magnet: links; drop them and backfill with direct URLs.
+    if is_android:
+        def _is_magnet(u: str) -> bool:
+            return isinstance(u, str) and u.startswith("magnet:")
+        magnets = sum(1 for s, _m in candidates if _is_magnet((s or {}).get("url", "")))
+        if magnets:
+            kept = []
+            seen = set()
+            for s, m in candidates:
+                u = (s or {}).get("url", "")
+                if _is_magnet(u):
+                    continue
+                key = (u, (s or {}).get("name") or "", (s or {}).get("title") or "")
+                if key in seen:
+                    continue
+                seen.add(key)
+                kept.append((s, m))
+            if len(kept) < MAX_DELIVER:
+                for s, m in out_pairs:
+                    u = (s or {}).get("url", "")
+                    if _is_magnet(u):
+                        continue
+                    key = (u, (s or {}).get("name") or "", (s or {}).get("title") or "")
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    kept.append((s, m))
+                    if len(kept) >= MAX_DELIVER:
+                        break
+            stats.dropped_uncached += magnets
+            logger.info(f"ANDROID_FILTER rid={rid} dropped_magnets={magnets}")
+            candidates = kept
+
     # Format (last step)
     delivered: List[Dict[str, Any]] = []
     for s, m in candidates[:MAX_DELIVER]:
@@ -1491,13 +1531,15 @@ def stream(type_: str, id_: str):
         return jsonify({"streams": []}), 400
     t0 = time.time()
     stats = PipeStats()
+    is_android = is_android_client()
+
     try:
         streams, aio_in, prov2_in, ms_aio, ms_p2 = get_streams(type_, id_)
         stats.aio_in = aio_in
         stats.prov2_in = prov2_in
         stats.ms_fetch_aio = ms_aio
         stats.ms_fetch_p2 = ms_p2
-        out, stats = filter_and_format(type_, id_, streams, aio_in=aio_in, prov2_in=prov2_in)
+        out, stats = filter_and_format(type_, id_, streams, aio_in=aio_in, prov2_in=prov2_in, is_android=is_android)
         return jsonify({"streams": out}), 200
     except Exception as e:
         logger.exception(f"Stream error: {e}")
