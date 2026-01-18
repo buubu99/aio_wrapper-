@@ -863,21 +863,77 @@ def api_key_for_provider(provider: str) -> str:
 # ---------------------------
 @lru_cache(maxsize=2000)
 def get_expected_metadata(type_: str, id_: str) -> Dict[str, Any]:
+    """Return canonical English title/year for the requested id.
+
+    Stremio ids here are usually IMDb (tt...). TMDB /movie/{id} and /tv/{id} require
+    numeric TMDB ids, so for IMDb ids we must use /find/{imdb_id}?external_source=imdb_id.
+
+    We keep language=en-US to stabilize titles and avoid non-English filenames bleeding
+    into the UI.
+    """
     if not TMDB_API_KEY:
         return {"title": "", "year": None, "type": type_}
+
     id_clean = id_.split(":")[0] if ":" in id_ else id_
-    base = f"https://api.themoviedb.org/3/{'movie' if type_ == 'movie' else 'tv'}/{id_clean}"
+
+    def _get(url: str) -> dict:
+        r = requests.get(url, timeout=TMDB_TIMEOUT)
+        if r.status_code != 200:
+            return {}
+        try:
+            return r.json() or {}
+        except Exception:
+            return {}
+
+    t0 = time.time()
     try:
-        resp = session.get(f"{base}?api_key={TMDB_API_KEY}&language=en-US", timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-        title = data.get("title") or data.get("name", "")
-        release_date = data.get("release_date") or data.get("first_air_date", "")
-        year = int(release_date[:4]) if release_date else None
-        return {"title": title, "year": year, "type": type_}
-    except Exception as e:
-        logger.warning(f"TMDB fetch failed: {e}")
-        return {"title": "", "year": None, "type": type_}
+        # IMDb id path
+        if id_clean.startswith("tt"):
+            find_url = f"https://api.themoviedb.org/3/find/{id_clean}?api_key={TMDB_API_KEY}&external_source=imdb_id&language=en-US"
+            find_js = _get(find_url)
+
+            if type_ == "movie":
+                results = find_js.get("movie_results") or []
+                if results:
+                    tmdb_id = results[0].get("id")
+                    if tmdb_id:
+                        js = _get(f"https://api.themoviedb.org/3/movie/{tmdb_id}?api_key={TMDB_API_KEY}&language=en-US")
+                        title = js.get("title") or js.get("original_title") or ""
+                        year = (js.get("release_date") or "")[:4] or None
+                        return {"title": title, "year": year, "type": type_}
+                return {"title": "", "year": None, "type": type_}
+
+            # series/tv
+            results = find_js.get("tv_results") or []
+            if results:
+                tmdb_id = results[0].get("id")
+                if tmdb_id:
+                    js = _get(f"https://api.themoviedb.org/3/tv/{tmdb_id}?api_key={TMDB_API_KEY}&language=en-US")
+                    title = js.get("name") or js.get("original_name") or ""
+                    year = (js.get("first_air_date") or "")[:4] or None
+                    return {"title": title, "year": year, "type": type_}
+            return {"title": "", "year": None, "type": type_}
+
+        # Already numeric TMDB id (rare in Stremio, but supported)
+        if type_ == "movie":
+            js = _get(f"https://api.themoviedb.org/3/movie/{id_clean}?api_key={TMDB_API_KEY}&language=en-US")
+            title = js.get("title") or js.get("original_title") or ""
+            year = (js.get("release_date") or "")[:4] or None
+            return {"title": title, "year": year, "type": type_}
+        else:
+            js = _get(f"https://api.themoviedb.org/3/tv/{id_clean}?api_key={TMDB_API_KEY}&language=en-US")
+            title = js.get("name") or js.get("original_name") or ""
+            year = (js.get("first_air_date") or "")[:4] or None
+            return {"title": title, "year": year, "type": type_}
+
+    finally:
+        # best-effort timing for logs
+        try:
+            global _TMDB_MS_LAST
+            _TMDB_MS_LAST = int((time.time() - t0) * 1000)
+        except Exception:
+            pass
+
 
 # ---------------------------
 # Formatting: guaranteed 2-left + 3-right (title + 2 lines)
