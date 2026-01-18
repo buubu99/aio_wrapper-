@@ -63,8 +63,6 @@ REFORMAT_STREAMS = _parse_bool(os.environ.get("REFORMAT_STREAMS", "true"), True)
 FORCE_ASCII_TITLE = _parse_bool(os.environ.get("FORCE_ASCII_TITLE", "true"), True)
 MAX_TITLE_CHARS = int(os.environ.get("MAX_TITLE_CHARS", "110"))
 MAX_DESC_CHARS = int(os.environ.get("MAX_DESC_CHARS", "180"))
-# Debug/interop: expose infoHash on delivered streams (off by default)
-EXPOSE_INFOHASH = _parse_bool(os.environ.get("EXPOSE_INFOHASH", "false"), False)
 # Optional: prettier names (emojis + single-line)
 PRETTY_EMOJIS = _parse_bool(os.environ.get("PRETTY_EMOJIS", "true"), True)
 NAME_SINGLE_LINE = _parse_bool(os.environ.get("NAME_SINGLE_LINE", "true"), True)
@@ -87,8 +85,6 @@ TB_USENET_CHECK = _parse_bool(os.environ.get("TB_USENET_CHECK", "false"), False)
 REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "30"))
 # TMDB for metadata
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
-TRAKT_CLIENT_ID = os.environ.get("TRAKT_CLIENT_ID", "")
-TRAKT_API_BASE = os.environ.get("TRAKT_API_BASE", "https://api.trakt.tv")
 # Additional filters
 MIN_SEEDERS = int(os.environ.get("MIN_SEEDERS", "1"))
 PREFERRED_LANG = os.environ.get("PREFERRED_LANG", "EN").upper()
@@ -100,7 +96,7 @@ ASSUME_PREMIUM_ON_FAIL = _parse_bool(os.environ.get("ASSUME_PREMIUM_ON_FAIL", "f
 POLL_ATTEMPTS = int(os.environ.get('POLL_ATTEMPTS', '2'))
 
 # TorBox WebDAV (optional fast existence checks; gated by USE_TB_WEBDAV)
-USE_TB_WEBDAV = _parse_bool(os.environ.get('USE_TB_WEBDAV', 'false'), False)
+USE_TB_WEBDAV = _parse_bool(os.environ.get('USE_TB_WEBDAV', 'true'), True)
 TB_WEBDAV_URL = os.environ.get('TB_WEBDAV_URL', 'https://webdav.torbox.app')
 TB_WEBDAV_USER = os.environ.get('TB_WEBDAV_USER', '')
 TB_WEBDAV_PASS = os.environ.get('TB_WEBDAV_PASS', '')
@@ -109,7 +105,7 @@ TB_WEBDAV_WORKERS = int(os.environ.get('TB_WEBDAV_WORKERS', '10'))
 TB_WEBDAV_TEMPLATES = [t.strip() for t in os.environ.get('TB_WEBDAV_TEMPLATES', 'downloads/{hash}/').split(',') if t.strip()]
 
 # Optional: drop TorBox streams that WebDAV cannot confirm (fast-ish, but still extra requests)
-TB_WEBDAV_STRICT = _parse_bool(os.environ.get('TB_WEBDAV_STRICT', 'false'), False)
+TB_WEBDAV_STRICT = _parse_bool(os.environ.get('TB_WEBDAV_STRICT', 'true'), True)
 
 # Optional: cached/instant validation for RD/AD (heuristics by default; strict workflow is opt-in)
 VERIFY_CACHED_ONLY = _parse_bool(os.environ.get("VERIFY_CACHED_ONLY", "false"), False)
@@ -160,7 +156,7 @@ USE_SIZE_MISMATCH = _parse_bool(os.environ.get("USE_SIZE_MISMATCH", "true"), Tru
 RATE_LIMIT = (os.environ.get("RATE_LIMIT", "") or "").strip()
 
 # ---------------------------
-# Missing helper functions (required by the pipeline)
+# Helpers (used by the pipeline)
 # ---------------------------
 _blacklist_cache = {"ts": 0.0, "terms": set()}
 _fakes_cache = {"ts": 0.0, "hashes": set()}
@@ -190,9 +186,11 @@ def normalize_display_title(title: str) -> str:
         t = re.sub(r'\s+', ' ', t).strip()
     return t
 
-
 def normalize_label(label: str) -> str:
-    # Normalize noisy labels (filename/bingeGroup/name) into a stable comparable key.
+    """Normalize a noisy filename/bingeGroup/name into a stable, comparable label.
+
+    Used only for dedup keys when infohash is missing.
+    """
     if not label:
         return ""
     s = unicodedata.normalize('NFKC', str(label)).lower().strip()
@@ -205,6 +203,7 @@ def normalize_label(label: str) -> str:
     s = re.sub(r'[^a-z0-9]+', ' ', s)
     s = re.sub(r'\s+', ' ', s).strip()
     return s
+
 
 
 def _human_size_bytes(n: int) -> str:
@@ -727,131 +726,73 @@ _AUDIO_TOKS = ["DDP", "DD+", "DD", "EAC3", "TRUEHD", "DTS-HD", "DTS", "AAC", "AC
 _LANG_TOKS = ["ENG", "ENGLISH", "SPANISH", "FRENCH", "GERMAN", "ITALIAN", "KOREAN", "JAPANESE", "CHINESE", "MULTI", "VOSTFR", "SUBBED"]
 _GROUP_RE = re.compile(r"[-.]([a-z0-9]+)$", re.I)
 _HASH_RE = re.compile(r"btih:([0-9a-fA-F]{40})|([0-9a-fA-F]{40})", re.I)
-_IH_DESC_RE = re.compile(r"\bIH:([0-9a-fA-F]{40})\b", re.I)
-_IH_PROV_RE = re.compile(r"\bIH:[0-9a-fA-F]{40}\s*([A-Za-z]{2,4})\b")
-
-def _extract_infohash_from_stream(s: Dict[str, Any]) -> str:
-    """Best-effort infohash extraction.
-
-    Upstream AIOStreams providers sometimes hide the magnet/BTIH in the URL and
-    instead embed it in the description as `IH:<40hex>`. Our wrapper also
-    proxies URLs, so we need a robust extractor.
-    """
-    try:
-        # 1) Direct fields (some addons use these)
-        for k in ("infoHash", "infohash", "info_hash"):
-            v = s.get(k)
-            if isinstance(v, str) and re.fullmatch(r"[0-9a-fA-F]{40}", v.strip()):
-                return v.strip().lower()
-
-        # 2) behaviorHints may carry it
-        bh = s.get("behaviorHints") or {}
-        for k in ("infoHash", "infohash", "info_hash"):
-            v = bh.get(k)
-            if isinstance(v, str) and re.fullmatch(r"[0-9a-fA-F]{40}", v.strip()):
-                return v.strip().lower()
-
-        # 3) Description token: IH:<40hex>
-        desc = s.get("description") or ""
-        m = _IH_DESC_RE.search(str(desc))
-        if m:
-            return (m.group(1) or "").lower()
-
-        # 4) URL / externalUrl: btih:<40hex> or bare 40-hex
-        url = s.get("url") or s.get("externalUrl") or ""
-        hm = _HASH_RE.search(str(url))
-        if hm:
-            return (hm.group(1) or hm.group(2) or "").lower()
-    except Exception:
-        pass
-    return ""
 
 def classify(s: Dict[str, Any]) -> Dict[str, Any]:
-    # Keep raw text for token extraction, but also prepare a cleaned version
-    # (removes IH:<hash> markers so title parsing isn't polluted).
-    name_raw = str(s.get("name", "") or "")
-    desc_raw = str(s.get("description", "") or "")
-    bh0 = s.get("behaviorHints", {}) or {}
-    filename_raw = str(bh0.get("filename", "") or "")
-
-    name = name_raw.lower()
-    desc = desc_raw.lower()
-    filename = filename_raw.lower()
-    desc_clean = _IH_DESC_RE.sub("", desc)
+    name = s.get("name", "").lower()
+    desc = s.get("description", "").lower()
+    filename = s.get("behaviorHints", {}).get("filename", "").lower()
     text = f"{name} {desc} {filename}"
-    text_clean = f"{name} {desc_clean} {filename}"
     # Provider
     provider = "UNK"
-    # Prefer an explicit provider hint embedded alongside IH:<hash> if present.
-    try:
-        hm_prov = _IH_PROV_RE.search(desc_raw)
-        if hm_prov:
-            p = (hm_prov.group(1) or "").upper().strip()
-            if p in {"TB", "RD", "AD", "ND", "EW", "NG"}:
-                provider = p
-    except Exception:
-        pass
-
-    if provider == "UNK":
-        # Fall back to heuristic token scanning (providers)
-        if "real-debrid" in text or re.search(r"\brd\b", text):
-            provider = "RD"
-        elif "torbox" in text or re.search(r"\btb\b", text):
-            provider = "TB"
-        elif "alldebrid" in text or re.search(r"\bad\b", text):
-            provider = "AD"
-        # Usenet providers (treat as premium-ish)
-        elif "nzbdav" in text or re.search(r"\bnzb\b", text):
-            provider = "ND"
-        elif "eweka" in text:
-            provider = "EW"
-        elif "nzgeek" in text:
-            provider = "NG"
-        elif "aio" in text:
-            provider = "AIOStreams"  # Short badge for unknowns
+    if "real-debrid" in text or "rd" in text:
+        provider = "RD"
+    elif "torbox" in text or "tb" in text:
+        provider = "TB"
+    elif "alldebrid" in text or "ad" in text:
+        provider = "AD"
+    elif "aio" in text:
+        provider = "AIOStreams" # Short badge for unknowns
+    # Usenet providers
+    elif "nzbdav" in text or "nzb" in text:
+        provider = "ND"
+    elif "eweka" in text:
+        provider = "EW"
+    elif "nzgeek" in text:
+        provider = "NG"
     # Resolution
-    m = _RES_RE.search(text_clean)
+    m = _RES_RE.search(text)
     res = (m.group(1).upper() if m else "SD")
     if res == "4K":
         res = "2160P"
     # Source
     source = ""
     for tok in _SOURCE_TOKS:
-        if tok.lower() in text_clean:
+        if tok.lower() in text:
             source = tok.upper()
             break
     # Codec
     codec = ""
     for tok in _CODEC_TOKS:
-        if tok.lower() in text_clean:
+        if tok.lower() in text:
             codec = tok.upper()
             break
     # Audio
     audio = ""
     for tok in _AUDIO_TOKS:
-        if tok.lower() in text_clean:
+        if tok.lower() in text:
             audio = tok.upper()
             break
     # Language
     language = "EN"
     for tok in _LANG_TOKS:
-        if tok.lower() in text_clean:
+        if tok.lower() in text:
             language = tok.upper()
             break
     language = LANG_MAP.get(language, language)  # Normalize
     # Size
     size = int(s.get("behaviorHints", {}).get("videoSize", 0))
     if not size:
-        m = _SIZE_RE.search(text_clean)
+        m = _SIZE_RE.search(text)
         if m:
             val = float(m.group(1))
             unit = m.group(2).upper()
             size = int(val * (1024 ** 3 if unit == "GB" else 1024 ** 2))
     # Seeders
-    seeders = int(re.search(r"(\d+) seeds?", text_clean).group(1)) if re.search(r"(\d+) seeds?", text_clean) else 0
-
-    # Infohash (robust: direct field, behaviorHints, IH:<hash> token, or btih in URL)
-    infohash = _extract_infohash_from_stream(s)
+    seeders = int(re.search(r"(\d+) seeds?", text).group(1)) if re.search(r"(\d+) seeds?", text) else 0
+    # Infohash
+    url = s.get("url", "") or s.get("externalUrl", "")
+    hm = _HASH_RE.search(url)
+    infohash = (hm.group(1) or hm.group(2)).lower() if hm else ""
 
     # Optional Usenet identifier (only used if TB_USENET_CHECK=true).
     bh = s.get("behaviorHints", {}) or {}
@@ -865,19 +806,9 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     gm = _GROUP_RE.search(filename)
     group = gm.group(1).upper() if gm else ""
     # Raw title for fallback
-    # Raw title for fallback (avoid IH:<hash> token pollution)
-    title_raw = normalize_display_title(filename_raw or desc_clean or name_raw)
-    # Premium level (fail-open): many upstream streams don't expose provider tokens.
-    # Only mark as non-premium when we're sure.
-    prov_u = (provider or "").upper().strip()
-    prem_set = {p.strip().upper() for p in PREMIUM_PRIORITY if p.strip()}
-    usenet_set = {p.strip().upper() for p in USENET_PRIORITY if p.strip()}
-    if prov_u in prem_set or prov_u in usenet_set:
-        premium_level = 1
-    elif prov_u in ("UNK", "AIOSTREAMS", "AIOSTREAMS"):
-        premium_level = 1
-    else:
-        premium_level = 0
+    title_raw = normalize_display_title(filename or desc or name)
+    # Premium level
+    premium_level = 1 if is_premium_plan(provider, TB_API_KEY if provider == "TB" else api_key_for_provider(provider)) else 0  # Adjust api_key_for_provider as needed
     return {
         "provider": provider,
         "res": res,
@@ -903,98 +834,32 @@ def api_key_for_provider(provider: str) -> str:
     return ""
 
 # ---------------------------
-# Expected metadata (TMDB preferred; Trakt fallback)
+# Expected metadata (real TMDB fetch)
 # ---------------------------
 @lru_cache(maxsize=2000)
 def get_expected_metadata(type_: str, id_: str) -> Dict[str, Any]:
-    # Stremio ids may include season/episode suffix: tt1234567:1:2 or tmdb:123:1:2
+    if not TMDB_API_KEY:
+        return {"title": "", "year": None, "type": type_}
     id_clean = id_.split(":")[0] if ":" in id_ else id_
-
-    imdb_id = None
-    tmdb_id = None
-    if isinstance(id_clean, str):
-        if id_clean.startswith("tt"):
-            imdb_id = id_clean
-        elif id_clean.startswith("tmdb:"):
-            tmdb_id = id_clean.split(":", 1)[1]
-        elif id_clean.startswith("tmdb") and id_clean[4:].isdigit():
-            tmdb_id = id_clean[4:]
-        elif id_clean.isdigit():
-            tmdb_id = id_clean
-
-    def _tmdb_details(_tmdb_id: str) -> Dict[str, Any]:
-        if not TMDB_API_KEY or not _tmdb_id:
-            return {"title": "", "year": None, "type": type_}
-        endpoint = 'movie' if type_ == 'movie' else 'tv'
-        url = f"https://api.themoviedb.org/3/{endpoint}/{_tmdb_id}"
-        resp = session.get(url, params={"api_key": TMDB_API_KEY, "language": "en-US"}, timeout=6)
+    base = f"https://api.themoviedb.org/3/{'movie' if type_ == 'movie' else 'tv'}/{id_clean}"
+    try:
+        resp = session.get(f"{base}?api_key={TMDB_API_KEY}&language=en-US", timeout=5)
         resp.raise_for_status()
-        data = resp.json() if resp.content else {}
-        title = data.get("title") or data.get("name") or ""
-        release_date = data.get("release_date") or data.get("first_air_date") or ""
-        year = int(str(release_date)[:4]) if release_date else None
-        return {"title": title or "", "year": year, "type": type_}
-
-    # 1) TMDB direct ID
-    if tmdb_id and TMDB_API_KEY:
-        try:
-            return _tmdb_details(tmdb_id)
-        except Exception as e:
-            logger.warning(f"TMDB direct fetch failed: {e}")
-
-    # 2) TMDB /find for IMDb ids
-    if imdb_id and TMDB_API_KEY:
-        try:
-            url = f"https://api.themoviedb.org/3/find/{imdb_id}"
-            resp = session.get(
-                url,
-                params={"api_key": TMDB_API_KEY, "external_source": "imdb_id", "language": "en-US"},
-                timeout=6,
-            )
-            resp.raise_for_status()
-            data = resp.json() if resp.content else {}
-            key = "movie_results" if type_ == "movie" else "tv_results"
-            results = data.get(key) if isinstance(data, dict) else None
-            if isinstance(results, list) and results:
-                found_id = results[0].get("id")
-                if found_id:
-                    return _tmdb_details(str(found_id))
-        except Exception as e:
-            logger.warning(f"TMDB find failed: {e}")
-
-    # 3) Trakt fallback (requires TRAKT_CLIENT_ID)
-    if imdb_id and TRAKT_CLIENT_ID:
-        try:
-            trakt_type = "movie" if type_ == "movie" else "show"
-            url = f"{TRAKT_API_BASE.rstrip('/')}/search/imdb/{imdb_id}"
-            headers = {
-                "Content-Type": "application/json",
-                "trakt-api-version": "2",
-                "trakt-api-key": TRAKT_CLIENT_ID,
-            }
-            resp = session.get(url, headers=headers, params={"type": trakt_type, "extended": "full"}, timeout=6)
-            if resp.status_code == 200:
-                items = resp.json() if resp.content else []
-                if isinstance(items, list) and items:
-                    blob = items[0].get(trakt_type) or {}
-                    title = blob.get("title") or ""
-                    year = blob.get("year")
-                    try:
-                        year = int(year) if year else None
-                    except Exception:
-                        year = None
-                    return {"title": title or "", "year": year, "type": type_}
-        except Exception as e:
-            logger.warning(f"Trakt lookup failed: {e}")
-
-    return {"title": "", "year": None, "type": type_}
+        data = resp.json()
+        title = data.get("title") or data.get("name", "")
+        release_date = data.get("release_date") or data.get("first_air_date", "")
+        year = int(release_date[:4]) if release_date else None
+        return {"title": title, "year": year, "type": type_}
+    except Exception as e:
+        logger.warning(f"TMDB fetch failed: {e}")
+        return {"title": "", "year": None, "type": type_}
 
 # ---------------------------
 # Formatting: guaranteed 2-left + 3-right (title + 2 lines)
 # ---------------------------
 def format_stream_inplace(
     s: Dict[str, Any],
-    meta: Dict[str, Any],
+    m: Dict[str, Any],
     expected: Dict[str, Any],
     cached_hint: str = "",
     type_: str = "",
@@ -1002,15 +867,15 @@ def format_stream_inplace(
     episode: Optional[int] = None,
 ) -> None:
     # Clean, modern formatting: sparse emojis + • separators + optional 2-line description.
-    prov = (meta.get('provider') or 'UNK').upper().strip()
-    res = (meta.get('res') or 'SD').upper().strip()
-    codec = (meta.get('codec') or '').upper().strip()
-    source = (meta.get('source') or '').upper().strip()
-    group = (meta.get('group') or '').strip()
-    lang = (meta.get('language') or 'EN').upper().strip()
-    audio = (meta.get('audio') or '').upper().strip()
-    size_str = _human_size_bytes(meta.get('size', 0))
-    seeders = int(meta.get('seeders') or 0)
+    prov = (m.get('provider') or 'UNK').upper().strip()
+    res = (m.get('res') or 'SD').upper().strip()
+    codec = (m.get('codec') or '').upper().strip()
+    source = (m.get('source') or '').upper().strip()
+    group = (m.get('group') or '').strip()
+    lang = (m.get('language') or 'EN').upper().strip()
+    audio = (m.get('audio') or '').upper().strip()
+    size_str = _human_size_bytes(m.get('size', 0))
+    seeders = int(m.get('seeders') or 0)
 
     # Emoji mapping (kept intentionally sparse)
     if PRETTY_EMOJIS:
@@ -1029,7 +894,7 @@ def format_stream_inplace(
 
     # Name (left): provider + core tech summary
     tech_parts = [res]
-    if 'HDR' in (meta.get('flags') or '') or 'hdr' in f"{s.get('name','')} {s.get('description','')}".lower():
+    if 'HDR' in (m.get('flags') or '') or 'hdr' in f"{s.get('name','')} {s.get('description','')}".lower():
         tech_parts.append('HDR')
     if audio:
         tech_parts.append(audio)
@@ -1038,7 +903,7 @@ def format_stream_inplace(
     s['name'] = _truncate(name_txt if NAME_SINGLE_LINE else name_txt.replace(' • ', '\n', 1), MAX_TITLE_CHARS)
 
     # Title: expected title from TMDB when available, else parsed/raw title
-    base_title = expected.get('title') or meta.get('title_raw') or 'Unknown'
+    base_title = expected.get('title') or m.get('title_raw') or 'Unknown'
     base_title = normalize_display_title(base_title)
     year = expected.get('year')
     ep_tag = f" S{season:02d}E{episode:02d}" if season and episode else ""
@@ -1051,20 +916,20 @@ def format_stream_inplace(
 
     # Ensure machine-visible hints are present for downstream (Stremio UI + other tools)
     bh = s.setdefault('behaviorHints', {})
+    ih = (m.get('infohash') or '').strip().lower()
+    if ih and not s.get('infoHash'):
+        s['infoHash'] = ih
+
     bh['provider'] = prov
     # Cached: booleans are API-truth for torrents; 'LIKELY' is heuristic for hashless/usenet.
-    if meta.get('infohash'):
-        if isinstance(meta.get('cached'), bool):
-            bh['cached'] = meta.get('cached')
+    if m.get('infohash'):
+        if isinstance(m.get('cached'), bool):
+            bh['cached'] = m.get('cached')
     else:
         if cached_hint == 'LIKELY':
             bh['cached'] = 'LIKELY'
-    if meta.get('source') and 'source' not in bh:
-        bh['source'] = meta.get('source')
-
-    # Optional: surface infohash for debugging / external tooling
-    if EXPOSE_INFOHASH and meta.get('infohash') and 'infoHash' not in s:
-        s['infoHash'] = meta.get('infohash')
+    if m.get('source') and 'source' not in bh:
+        bh['source'] = m.get('source')
     line2_bits = [p for p in [size_str, seeds_str, (f"Grp {group}" if group else '')] if p]
     line2 = ' • '.join(line2_bits)
     if cached_hint:
@@ -1190,21 +1055,33 @@ class PipeStats:
     tb_usenet_hashes: int = 0
 
 def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
-    # Stable dedup key.
-    # - If infohash exists: dedup by (infohash + res) so 1080p and 2160p stay separate.
-    # - If no hash: dedup by (normalized label + res + size bucket) to remove true duplicates.
+    """Stable dedup key.
+
+    - Prefer infohash when present.
+    - For hashless streams (common with some Usenet/direct sources), use filename/bingeGroup/name + size bucket.
+    """
     infohash = (meta.get('infohash') or '').lower().strip()
-    res = (meta.get('res') or 'SD').upper().strip()
     size = int(meta.get('size') or 0)
-
-    if infohash:
-        return f"{infohash}:{res}"
-
+    res = (meta.get('res') or 'SD').upper()
+    lang = (meta.get('language') or 'EN').upper()
+    audio = (meta.get('audio') or '').upper()
+    prov = (meta.get('provider') or 'ZZ').upper()
     bh = stream.get('behaviorHints') or {}
-    label = bh.get('filename') or bh.get('bingeGroup') or stream.get('name', '')
-    norm = normalize_label(label)
-    bucket = int(round(size / 1e8) * 1e8) if size > 0 else 0  # 100MB bucket
-    return f"{norm}:{res}:{bucket}"
+    try:
+        normalized_label = normalize_label(
+            bh.get('filename') or bh.get('bingeGroup') or stream.get('name', '')
+        )
+    except Exception:
+        normalized_label = ''
+
+    # Size bucketing helps merge near-duplicate remux/web-dl variants that differ by small amounts.
+    if infohash:
+        size_part = str(size)
+    else:
+        bucket = int(round(size / 1e8) * 1e8)  # 100MB bucket
+        size_part = str(bucket)
+
+    return f"{infohash or 'nohash'}:{size_part}:{res}:{lang}:{audio}:{prov}:{normalized_label}"
 
 
 def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0) -> Tuple[List[Dict[str, Any]], PipeStats]:
@@ -1354,8 +1231,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         cached_val = 0 if cached is True else 1 if cached == 'LIKELY' else 2
         res = _res_to_int(m.get('res') or 'SD')
         seeders = int(m.get('seeders') or 0)
-        size = int(m.get('size') or 0)
-        return (prov_idx, cached_val, -res, -size, -seeders)
+        return (prov_idx, cached_val, -res, -seeders)
 
     out_pairs.sort(key=sort_key)
 
@@ -1404,26 +1280,6 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # Optional: TorBox Usenet cache checks (only when we can extract a usenet identifier).
     usenet_cached_map: Dict[str, bool] = {}
-    cached_map: Dict[str, bool] = {}
-    # TorBox API cached check (for hints and strict mode).
-    # Runs even when VERIFY_CACHED_ONLY is off so the final UI can show ✅/CACHED when available.
-    if (not VALIDATE_OFF) and TB_CACHE_HINTS and TB_API_KEY and candidates and (not VERIFY_TB_CACHE_OFF):
-        hashes: List[str] = []
-        seen_h: set = set()
-        for _s, _m in candidates:
-            if (_m.get('provider') == 'TB'):
-                h = (_m.get('infohash') or '').lower().strip()
-                if h and h not in seen_h:
-                    seen_h.add(h)
-                    hashes.append(h)
-        if len(hashes) >= TB_API_MIN_HASHES:
-            t0 = time.time()
-            cached_map = tb_get_cached(hashes[:TB_MAX_HASHES])
-            stats.ms_tb_api = int((time.time() - t0) * 1000)
-            stats.tb_api_hashes = len(hashes[:TB_MAX_HASHES])
-        else:
-            logger.info(f"TB_API_SKIP rid={_rid()} hashes={len(hashes)} <{TB_API_MIN_HASHES}")
-
     if TB_USENET_CHECK and TB_API_KEY and candidates:
         uhashes: List[str] = []
         seen_u: set[str] = set()
@@ -1442,9 +1298,10 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # - TB: requires TB_CACHE_HINTS + TB_API_KEY (otherwise we can't confirm)
     # - RD/AD: heuristic only (no API checks anymore)
     # Cache checks / premium validation
+    cached_map: Dict[str, bool] = {}
     if VERIFY_CACHED_ONLY and not VALIDATE_OFF:
         # TorBox API cached check (batched). Skip very small hash sets to avoid rate-limit/reset churn.
-        if TB_CACHE_HINTS and not cached_map:
+        if TB_CACHE_HINTS:
             hashes: List[str] = []
             seen_h: set = set()
             for _s, _m in candidates:
@@ -1505,66 +1362,6 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         candidates = kept
         stats.dropped_uncached += dropped_uncached
         stats.dropped_uncached_tb += dropped_uncached_tb
-
-
-    # ATTACH_CACHED_MARKERS_ALWAYS: even if VERIFY_CACHED_ONLY is off, annotate meta with cached hints
-    # so sorting/formatting can surface CACHED/LIKELY.
-    if (not VALIDATE_OFF) and (not VERIFY_CACHED_ONLY) and candidates:
-        for _s, _m in candidates:
-            provider = (_m.get('provider') or '').upper()
-            h = (_m.get('infohash') or '').lower().strip()
-            bh = _s.get('behaviorHints') or {}
-            text_blob = (str(_s.get('name') or '') + ' ' + str(_s.get('description') or '') + ' ' + str(bh.get('filename') or '') + ' ' + str(bh.get('bingeGroup') or '')).lower()
-
-            cached_marker = None
-            if provider == 'TB':
-                if h and cached_map:
-                    cached_marker = bool(cached_map.get(h, False))
-                elif h and h in CACHED_HISTORY:
-                    cached_marker = bool(CACHED_HISTORY.get(h, False))
-                else:
-                    cached_marker = None
-            elif provider in ('RD', 'AD'):
-                cached_marker = bool(_heuristic_cached(_s, _m))
-            elif provider in USENET_PRIORITY:
-                cached_marker = 'LIKELY' if _looks_instant(text_blob) else None
-
-            if cached_marker is not None:
-                _m['cached'] = cached_marker
-            if h and isinstance(cached_marker, bool):
-                CACHED_HISTORY[h] = cached_marker
-
-
-    # Hint-only cached markers: when VERIFY_CACHED_ONLY is off, we still want the UI to show
-    # TB ✅ cached (API truth), RD/AD likely cached (heuristic), and usenet likely-instant.
-    if (not VALIDATE_OFF) and (not VERIFY_CACHED_ONLY) and candidates:
-        for _s, _m in candidates:
-            provider = (_m.get('provider') or '').upper()
-            h = (_m.get('infohash') or '').lower().strip()
-            bh = _s.get('behaviorHints') or {}
-            text_blob = (str(_s.get('name') or '') + ' ' + str(_s.get('description') or '') + ' ' + str(bh.get('filename') or '') + ' ' + str(bh.get('bingeGroup') or '')).lower()
-
-            cached_marker = _m.get('cached')
-            if cached_marker is None:
-                if provider == 'TB':
-                    if h and cached_map:
-                        cached_marker = bool(cached_map.get(h, False))
-                    elif h and h in CACHED_HISTORY:
-                        cached_marker = bool(CACHED_HISTORY.get(h, False))
-                    elif ASSUME_PREMIUM_ON_FAIL:
-                        cached_marker = True
-                    else:
-                        cached_marker = None
-                elif provider in ('RD', 'AD'):
-                    cached_marker = bool(_heuristic_cached(_s, _m))
-                elif provider in USENET_PRIORITY:
-                    cached_marker = 'LIKELY' if _looks_instant(text_blob) else None
-                else:
-                    cached_marker = None
-
-                _m['cached'] = cached_marker
-                if h and isinstance(cached_marker, bool):
-                    CACHED_HISTORY[h] = cached_marker
 
 
     # Clarity log: tells you if TB checks actually ran and how many hashes were checked.
@@ -1653,8 +1450,8 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.9",
-            "name": "AIO Wrapper (Unified 2 Providers) 8.9",
+            "version": "1.0.10",
+            "name": "AIO Wrapper (Unified 2 Providers) 8.9.1",
             "description": "Unified 2 providers into one stream list with hardened normalization + strict Stremio formatting. Adds premium-first sorting, optional title similarity gate, prettier labels with emojis, WebDAV strict TB drop, heuristic caching for RD/AD, dedup enhancement. VALIDATE_OFF bypass supported.",
             "resources": ["stream"],
             "types": ["movie", "series"],
@@ -1675,7 +1472,6 @@ def stream(type_: str, id_: str):
         stats.prov2_in = prov2_in
         stats.ms_fetch_aio = ms_aio
         stats.ms_fetch_p2 = ms_p2
-        stats.merged_in = len(streams)
         out, stats = filter_and_format(type_, id_, streams, aio_in=aio_in, prov2_in=prov2_in)
         return jsonify({"streams": out}), 200
     except Exception as e:
