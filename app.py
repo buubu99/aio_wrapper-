@@ -156,7 +156,7 @@ USE_SIZE_MISMATCH = _parse_bool(os.environ.get("USE_SIZE_MISMATCH", "true"), Tru
 RATE_LIMIT = (os.environ.get("RATE_LIMIT", "") or "").strip()
 
 # ---------------------------
-# Missing helper functions (required by the pipeline)
+# Helpers (used by the pipeline)
 # ---------------------------
 _blacklist_cache = {"ts": 0.0, "terms": set()}
 _fakes_cache = {"ts": 0.0, "hashes": set()}
@@ -185,6 +185,25 @@ def normalize_display_title(title: str) -> str:
         t = t.encode('ascii', 'ignore').decode('ascii')
         t = re.sub(r'\s+', ' ', t).strip()
     return t
+
+def normalize_label(label: str) -> str:
+    """Normalize a noisy filename/bingeGroup/name into a stable, comparable label.
+
+    Used only for dedup keys when infohash is missing.
+    """
+    if not label:
+        return ""
+    s = unicodedata.normalize('NFKC', str(label)).lower().strip()
+    s = re.sub(r'\s+', ' ', s)
+    # Remove bracketed tags that often create fake differences
+    s = re.sub(r'[\[\(\{].*?[\]\)\}]', ' ', s)
+    # Drop common file extensions
+    s = re.sub(r'\.(mkv|mp4|avi|webm|ts|m2ts)$', '', s, flags=re.IGNORECASE)
+    # Keep only simple chars for stability
+    s = re.sub(r'[^a-z0-9]+', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
 
 
 def _human_size_bytes(n: int) -> str:
@@ -1043,11 +1062,13 @@ def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
     lang = (meta.get('language') or 'EN').upper()
     audio = (meta.get('audio') or '').upper()
     prov = (meta.get('provider') or 'ZZ').upper()
-
     bh = stream.get('behaviorHints') or {}
-    normalized_label = normalize_label(
-        bh.get('filename') or bh.get('bingeGroup') or stream.get('name', '')
-    )
+    try:
+        normalized_label = normalize_label(
+            bh.get('filename') or bh.get('bingeGroup') or stream.get('name', '')
+        )
+    except Exception:
+        normalized_label = ''
 
     # Size bucketing helps merge near-duplicate remux/web-dl variants that differ by small amounts.
     if infohash:
@@ -1425,8 +1446,8 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.9",
-            "name": "AIO Wrapper (Unified 2 Providers) 8.9",
+            "version": "1.0.10",
+            "name": "AIO Wrapper (Unified 2 Providers) 8.9.1",
             "description": "Unified 2 providers into one stream list with hardened normalization + strict Stremio formatting. Adds premium-first sorting, optional title similarity gate, prettier labels with emojis, WebDAV strict TB drop, heuristic caching for RD/AD, dedup enhancement. VALIDATE_OFF bypass supported.",
             "resources": ["stream"],
             "types": ["movie", "series"],
