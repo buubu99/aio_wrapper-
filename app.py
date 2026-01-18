@@ -85,6 +85,8 @@ TB_USENET_CHECK = _parse_bool(os.environ.get("TB_USENET_CHECK", "false"), False)
 REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "30"))
 # TMDB for metadata
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
+TRAKT_CLIENT_ID = os.environ.get("TRAKT_CLIENT_ID", "")
+TRAKT_API_BASE = os.environ.get("TRAKT_API_BASE", "https://api.trakt.tv")
 # Additional filters
 MIN_SEEDERS = int(os.environ.get("MIN_SEEDERS", "1"))
 PREFERRED_LANG = os.environ.get("PREFERRED_LANG", "EN").upper()
@@ -96,7 +98,7 @@ ASSUME_PREMIUM_ON_FAIL = _parse_bool(os.environ.get("ASSUME_PREMIUM_ON_FAIL", "f
 POLL_ATTEMPTS = int(os.environ.get('POLL_ATTEMPTS', '2'))
 
 # TorBox WebDAV (optional fast existence checks; gated by USE_TB_WEBDAV)
-USE_TB_WEBDAV = _parse_bool(os.environ.get('USE_TB_WEBDAV', 'true'), True)
+USE_TB_WEBDAV = _parse_bool(os.environ.get('USE_TB_WEBDAV', 'false'), False)
 TB_WEBDAV_URL = os.environ.get('TB_WEBDAV_URL', 'https://webdav.torbox.app')
 TB_WEBDAV_USER = os.environ.get('TB_WEBDAV_USER', '')
 TB_WEBDAV_PASS = os.environ.get('TB_WEBDAV_PASS', '')
@@ -105,7 +107,7 @@ TB_WEBDAV_WORKERS = int(os.environ.get('TB_WEBDAV_WORKERS', '10'))
 TB_WEBDAV_TEMPLATES = [t.strip() for t in os.environ.get('TB_WEBDAV_TEMPLATES', 'downloads/{hash}/').split(',') if t.strip()]
 
 # Optional: drop TorBox streams that WebDAV cannot confirm (fast-ish, but still extra requests)
-TB_WEBDAV_STRICT = _parse_bool(os.environ.get('TB_WEBDAV_STRICT', 'true'), True)
+TB_WEBDAV_STRICT = _parse_bool(os.environ.get('TB_WEBDAV_STRICT', 'false'), False)
 
 # Optional: cached/instant validation for RD/AD (heuristics by default; strict workflow is opt-in)
 VERIFY_CACHED_ONLY = _parse_bool(os.environ.get("VERIFY_CACHED_ONLY", "false"), False)
@@ -156,7 +158,7 @@ USE_SIZE_MISMATCH = _parse_bool(os.environ.get("USE_SIZE_MISMATCH", "true"), Tru
 RATE_LIMIT = (os.environ.get("RATE_LIMIT", "") or "").strip()
 
 # ---------------------------
-# Helpers (used by the pipeline)
+# Missing helper functions (required by the pipeline)
 # ---------------------------
 _blacklist_cache = {"ts": 0.0, "terms": set()}
 _fakes_cache = {"ts": 0.0, "hashes": set()}
@@ -186,11 +188,9 @@ def normalize_display_title(title: str) -> str:
         t = re.sub(r'\s+', ' ', t).strip()
     return t
 
-def normalize_label(label: str) -> str:
-    """Normalize a noisy filename/bingeGroup/name into a stable, comparable label.
 
-    Used only for dedup keys when infohash is missing.
-    """
+def normalize_label(label: str) -> str:
+    # Normalize noisy labels (filename/bingeGroup/name) into a stable comparable key.
     if not label:
         return ""
     s = unicodedata.normalize('NFKC', str(label)).lower().strip()
@@ -203,7 +203,6 @@ def normalize_label(label: str) -> str:
     s = re.sub(r'[^a-z0-9]+', ' ', s)
     s = re.sub(r'\s+', ' ', s).strip()
     return s
-
 
 
 def _human_size_bytes(n: int) -> str:
@@ -807,8 +806,17 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     group = gm.group(1).upper() if gm else ""
     # Raw title for fallback
     title_raw = normalize_display_title(filename or desc or name)
-    # Premium level
-    premium_level = 1 if is_premium_plan(provider, TB_API_KEY if provider == "TB" else api_key_for_provider(provider)) else 0  # Adjust api_key_for_provider as needed
+    # Premium level (fail-open): many upstream streams don't expose provider tokens.
+    # Only mark as non-premium when we're sure.
+    prov_u = (provider or "").upper().strip()
+    prem_set = {p.strip().upper() for p in PREMIUM_PRIORITY if p.strip()}
+    usenet_set = {p.strip().upper() for p in USENET_PRIORITY if p.strip()}
+    if prov_u in prem_set or prov_u in usenet_set:
+        premium_level = 1
+    elif prov_u in ("UNK", "AIOSTREAMS", "AIOSTREAMS"):
+        premium_level = 1
+    else:
+        premium_level = 0
     return {
         "provider": provider,
         "res": res,
@@ -834,25 +842,91 @@ def api_key_for_provider(provider: str) -> str:
     return ""
 
 # ---------------------------
-# Expected metadata (real TMDB fetch)
+# Expected metadata (TMDB preferred; Trakt fallback)
 # ---------------------------
 @lru_cache(maxsize=2000)
 def get_expected_metadata(type_: str, id_: str) -> Dict[str, Any]:
-    if not TMDB_API_KEY:
-        return {"title": "", "year": None, "type": type_}
+    # Stremio ids may include season/episode suffix: tt1234567:1:2 or tmdb:123:1:2
     id_clean = id_.split(":")[0] if ":" in id_ else id_
-    base = f"https://api.themoviedb.org/3/{'movie' if type_ == 'movie' else 'tv'}/{id_clean}"
-    try:
-        resp = session.get(f"{base}?api_key={TMDB_API_KEY}&language=en-US", timeout=5)
+
+    imdb_id = None
+    tmdb_id = None
+    if isinstance(id_clean, str):
+        if id_clean.startswith("tt"):
+            imdb_id = id_clean
+        elif id_clean.startswith("tmdb:"):
+            tmdb_id = id_clean.split(":", 1)[1]
+        elif id_clean.startswith("tmdb") and id_clean[4:].isdigit():
+            tmdb_id = id_clean[4:]
+        elif id_clean.isdigit():
+            tmdb_id = id_clean
+
+    def _tmdb_details(_tmdb_id: str) -> Dict[str, Any]:
+        if not TMDB_API_KEY or not _tmdb_id:
+            return {"title": "", "year": None, "type": type_}
+        endpoint = 'movie' if type_ == 'movie' else 'tv'
+        url = f"https://api.themoviedb.org/3/{endpoint}/{_tmdb_id}"
+        resp = session.get(url, params={"api_key": TMDB_API_KEY, "language": "en-US"}, timeout=6)
         resp.raise_for_status()
-        data = resp.json()
-        title = data.get("title") or data.get("name", "")
-        release_date = data.get("release_date") or data.get("first_air_date", "")
-        year = int(release_date[:4]) if release_date else None
-        return {"title": title, "year": year, "type": type_}
-    except Exception as e:
-        logger.warning(f"TMDB fetch failed: {e}")
-        return {"title": "", "year": None, "type": type_}
+        data = resp.json() if resp.content else {}
+        title = data.get("title") or data.get("name") or ""
+        release_date = data.get("release_date") or data.get("first_air_date") or ""
+        year = int(str(release_date)[:4]) if release_date else None
+        return {"title": title or "", "year": year, "type": type_}
+
+    # 1) TMDB direct ID
+    if tmdb_id and TMDB_API_KEY:
+        try:
+            return _tmdb_details(tmdb_id)
+        except Exception as e:
+            logger.warning(f"TMDB direct fetch failed: {e}")
+
+    # 2) TMDB /find for IMDb ids
+    if imdb_id and TMDB_API_KEY:
+        try:
+            url = f"https://api.themoviedb.org/3/find/{imdb_id}"
+            resp = session.get(
+                url,
+                params={"api_key": TMDB_API_KEY, "external_source": "imdb_id", "language": "en-US"},
+                timeout=6,
+            )
+            resp.raise_for_status()
+            data = resp.json() if resp.content else {}
+            key = "movie_results" if type_ == "movie" else "tv_results"
+            results = data.get(key) if isinstance(data, dict) else None
+            if isinstance(results, list) and results:
+                found_id = results[0].get("id")
+                if found_id:
+                    return _tmdb_details(str(found_id))
+        except Exception as e:
+            logger.warning(f"TMDB find failed: {e}")
+
+    # 3) Trakt fallback (requires TRAKT_CLIENT_ID)
+    if imdb_id and TRAKT_CLIENT_ID:
+        try:
+            trakt_type = "movie" if type_ == "movie" else "show"
+            url = f"{TRAKT_API_BASE.rstrip('/')}/search/imdb/{imdb_id}"
+            headers = {
+                "Content-Type": "application/json",
+                "trakt-api-version": "2",
+                "trakt-api-key": TRAKT_CLIENT_ID,
+            }
+            resp = session.get(url, headers=headers, params={"type": trakt_type, "extended": "full"}, timeout=6)
+            if resp.status_code == 200:
+                items = resp.json() if resp.content else []
+                if isinstance(items, list) and items:
+                    blob = items[0].get(trakt_type) or {}
+                    title = blob.get("title") or ""
+                    year = blob.get("year")
+                    try:
+                        year = int(year) if year else None
+                    except Exception:
+                        year = None
+                    return {"title": title or "", "year": year, "type": type_}
+        except Exception as e:
+            logger.warning(f"Trakt lookup failed: {e}")
+
+    return {"title": "", "year": None, "type": type_}
 
 # ---------------------------
 # Formatting: guaranteed 2-left + 3-right (title + 2 lines)
@@ -918,14 +992,14 @@ def format_stream_inplace(
     bh = s.setdefault('behaviorHints', {})
     bh['provider'] = prov
     # Cached: booleans are API-truth for torrents; 'LIKELY' is heuristic for hashless/usenet.
-    if m.get('infohash'):
-        if isinstance(m.get('cached'), bool):
-            bh['cached'] = m.get('cached')
+    if meta.get('infohash'):
+        if isinstance(meta.get('cached'), bool):
+            bh['cached'] = meta.get('cached')
     else:
         if cached_hint == 'LIKELY':
             bh['cached'] = 'LIKELY'
-    if m.get('source') and 'source' not in bh:
-        bh['source'] = m.get('source')
+    if meta.get('source') and 'source' not in bh:
+        bh['source'] = meta.get('source')
     line2_bits = [p for p in [size_str, seeds_str, (f"Grp {group}" if group else '')] if p]
     line2 = ' • '.join(line2_bits)
     if cached_hint:
@@ -1051,33 +1125,21 @@ class PipeStats:
     tb_usenet_hashes: int = 0
 
 def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
-    """Stable dedup key.
-
-    - Prefer infohash when present.
-    - For hashless streams (common with some Usenet/direct sources), use filename/bingeGroup/name + size bucket.
-    """
+    # Stable dedup key.
+    # - If infohash exists: dedup by (infohash + res) so 1080p and 2160p stay separate.
+    # - If no hash: dedup by (normalized label + res + size bucket) to remove true duplicates.
     infohash = (meta.get('infohash') or '').lower().strip()
+    res = (meta.get('res') or 'SD').upper().strip()
     size = int(meta.get('size') or 0)
-    res = (meta.get('res') or 'SD').upper()
-    lang = (meta.get('language') or 'EN').upper()
-    audio = (meta.get('audio') or '').upper()
-    prov = (meta.get('provider') or 'ZZ').upper()
-    bh = stream.get('behaviorHints') or {}
-    try:
-        normalized_label = normalize_label(
-            bh.get('filename') or bh.get('bingeGroup') or stream.get('name', '')
-        )
-    except Exception:
-        normalized_label = ''
 
-    # Size bucketing helps merge near-duplicate remux/web-dl variants that differ by small amounts.
     if infohash:
-        size_part = str(size)
-    else:
-        bucket = int(round(size / 1e8) * 1e8)  # 100MB bucket
-        size_part = str(bucket)
+        return f"{infohash}:{res}"
 
-    return f"{infohash or 'nohash'}:{size_part}:{res}:{lang}:{audio}:{prov}:{normalized_label}"
+    bh = stream.get('behaviorHints') or {}
+    label = bh.get('filename') or bh.get('bingeGroup') or stream.get('name', '')
+    norm = normalize_label(label)
+    bucket = int(round(size / 1e8) * 1e8) if size > 0 else 0  # 100MB bucket
+    return f"{norm}:{res}:{bucket}"
 
 
 def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0) -> Tuple[List[Dict[str, Any]], PipeStats]:
@@ -1227,7 +1289,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         cached_val = 0 if cached is True else 1 if cached == 'LIKELY' else 2
         res = _res_to_int(m.get('res') or 'SD')
         seeders = int(m.get('seeders') or 0)
-        return (prov_idx, cached_val, -res, -seeders)
+        size = int(m.get('size') or 0)
+        return (prov_idx, cached_val, -res, -size, -seeders)
 
     out_pairs.sort(key=sort_key)
 
@@ -1276,6 +1339,26 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # Optional: TorBox Usenet cache checks (only when we can extract a usenet identifier).
     usenet_cached_map: Dict[str, bool] = {}
+    cached_map: Dict[str, bool] = {}
+    # TorBox API cached check (for hints and strict mode).
+    # Runs even when VERIFY_CACHED_ONLY is off so the final UI can show ✅/CACHED when available.
+    if (not VALIDATE_OFF) and TB_CACHE_HINTS and TB_API_KEY and candidates and (not VERIFY_TB_CACHE_OFF):
+        hashes: List[str] = []
+        seen_h: set = set()
+        for _s, _m in candidates:
+            if (_m.get('provider') == 'TB'):
+                h = (_m.get('infohash') or '').lower().strip()
+                if h and h not in seen_h:
+                    seen_h.add(h)
+                    hashes.append(h)
+        if len(hashes) >= TB_API_MIN_HASHES:
+            t0 = time.time()
+            cached_map = tb_get_cached(hashes[:TB_MAX_HASHES])
+            stats.ms_tb_api = int((time.time() - t0) * 1000)
+            stats.tb_api_hashes = len(hashes[:TB_MAX_HASHES])
+        else:
+            logger.info(f"TB_API_SKIP rid={_rid()} hashes={len(hashes)} <{TB_API_MIN_HASHES}")
+
     if TB_USENET_CHECK and TB_API_KEY and candidates:
         uhashes: List[str] = []
         seen_u: set[str] = set()
@@ -1294,10 +1377,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # - TB: requires TB_CACHE_HINTS + TB_API_KEY (otherwise we can't confirm)
     # - RD/AD: heuristic only (no API checks anymore)
     # Cache checks / premium validation
-    cached_map: Dict[str, bool] = {}
     if VERIFY_CACHED_ONLY and not VALIDATE_OFF:
         # TorBox API cached check (batched). Skip very small hash sets to avoid rate-limit/reset churn.
-        if TB_CACHE_HINTS:
+        if TB_CACHE_HINTS and not cached_map:
             hashes: List[str] = []
             seen_h: set = set()
             for _s, _m in candidates:
@@ -1358,6 +1440,66 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         candidates = kept
         stats.dropped_uncached += dropped_uncached
         stats.dropped_uncached_tb += dropped_uncached_tb
+
+
+    # ATTACH_CACHED_MARKERS_ALWAYS: even if VERIFY_CACHED_ONLY is off, annotate meta with cached hints
+    # so sorting/formatting can surface CACHED/LIKELY.
+    if (not VALIDATE_OFF) and (not VERIFY_CACHED_ONLY) and candidates:
+        for _s, _m in candidates:
+            provider = (_m.get('provider') or '').upper()
+            h = (_m.get('infohash') or '').lower().strip()
+            bh = _s.get('behaviorHints') or {}
+            text_blob = (str(_s.get('name') or '') + ' ' + str(_s.get('description') or '') + ' ' + str(bh.get('filename') or '') + ' ' + str(bh.get('bingeGroup') or '')).lower()
+
+            cached_marker = None
+            if provider == 'TB':
+                if h and cached_map:
+                    cached_marker = bool(cached_map.get(h, False))
+                elif h and h in CACHED_HISTORY:
+                    cached_marker = bool(CACHED_HISTORY.get(h, False))
+                else:
+                    cached_marker = None
+            elif provider in ('RD', 'AD'):
+                cached_marker = bool(_heuristic_cached(_s, _m))
+            elif provider in USENET_PRIORITY:
+                cached_marker = 'LIKELY' if _looks_instant(text_blob) else None
+
+            if cached_marker is not None:
+                _m['cached'] = cached_marker
+            if h and isinstance(cached_marker, bool):
+                CACHED_HISTORY[h] = cached_marker
+
+
+    # Hint-only cached markers: when VERIFY_CACHED_ONLY is off, we still want the UI to show
+    # TB ✅ cached (API truth), RD/AD likely cached (heuristic), and usenet likely-instant.
+    if (not VALIDATE_OFF) and (not VERIFY_CACHED_ONLY) and candidates:
+        for _s, _m in candidates:
+            provider = (_m.get('provider') or '').upper()
+            h = (_m.get('infohash') or '').lower().strip()
+            bh = _s.get('behaviorHints') or {}
+            text_blob = (str(_s.get('name') or '') + ' ' + str(_s.get('description') or '') + ' ' + str(bh.get('filename') or '') + ' ' + str(bh.get('bingeGroup') or '')).lower()
+
+            cached_marker = _m.get('cached')
+            if cached_marker is None:
+                if provider == 'TB':
+                    if h and cached_map:
+                        cached_marker = bool(cached_map.get(h, False))
+                    elif h and h in CACHED_HISTORY:
+                        cached_marker = bool(CACHED_HISTORY.get(h, False))
+                    elif ASSUME_PREMIUM_ON_FAIL:
+                        cached_marker = True
+                    else:
+                        cached_marker = None
+                elif provider in ('RD', 'AD'):
+                    cached_marker = bool(_heuristic_cached(_s, _m))
+                elif provider in USENET_PRIORITY:
+                    cached_marker = 'LIKELY' if _looks_instant(text_blob) else None
+                else:
+                    cached_marker = None
+
+                _m['cached'] = cached_marker
+                if h and isinstance(cached_marker, bool):
+                    CACHED_HISTORY[h] = cached_marker
 
 
     # Clarity log: tells you if TB checks actually ran and how many hashes were checked.
@@ -1446,8 +1588,8 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.10",
-            "name": "AIO Wrapper (Unified 2 Providers) 8.9.1",
+            "version": "1.0.9",
+            "name": "AIO Wrapper (Unified 2 Providers) 8.9",
             "description": "Unified 2 providers into one stream list with hardened normalization + strict Stremio formatting. Adds premium-first sorting, optional title similarity gate, prettier labels with emojis, WebDAV strict TB drop, heuristic caching for RD/AD, dedup enhancement. VALIDATE_OFF bypass supported.",
             "resources": ["stream"],
             "types": ["movie", "series"],
@@ -1468,6 +1610,7 @@ def stream(type_: str, id_: str):
         stats.prov2_in = prov2_in
         stats.ms_fetch_aio = ms_aio
         stats.ms_fetch_p2 = ms_p2
+        stats.merged_in = len(streams)
         out, stats = filter_and_format(type_, id_, streams, aio_in=aio_in, prov2_in=prov2_in)
         return jsonify({"streams": out}), 200
     except Exception as e:
