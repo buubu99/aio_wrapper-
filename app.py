@@ -43,15 +43,17 @@ def _normalize_base(raw: str) -> str:
 # Config (keep env names compatible with your existing Render setup)
 # ---------------------------
 AIO_URL = os.environ.get("AIO_URL", "")
-# Safer fallback: preserves path if the user uses token-in-path URLs
-AIO_BASE = (os.environ.get("AIO_BASE", "") or AIO_URL).rstrip("/")
+# Robust: accepts either a base addon URL or a full manifest URL.
+# Preserves token-in-path URLs while stripping any trailing /manifest.json.
+AIO_BASE = _normalize_base(os.environ.get("AIO_BASE", "") or AIO_URL)
 # can be base url or .../manifest.json
 AIOSTREAMS_AUTH = os.environ.get("AIOSTREAMS_AUTH", "") # "user:pass"
 
 # Optional second provider (another AIOStreams-compatible addon)
 PROV2_URL = os.environ.get("PROV2_URL", "")
-# Safer fallback: preserves path if the user uses token-in-path URLs
-PROV2_BASE = (os.environ.get("PROV2_BASE", "") or PROV2_URL).rstrip("/")
+# Robust: accepts either a base addon URL or a full manifest URL.
+# Preserves token-in-path URLs while stripping any trailing /manifest.json.
+PROV2_BASE = _normalize_base(os.environ.get("PROV2_BASE", "") or PROV2_URL)
 PROV2_AUTH = os.environ.get("PROV2_AUTH", "")  # 'user:pass' for Basic auth if needed
 PROV2_TAG = os.environ.get("PROV2_TAG", "P2")
 INPUT_CAP = int(os.environ.get("INPUT_CAP", "4500"))
@@ -67,6 +69,7 @@ NAME_SINGLE_LINE = _parse_bool(os.environ.get("NAME_SINGLE_LINE", "true"), True)
 # Optional: title similarity drop (Trakt-like naming; works without Trakt)
 TRAKT_VALIDATE_TITLES = _parse_bool(os.environ.get("TRAKT_VALIDATE_TITLES", "true"), True)
 TRAKT_TITLE_MIN_RATIO = float(os.environ.get("TRAKT_TITLE_MIN_RATIO", "0.65"))
+TRAKT_STRICT_YEAR = _parse_bool(os.environ.get("TRAKT_STRICT_YEAR", "false"), False)
 
 # Validation/testing toggles
 VALIDATE_OFF = _parse_bool(os.environ.get("VALIDATE_OFF", "false"), False)  # pass-through for format testing
@@ -77,6 +80,7 @@ TB_BASE = "https://api.torbox.app"
 TB_BATCH_SIZE = int(os.environ.get("TB_BATCH_SIZE", "50"))
 TB_MAX_HASHES = int(os.environ.get("TB_MAX_HASHES", "200"))  # limit hashes checked per request for speed
 TB_CACHE_HINTS = _parse_bool(os.environ.get("TB_CACHE_HINTS", "true"), True)  # enable TorBox cache hint lookups
+TB_USENET_CHECK = _parse_bool(os.environ.get("TB_USENET_CHECK", "false"), False)  # optional usenet cache checks (requires identifiers)
 REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "30"))
 # TMDB for metadata
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
@@ -195,6 +199,19 @@ def _human_size_bytes(n: int) -> str:
         f /= 1024.0
         i += 1
     return f"{f:.1f}{units[i]}".replace('.0', '')
+
+
+def _extract_year(text: str) -> Optional[int]:
+    """Extract a plausible year from text (e.g. 1999, 2024)."""
+    if not text:
+        return None
+    m = re.search(r"\b(19|20)\d{2}\b", str(text))
+    if not m:
+        return None
+    try:
+        return int(m.group(0))
+    except Exception:
+        return None
 
 
 def is_premium_plan(provider: str, api_key: str = '') -> bool:
@@ -345,10 +362,63 @@ def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
     return out
 
 
+def tb_get_usenet_cached(hashes: List[str]) -> Dict[str, bool]:
+    """Optional TorBox Usenet cached availability check.
+
+    TorBox exposes a separate usenet endpoint. Many Stremio streams do not carry a usable usenet identifier,
+    so this is only used when we can collect identifiers (stored in meta['usenet_hash']).
+    """
+    if not TB_API_KEY or not hashes:
+        return {}
+    out: Dict[str, bool] = {}
+    headers = {
+        'Authorization': f'Bearer {TB_API_KEY}',
+        'X-API-Key': TB_API_KEY,
+        'Accept': 'application/json',
+    }
+    url = f'{TB_BASE}/v1/api/usenet/checkcached'
+    for i in range(0, len(hashes), max(1, TB_BATCH_SIZE)):
+        batch = hashes[i:i+TB_BATCH_SIZE]
+        try:
+            # Swagger/Postman show `hash` as the repeated query parameter; `format=list` returns the cached hashes.
+            params = [('format', 'list')]
+            params.extend([('hash', h) for h in batch])
+            r = session.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+            if r.status_code != 200:
+                continue
+            data = r.json() if r.content else {}
+            d = data.get('data') if isinstance(data, dict) else None
+            if isinstance(d, dict):
+                cached = set(d.keys())
+            elif isinstance(d, list):
+                cached = set([x for x in d if isinstance(x, str)])
+            else:
+                cached = set()
+            for h in batch:
+                out[h] = h in cached
+        except Exception:
+            continue
+    return out
+
+
+class _WebDavUnauthorized(RuntimeError):
+    """Raised when TorBox WebDAV returns 401 (bad/missing credentials)."""
+
+
 def _tb_webdav_exists(url: str) -> bool:
     try:
-        r = session.request('PROPFIND', url, headers={'Depth': '0'}, auth=(TB_WEBDAV_USER, TB_WEBDAV_PASS) if TB_WEBDAV_USER or TB_WEBDAV_PASS else None, timeout=TB_WEBDAV_TIMEOUT)
+        r = session.request(
+            'PROPFIND',
+            url,
+            headers={'Depth': '0'},
+            auth=(TB_WEBDAV_USER, TB_WEBDAV_PASS),
+            timeout=TB_WEBDAV_TIMEOUT,
+        )
+        if r.status_code == 401:
+            raise _WebDavUnauthorized('TorBox WebDAV unauthorized (401)')
         return r.status_code in (200, 207)
+    except _WebDavUnauthorized:
+        raise
     except Exception:
         return False
 
@@ -357,6 +427,10 @@ def tb_webdav_batch_check(hashes: List[str]) -> set:
     if not hashes or not TB_WEBDAV_URL:
         return set()
     base = TB_WEBDAV_URL.rstrip('/')
+
+    # One-time credential probe: prevents spamming 401s on every hash when creds are missing/wrong.
+    _ = _tb_webdav_exists(base + '/')
+
     ok = set()
     urls = []
     for h in hashes:
@@ -365,7 +439,8 @@ def tb_webdav_batch_check(hashes: List[str]) -> set:
             urls.append((h, f'{base}/{path}'))
     def worker(item):
         h, u = item
-        if _tb_webdav_exists(u):
+        ok = _tb_webdav_exists(u)
+        if ok:
             return h
         return None
     with ThreadPoolExecutor(max_workers=max(1, TB_WEBDAV_WORKERS)) as ex:
@@ -695,6 +770,15 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     url = s.get("url", "") or s.get("externalUrl", "")
     hm = _HASH_RE.search(url)
     infohash = (hm.group(1) or hm.group(2)).lower() if hm else ""
+
+    # Optional Usenet identifier (only used if TB_USENET_CHECK=true).
+    bh = s.get("behaviorHints", {}) or {}
+    usenet_hash = ""
+    for k in ("usenet_hash", "usenetHash", "nzb_hash", "nzbHash", "nzb_id", "guid"):
+        v = bh.get(k)
+        if isinstance(v, str) and v.strip():
+            usenet_hash = v.strip().lower()
+            break
     # Group
     gm = _GROUP_RE.search(filename)
     group = gm.group(1).upper() if gm else ""
@@ -712,6 +796,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
         "size": size,
         "seeders": seeders,
         "infohash": infohash,
+        "usenet_hash": usenet_hash,
         "group": group,
         "title_raw": title_raw,
         "premium_level": premium_level,
@@ -758,74 +843,62 @@ def format_stream_inplace(
     season: Optional[int] = None,
     episode: Optional[int] = None,
 ) -> None:
-    # Left column: provider + resolution (optionally prettified)
-    prov = (meta.get('provider', "UNK") or "UNK").upper()
-    res = (meta.get("res", "SD") or "SD").upper()
-    res_int = _res_to_int(res)
+    # Clean, modern formatting: sparse emojis + • separators + optional 2-line description.
+    prov = (meta.get('provider') or 'UNK').upper().strip()
+    res = (meta.get('res') or 'SD').upper().strip()
+    codec = (meta.get('codec') or '').upper().strip()
+    source = (meta.get('source') or '').upper().strip()
+    group = (meta.get('group') or '').strip()
+    lang = (meta.get('language') or 'EN').upper().strip()
+    audio = (meta.get('audio') or '').upper().strip()
+    size_str = _human_size_bytes(meta.get('size', 0))
+    seeders = int(meta.get('seeders') or 0)
 
+    # Emoji mapping (kept intentionally sparse)
     if PRETTY_EMOJIS:
-        emoji_parts: list[str] = []
-        if prov in (p.upper() for p in PREMIUM_PRIORITY):
-            emoji_parts.append('💎')
-        if prov in (p.upper() for p in USENET_PRIORITY):
-            emoji_parts.append('📡')
-        # cached hint is already computed by caller; meta may also carry cached=True
-        if (meta.get('cached') is True) or (cached_hint and cached_hint.upper() == 'CACHED'):
-            emoji_parts.append('⭐')
-        if res_int >= 2160:
-            emoji_parts.append('📺4K')
-        elif res_int >= 1080:
-            emoji_parts.append('📺HD')
-        emoji = (' '.join(emoji_parts) + ' ') if emoji_parts else ''
-        if NAME_SINGLE_LINE:
-            s['name'] = _truncate(f"{emoji}{prov} {res}", MAX_TITLE_CHARS)
-        else:
-            s['name'] = _truncate(f"{emoji}{prov}\n{res}", MAX_TITLE_CHARS)
+        prov_emoji = {
+            'TB': '♻️',
+            'RD': '🔴',
+            'AD': '🔵',
+            'ND': '📰',
+            'EW': '⚡',
+            'NG': '🔍',
+        }.get(prov, '📺')
+        cache_emoji = '✅' if (cached_hint and cached_hint.upper() == 'CACHED') else ('⭐' if (cached_hint and cached_hint.upper() == 'LIKELY') else '')
     else:
-        if NAME_SINGLE_LINE:
-            s['name'] = _truncate(f"{prov} {res}", MAX_TITLE_CHARS)
-        else:
-            s['name'] = _truncate(f"{prov}\n{res}", MAX_TITLE_CHARS)
-    # Right header: title (English from TMDB if available, else cleaned raw)
-    base_title = expected.get("title", meta.get("title_raw", "Unknown Title"))
-    if FORCE_ASCII_TITLE:
-        base_title = normalize_display_title(base_title)
-    base_title = _truncate(base_title, MAX_TITLE_CHARS)
-    year = expected.get("year")
-    ep_tag = f" S{season:02d}E{episode:02d}" if season and episode else ""
-    title_str = f"{base_title}{ep_tag}" + (f" ({year})" if year else "")
-    s["title"] = _truncate(title_str, MAX_TITLE_CHARS)
-    # Right body: exactly 2 lines (always present)
-    tech_parts = []
-    if res:
-        tech_parts.append(res)
-    if meta.get("source"):
-        tech_parts.append(meta["source"])
-    if meta.get("codec"):
-        tech_parts.append(meta["codec"])
-    line1 = " / ".join(tech_parts) if tech_parts else "SD"
-    size_str = _human_size_bytes(meta.get("size", 0))
-    seeders = meta.get("seeders", 0)
-    group = meta.get("group", "")
-    lang = meta.get("language", "EN")
-    audio = meta.get("audio", "")
-    seeds_str = f"Seeds: {seeders}" if seeders > 0 else "Seeds: Unknown"
-    bits = [f"Size {size_str}", seeds_str]
-    if cached_hint:
-        bits.insert(0, cached_hint)
-    if group:
-        bits.append(f"Grp {group}")
-    if lang:
-        bits.append(f"Lang {lang}")
+        prov_emoji = ''
+        cache_emoji = ''
+
+    # Name (left): provider + core tech summary
+    tech_parts = [res]
+    if 'HDR' in (meta.get('flags') or '') or 'hdr' in f"{s.get('name','')} {s.get('description','')}".lower():
+        tech_parts.append('HDR')
     if audio:
-        bits.append(f"Aud {audio}")
-    line2 = " ".join(bits)
+        tech_parts.append(audio)
+    # Keep name short and readable in Stremio list
+    name_txt = f"{prov_emoji} {prov} • {' '.join([p for p in tech_parts if p])} {cache_emoji}".strip()
+    s['name'] = _truncate(name_txt if NAME_SINGLE_LINE else name_txt.replace(' • ', '\n', 1), MAX_TITLE_CHARS)
+
+    # Title: expected title from TMDB when available, else parsed/raw title
+    base_title = expected.get('title') or meta.get('title_raw') or 'Unknown'
+    base_title = normalize_display_title(base_title)
+    year = expected.get('year')
+    ep_tag = f" S{season:02d}E{episode:02d}" if season and episode else ""
+    s['title'] = _truncate(f"{base_title}{ep_tag}" + (f" ({year})" if year else ""), MAX_TITLE_CHARS)
+
+    # Description: 2 clean lines (or single line if NAME_SINGLE_LINE)
+    line1_bits = [p for p in [audio, lang, codec, source] if p]
+    line1 = ' • '.join(line1_bits) if line1_bits else res
+    seeds_str = f"{seeders} Seeds" if seeders > 0 else "Seeds Unknown"
+    line2_bits = [p for p in [size_str, seeds_str, (f"Grp {group}" if group else '')] if p]
+    line2 = ' • '.join(line2_bits)
+    if cached_hint:
+        line1 = f"{cached_hint} • {line1}".strip(' •')
+
     desc = _truncate(line1, MAX_DESC_CHARS) + "\n" + _truncate(line2, MAX_DESC_CHARS)
-    # Clean a common placeholder from upstream descriptions
-    desc = desc.replace('Seeds ?', 'Seeds: Unknown')
     if NAME_SINGLE_LINE:
-        desc = desc.replace('\n', ' • ')
-    s["description"] = desc
+        desc = desc.replace("\n", " • ")
+    s['description'] = desc
 
 # ---------------------------
 # Fetch streams
@@ -934,10 +1007,12 @@ class PipeStats:
     ms_tmdb: int = 0
     ms_tb_api: int = 0
     ms_tb_webdav: int = 0
+    ms_tb_usenet: int = 0
 
     # Hash counts (diagnostics)
     tb_api_hashes: int = 0
     tb_webdav_hashes: int = 0
+    tb_usenet_hashes: int = 0
 
 def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
     """Stable dedup key.
@@ -1075,22 +1150,31 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     else:
         out_pairs = cleaned[:]
 
-    # Optional: title similarity gate (local similarity; useful to drop obvious mismatches)
-    if (not VALIDATE_OFF) and TRAKT_VALIDATE_TITLES:
-        expected_title = (expected.get('title') or '').lower()
-        if expected_title:
-            filtered_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-            for s, m in out_pairs:
-                stream_title = (s.get('title') or '').lower()
-                if not stream_title:
-                    filtered_pairs.append((s, m))
-                    continue
-                similarity = difflib.SequenceMatcher(None, stream_title, expected_title).ratio()
+    # Optional: title/year validation gate (local similarity; useful to drop obvious mismatches)
+    # Uses parsed title from classify() when available (streams often have empty s['title']).
+    if (not VALIDATE_OFF) and (TRAKT_VALIDATE_TITLES or TRAKT_STRICT_YEAR):
+        expected_title = (expected.get('title') or '').lower().strip()
+        expected_year = expected.get('year')
+        filtered_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        for s, m in out_pairs:
+            # Prefer our parsed raw title; fall back to upstream 'title' then name/desc.
+            cand_title = (m.get('title_raw') or s.get('title') or s.get('name') or '').lower().strip()
+
+            if TRAKT_VALIDATE_TITLES and expected_title and cand_title:
+                similarity = difflib.SequenceMatcher(None, cand_title, expected_title).ratio()
                 if similarity < TRAKT_TITLE_MIN_RATIO:
                     stats.dropped_title_mismatch += 1
                     continue
-                filtered_pairs.append((s, m))
-            out_pairs = filtered_pairs
+
+            if TRAKT_STRICT_YEAR and expected_year:
+                stream_year = _extract_year(s.get('name') or '') or _extract_year(s.get('description') or '')
+                if stream_year and abs(int(stream_year) - int(expected_year)) > 1:
+                    stats.dropped_title_mismatch += 1
+                    continue
+
+            filtered_pairs.append((s, m))
+
+        out_pairs = filtered_pairs
 
     # Sorting: enforce premium streams first, then resolution/seeders.
     # This makes the first MAX_DELIVER feel like a true "premium" view.
@@ -1130,19 +1214,24 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             try:
                 stats.tb_webdav_hashes = len(tb_hashes)
                 t_wd0 = time.time()
-                webdav_ok = tb_webdav_batch_check(tb_hashes)
+                webdav_ok = tb_webdav_batch_check(tb_hashes)  # set of ok hashes
                 stats.ms_tb_webdav = int((time.time() - t_wd0) * 1000)
+            except _WebDavUnauthorized:
+                # Credentials missing/wrong in environment. Do NOT drop TB results.
+                webdav_ok = None
             except Exception:
-                webdav_ok = {}
-            before = len(candidates)
-            def _keep_tb(p):
-                _s, _m = p
-                if (_m.get('provider') or '').upper() != 'TB':
-                    return True
-                h = (_m.get('infohash') or '').lower()
-                return bool(h) and bool(webdav_ok.get(h, False))
-            candidates = [p for p in candidates if _keep_tb(p)]
-            stats.dropped_uncached_tb += before - len(candidates)
+                webdav_ok = None
+
+            if webdav_ok is not None:
+                before = len(candidates)
+                def _keep_tb(p):
+                    _s, _m = p
+                    if (_m.get('provider') or '').upper() != 'TB':
+                        return True
+                    h = (_m.get('infohash') or '').lower()
+                    return bool(h) and (h in webdav_ok)
+                candidates = [p for p in candidates if _keep_tb(p)]
+                stats.dropped_uncached_tb += before - len(candidates)
 
     # TorBox cache hints / enforcement
     cached_map: Dict[str, bool] = {}
@@ -1193,6 +1282,33 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             candidates = [p for p in candidates if _is_tb_cached(p)]
             stats.dropped_uncached_tb += before - len(candidates)
 
+    # Clarity log: tells you if TB checks actually ran and how many hashes were checked.
+    logger.info(
+        "TB_CHECKS rid=%s webdav_active=%s webdav_strict=%s api_active=%s api_hashes=%s webdav_hashes=%s",
+        _rid(),
+        bool(USE_TB_WEBDAV and TB_WEBDAV_USER),
+        bool(TB_WEBDAV_STRICT),
+        bool(TB_API_KEY and TB_CACHE_HINTS),
+        int(stats.tb_api_hashes or 0),
+        int(stats.tb_webdav_hashes or 0),
+    )
+
+    # Optional: TorBox Usenet cache checks (only when we can extract a usenet identifier).
+    usenet_cached_map: Dict[str, bool] = {}
+    if TB_USENET_CHECK and TB_API_KEY and candidates:
+        uhashes: List[str] = []
+        seen_u: set[str] = set()
+        for _s, _m in candidates:
+            uh = (_m.get('usenet_hash') or '').strip().lower()
+            if uh and uh not in seen_u:
+                seen_u.add(uh)
+                uhashes.append(uh)
+        stats.tb_usenet_hashes = len(uhashes)
+        if uhashes:
+            t_u0 = time.time()
+            usenet_cached_map = tb_get_usenet_cached(uhashes)
+            stats.ms_tb_usenet = int((time.time() - t_u0) * 1000)
+
     # Optional: cached/instant-only enforcement across providers.
     # - TB: requires TB_CACHE_HINTS + TB_API_KEY (otherwise we can't confirm)
     # - RD/AD: heuristic only (no API checks anymore)
@@ -1205,8 +1321,23 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             provider = _m.get('provider', 'UNK')
             h = (_m.get('infohash') or '').lower()
 
-            # Usenet / unknown providers are treated as playable without cache confirmation.
-            if provider in USENET_PRIORITY or provider not in ('RD', 'AD', 'TB'):
+            # Usenet providers: if we have a TorBox usenet identifier and checks are enabled, honor it.
+            if provider in USENET_PRIORITY:
+                uh = (_m.get('usenet_hash') or '').strip().lower()
+                if uh and usenet_cached_map:
+                    ok = bool(usenet_cached_map.get(uh, False))
+                    _m['cached'] = ok
+                    return ok
+                _m['cached'] = True
+                return True
+
+            # Unknown providers: treated as playable without cache confirmation.
+            if provider not in ('RD', 'AD', 'TB'):
+                _m['cached'] = True
+                return True
+
+            # Unknown providers: treat as playable without cache confirmation.
+            if provider not in ('RD', 'AD', 'TB'):
                 _m['cached'] = True
                 return True
 
@@ -1294,8 +1425,8 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.7",
-            "name": "AIO Wrapper (Unified 2 Providers) 8.7",
+            "version": "1.0.8",
+            "name": "AIO Wrapper (Unified 2 Providers) 8.8",
             "description": "Unified 2 providers into one stream list with hardened normalization + strict Stremio formatting. Adds premium-first sorting, optional title similarity gate, prettier labels with emojis, WebDAV strict TB drop, heuristic caching for RD/AD, dedup enhancement. VALIDATE_OFF bypass supported.",
             "resources": ["stream"],
             "types": ["movie", "series"],
