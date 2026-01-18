@@ -63,6 +63,8 @@ REFORMAT_STREAMS = _parse_bool(os.environ.get("REFORMAT_STREAMS", "true"), True)
 FORCE_ASCII_TITLE = _parse_bool(os.environ.get("FORCE_ASCII_TITLE", "true"), True)
 MAX_TITLE_CHARS = int(os.environ.get("MAX_TITLE_CHARS", "110"))
 MAX_DESC_CHARS = int(os.environ.get("MAX_DESC_CHARS", "180"))
+# Debug/interop: expose infoHash on delivered streams (off by default)
+EXPOSE_INFOHASH = _parse_bool(os.environ.get("EXPOSE_INFOHASH", "false"), False)
 # Optional: prettier names (emojis + single-line)
 PRETTY_EMOJIS = _parse_bool(os.environ.get("PRETTY_EMOJIS", "true"), True)
 NAME_SINGLE_LINE = _parse_bool(os.environ.get("NAME_SINGLE_LINE", "true"), True)
@@ -725,73 +727,131 @@ _AUDIO_TOKS = ["DDP", "DD+", "DD", "EAC3", "TRUEHD", "DTS-HD", "DTS", "AAC", "AC
 _LANG_TOKS = ["ENG", "ENGLISH", "SPANISH", "FRENCH", "GERMAN", "ITALIAN", "KOREAN", "JAPANESE", "CHINESE", "MULTI", "VOSTFR", "SUBBED"]
 _GROUP_RE = re.compile(r"[-.]([a-z0-9]+)$", re.I)
 _HASH_RE = re.compile(r"btih:([0-9a-fA-F]{40})|([0-9a-fA-F]{40})", re.I)
+_IH_DESC_RE = re.compile(r"\bIH:([0-9a-fA-F]{40})\b", re.I)
+_IH_PROV_RE = re.compile(r"\bIH:[0-9a-fA-F]{40}\s*([A-Za-z]{2,4})\b")
+
+def _extract_infohash_from_stream(s: Dict[str, Any]) -> str:
+    """Best-effort infohash extraction.
+
+    Upstream AIOStreams providers sometimes hide the magnet/BTIH in the URL and
+    instead embed it in the description as `IH:<40hex>`. Our wrapper also
+    proxies URLs, so we need a robust extractor.
+    """
+    try:
+        # 1) Direct fields (some addons use these)
+        for k in ("infoHash", "infohash", "info_hash"):
+            v = s.get(k)
+            if isinstance(v, str) and re.fullmatch(r"[0-9a-fA-F]{40}", v.strip()):
+                return v.strip().lower()
+
+        # 2) behaviorHints may carry it
+        bh = s.get("behaviorHints") or {}
+        for k in ("infoHash", "infohash", "info_hash"):
+            v = bh.get(k)
+            if isinstance(v, str) and re.fullmatch(r"[0-9a-fA-F]{40}", v.strip()):
+                return v.strip().lower()
+
+        # 3) Description token: IH:<40hex>
+        desc = s.get("description") or ""
+        m = _IH_DESC_RE.search(str(desc))
+        if m:
+            return (m.group(1) or "").lower()
+
+        # 4) URL / externalUrl: btih:<40hex> or bare 40-hex
+        url = s.get("url") or s.get("externalUrl") or ""
+        hm = _HASH_RE.search(str(url))
+        if hm:
+            return (hm.group(1) or hm.group(2) or "").lower()
+    except Exception:
+        pass
+    return ""
 
 def classify(s: Dict[str, Any]) -> Dict[str, Any]:
-    name = s.get("name", "").lower()
-    desc = s.get("description", "").lower()
-    filename = s.get("behaviorHints", {}).get("filename", "").lower()
+    # Keep raw text for token extraction, but also prepare a cleaned version
+    # (removes IH:<hash> markers so title parsing isn't polluted).
+    name_raw = str(s.get("name", "") or "")
+    desc_raw = str(s.get("description", "") or "")
+    bh0 = s.get("behaviorHints", {}) or {}
+    filename_raw = str(bh0.get("filename", "") or "")
+
+    name = name_raw.lower()
+    desc = desc_raw.lower()
+    filename = filename_raw.lower()
+    desc_clean = _IH_DESC_RE.sub("", desc)
     text = f"{name} {desc} {filename}"
+    text_clean = f"{name} {desc_clean} {filename}"
     # Provider
     provider = "UNK"
-    if "real-debrid" in text or "rd" in text:
-        provider = "RD"
-    elif "torbox" in text or "tb" in text:
-        provider = "TB"
-    elif "alldebrid" in text or "ad" in text:
-        provider = "AD"
-    elif "aio" in text:
-        provider = "AIOStreams" # Short badge for unknowns
-    # Usenet providers
-    elif "nzbdav" in text or "nzb" in text:
-        provider = "ND"
-    elif "eweka" in text:
-        provider = "EW"
-    elif "nzgeek" in text:
-        provider = "NG"
+    # Prefer an explicit provider hint embedded alongside IH:<hash> if present.
+    try:
+        hm_prov = _IH_PROV_RE.search(desc_raw)
+        if hm_prov:
+            p = (hm_prov.group(1) or "").upper().strip()
+            if p in {"TB", "RD", "AD", "ND", "EW", "NG"}:
+                provider = p
+    except Exception:
+        pass
+
+    if provider == "UNK":
+        # Fall back to heuristic token scanning (providers)
+        if "real-debrid" in text or re.search(r"\brd\b", text):
+            provider = "RD"
+        elif "torbox" in text or re.search(r"\btb\b", text):
+            provider = "TB"
+        elif "alldebrid" in text or re.search(r"\bad\b", text):
+            provider = "AD"
+        # Usenet providers (treat as premium-ish)
+        elif "nzbdav" in text or re.search(r"\bnzb\b", text):
+            provider = "ND"
+        elif "eweka" in text:
+            provider = "EW"
+        elif "nzgeek" in text:
+            provider = "NG"
+        elif "aio" in text:
+            provider = "AIOStreams"  # Short badge for unknowns
     # Resolution
-    m = _RES_RE.search(text)
+    m = _RES_RE.search(text_clean)
     res = (m.group(1).upper() if m else "SD")
     if res == "4K":
         res = "2160P"
     # Source
     source = ""
     for tok in _SOURCE_TOKS:
-        if tok.lower() in text:
+        if tok.lower() in text_clean:
             source = tok.upper()
             break
     # Codec
     codec = ""
     for tok in _CODEC_TOKS:
-        if tok.lower() in text:
+        if tok.lower() in text_clean:
             codec = tok.upper()
             break
     # Audio
     audio = ""
     for tok in _AUDIO_TOKS:
-        if tok.lower() in text:
+        if tok.lower() in text_clean:
             audio = tok.upper()
             break
     # Language
     language = "EN"
     for tok in _LANG_TOKS:
-        if tok.lower() in text:
+        if tok.lower() in text_clean:
             language = tok.upper()
             break
     language = LANG_MAP.get(language, language)  # Normalize
     # Size
     size = int(s.get("behaviorHints", {}).get("videoSize", 0))
     if not size:
-        m = _SIZE_RE.search(text)
+        m = _SIZE_RE.search(text_clean)
         if m:
             val = float(m.group(1))
             unit = m.group(2).upper()
             size = int(val * (1024 ** 3 if unit == "GB" else 1024 ** 2))
     # Seeders
-    seeders = int(re.search(r"(\d+) seeds?", text).group(1)) if re.search(r"(\d+) seeds?", text) else 0
-    # Infohash
-    url = s.get("url", "") or s.get("externalUrl", "")
-    hm = _HASH_RE.search(url)
-    infohash = (hm.group(1) or hm.group(2)).lower() if hm else ""
+    seeders = int(re.search(r"(\d+) seeds?", text_clean).group(1)) if re.search(r"(\d+) seeds?", text_clean) else 0
+
+    # Infohash (robust: direct field, behaviorHints, IH:<hash> token, or btih in URL)
+    infohash = _extract_infohash_from_stream(s)
 
     # Optional Usenet identifier (only used if TB_USENET_CHECK=true).
     bh = s.get("behaviorHints", {}) or {}
@@ -805,7 +865,8 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     gm = _GROUP_RE.search(filename)
     group = gm.group(1).upper() if gm else ""
     # Raw title for fallback
-    title_raw = normalize_display_title(filename or desc or name)
+    # Raw title for fallback (avoid IH:<hash> token pollution)
+    title_raw = normalize_display_title(filename_raw or desc_clean or name_raw)
     # Premium level (fail-open): many upstream streams don't expose provider tokens.
     # Only mark as non-premium when we're sure.
     prov_u = (provider or "").upper().strip()
@@ -1000,6 +1061,10 @@ def format_stream_inplace(
             bh['cached'] = 'LIKELY'
     if meta.get('source') and 'source' not in bh:
         bh['source'] = meta.get('source')
+
+    # Optional: surface infohash for debugging / external tooling
+    if EXPOSE_INFOHASH and meta.get('infohash') and 'infoHash' not in s:
+        s['infoHash'] = meta.get('infohash')
     line2_bits = [p for p in [size_str, seeds_str, (f"Grp {group}" if group else '')] if p]
     line2 = ' • '.join(line2_bits)
     if cached_hint:
