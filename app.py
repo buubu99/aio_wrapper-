@@ -75,6 +75,16 @@ PREMIUM_PRIORITY = os.environ.get("PREMIUM_PRIORITY", "RD,TB,AD").split(",")
 USENET_PRIORITY = os.environ.get("USENET_PRIORITY", "ND,EW,NG").split(",")
 VERIFY_PREMIUM = _parse_bool(os.environ.get("VERIFY_PREMIUM", "false"), False)
 ASSUME_PREMIUM_ON_FAIL = _parse_bool(os.environ.get("ASSUME_PREMIUM_ON_FAIL", "false"), False)
+POLL_ATTEMPTS = int(os.environ.get('POLL_ATTEMPTS', '2'))
+
+# TorBox WebDAV (optional fast existence checks; gated by USE_TB_WEBDAV)
+USE_TB_WEBDAV = _parse_bool(os.environ.get('USE_TB_WEBDAV', 'false'), False)
+TB_WEBDAV_URL = os.environ.get('TB_WEBDAV_URL', 'https://webdav.torbox.app')
+TB_WEBDAV_USERNAME = os.environ.get('TB_WEBDAV_USERNAME')
+TB_WEBDAV_PASSWORD = os.environ.get('TB_WEBDAV_PASSWORD')
+TB_WEBDAV_TIMEOUT = float(os.environ.get('TB_WEBDAV_TIMEOUT', '1.0'))
+TB_WEBDAV_WORKERS = int(os.environ.get('TB_WEBDAV_WORKERS', '10'))
+TB_WEBDAV_TEMPLATES = [t.strip() for t in os.environ.get('TB_WEBDAV_TEMPLATES', 'downloads/{hash}/').split(',') if t.strip()]
 
 # Optional: cached/instant validation for RD/AD (heuristics by default; strict workflow is opt-in)
 VERIFY_CACHED_ONLY = _parse_bool(os.environ.get("VERIFY_CACHED_ONLY", "false"), False)
@@ -94,6 +104,7 @@ STRICT_CACHE_MAX = int(os.environ.get("STRICT_CACHE_MAX", "18"))
 # --- Add-ons / extensions (optional) ---
 DEPRIORITIZE_RD = _parse_bool(os.environ.get("DEPRIORITIZE_RD", "false"), False)
 DROP_RD = _parse_bool(os.environ.get("DROP_RD", "false"), False)
+DROP_AD = _parse_bool(os.environ.get("DROP_AD", "false"), False)
 
 MIN_RES = int(os.environ.get("MIN_RES", "0"))  # e.g. 720, 1080, 2160
 MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", "0"))  # 0 = off
@@ -189,6 +200,10 @@ def _rid() -> str:
 # HTTP session (retries)
 # ---------------------------
 session = requests.Session()
+
+# In-process cache history for expensive cache checks (per infohash)
+CACHED_HISTORY: dict[str, bool] = {}
+
 retry = Retry(total=3, backoff_factor=0.6, status_forcelist=[500, 502, 503, 504], allowed_methods=["GET", "POST"])
 adapter = HTTPAdapter(max_retries=retry)
 session.mount("http://", adapter)
@@ -292,8 +307,10 @@ def _heuristic_cached(s: Dict[str, Any], meta: Dict[str, Any]) -> bool:
 def _rd_strict_is_cached(infohash: str) -> Optional[bool]:
     """Strict RD cache test (mutates account state).
 
-    Uses addMagnet -> selectFiles(all) -> info -> delete.
+    Workaround: addMagnet -> selectFiles(all) -> poll info a few times -> delete.
     Returns True/False if it can determine, or None if it cannot.
+
+    Note: keep RD_STRICT_CACHE_CHECK disabled by default; this is only used when enabled.
     """
     if not RD_API_KEY or not infohash or not re.fullmatch(r"[0-9a-fA-F]{40}", infohash):
         return None
@@ -312,7 +329,7 @@ def _rd_strict_is_cached(infohash: str) -> Optional[bool]:
         if not torrent_id:
             return None
 
-        # select all files
+        # select all files (best-effort)
         try:
             session.post(
                 f"https://api.real-debrid.com/rest/1.0/torrents/selectFiles/{torrent_id}",
@@ -323,20 +340,26 @@ def _rd_strict_is_cached(infohash: str) -> Optional[bool]:
         except Exception:
             pass
 
-        info = session.get(
-            f"https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}",
-            params={"auth_token": RD_API_KEY},
-            timeout=VALIDATE_CACHE_TIMEOUT,
-        )
-        info.raise_for_status()
-        info_data = info.json() or {}
-        links = info_data.get("links") or []
-        if isinstance(links, list) and len(links) > 0:
-            return True
-        # If no links, treat as not cached/instant.
+        attempts = max(1, int(POLL_ATTEMPTS))
+        for i in range(attempts):
+            if i:
+                time.sleep(5)
+            info = session.get(
+                f"https://api.real-debrid.com/rest/1.0/torrents/info/{torrent_id}",
+                params={"auth_token": RD_API_KEY},
+                timeout=VALIDATE_CACHE_TIMEOUT,
+            )
+            info.raise_for_status()
+            info_data = info.json() or {}
+            status = (info_data.get('status') or '').lower()
+            links = info_data.get('links') or []
+            if status == 'downloaded' or (isinstance(links, list) and len(links) > 0):
+                return True
+
+        # No progress / no links after polling window
         return False
     except Exception as e:
-        logger.debug("RD strict cache check failed: %s", e)
+        logger.debug("RD poll check failed: %s", e)
         return None
     finally:
         if torrent_id:
@@ -349,6 +372,49 @@ def _rd_strict_is_cached(infohash: str) -> Optional[bool]:
             except Exception:
                 pass
 
+
+def _ad_poll_is_cached(infohash: str) -> Optional[bool]:
+    """Optional AD cache check via polling magnet status."""
+    if not AD_API_KEY or not infohash or not re.fullmatch(r"[0-9a-fA-F]{40}", infohash):
+        return None
+    magnet = f"magnet:?xt=urn:btih:{infohash.upper()}"
+    magnet_id: Optional[str] = None
+    try:
+        add = session.post(
+            "https://api.alldebrid.com/v4/magnet/upload",
+            params={"apikey": AD_API_KEY},
+            data={"magnets[]": magnet},
+            timeout=min(5, VALIDATE_CACHE_TIMEOUT),
+        )
+        add.raise_for_status()
+        add_data = add.json() or {}
+        mags = (((add_data.get('data') or {}).get('magnets')) or [])
+        if mags and isinstance(mags, list):
+            magnet_id = (mags[0] or {}).get('id')
+        if not magnet_id:
+            return None
+        for _ in range(max(1, POLL_ATTEMPTS)):
+            time.sleep(5)
+            st = session.get(
+                "https://api.alldebrid.com/v4/magnet/status",
+                params={"apikey": AD_API_KEY, "id": magnet_id},
+                timeout=min(5, VALIDATE_CACHE_TIMEOUT),
+            )
+            st.raise_for_status()
+            st_data = st.json() or {}
+            magnets = ((st_data.get('data') or {}).get('magnets')) or {}
+            if isinstance(magnets, dict):
+                status = (magnets.get('status') or '').lower()
+                links = magnets.get('links') or []
+            else:
+                status = ''
+                links = []
+            if status in ('ready', 'downloaded') or (links and len(links) > 0):
+                return True
+        return False
+    except Exception as e:
+        logger.debug('AD poll check failed: %s', e)
+        return None
 
 def _verify_stream_url(s: Dict[str, Any]) -> bool:
     if not VERIFY_STREAM:
@@ -371,6 +437,7 @@ def _verify_stream_url(s: Dict[str, Any]) -> bool:
         return False
     except Exception:
         return False
+
 
 
 # ---------------------------
@@ -529,17 +596,37 @@ def sanitize_stream_inplace(s: Dict[str, Any]) -> bool:
 # ---------------------------
 # Premium check (with retries and backoff)
 # ---------------------------
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=32)
 def is_premium_plan(provider: str, api_key: str) -> bool:
     if not VERIFY_PREMIUM or not api_key:
         return True
     if provider == "TB":
+        # TorBox user info endpoint (see https://api.torbox.app/openapi.json)
         for attempt in range(3):
             try:
-                r = session.get(f"{TB_BASE}/v1/api/account/info", headers={"Authorization": f"Bearer {api_key}"}, timeout=5)
+                r = session.get(
+                    f"{TB_BASE}/v1/api/user/me",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=5,
+                )
+                # Some deployments may accept apikey as a query param; fallback if bearer fails.
+                if r.status_code in (401, 403):
+                    r = session.get(
+                        f"{TB_BASE}/v1/api/user/me",
+                        params={"apikey": api_key},
+                        timeout=5,
+                    )
                 r.raise_for_status()
-                data = r.json()
-                return data.get("plan", "").lower() in ["pro", "standard"]
+                data = r.json() if r.headers.get('content-type','').lower().startswith('application/json') else {}
+                # If token is valid, treat as premium. If plan fields exist, use them.
+                plan = ''
+                if isinstance(data, dict):
+                    if isinstance(data.get('data'), dict):
+                        plan = str(data['data'].get('plan','') or data['data'].get('subscription','') or '')
+                    plan = str(data.get('plan') or plan or '')
+                if plan:
+                    return plan.lower() in ["pro", "premium", "standard", "plus", "starter"]
+                return True
             except requests.exceptions.RequestException as e:
                 logger.warning(f"TB premium check failed (attempt {attempt+1}/3): {e}")
                 if attempt < 2:
@@ -588,6 +675,60 @@ def is_premium_plan(provider: str, api_key: str) -> bool:
 # ---------------------------
 # TorBox cache check (optional)
 # ---------------------------
+def tb_webdav_batch_check(hashes: List[str]) -> Dict[str, bool]:
+    """Optional fast WebDAV existence checks.
+
+    IMPORTANT: TorBox WebDAV directory structure may vary depending on account settings.
+    Use TB_WEBDAV_TEMPLATES to specify path templates, e.g.:
+      TB_WEBDAV_TEMPLATES=downloads/{hash}/,torrents/{hash}/
+
+    Returns only positive hits; missing/unknown hashes are omitted so caller can fall back to API.
+    """
+    if not (USE_TB_WEBDAV and TB_WEBDAV_USER and TB_WEBDAV_PASS):
+        return {}
+
+    def _exists(url: str) -> bool:
+        try:
+            r = session.head(url, auth=(TB_WEBDAV_USER, TB_WEBDAV_PASS), timeout=TB_WEBDAV_TIMEOUT)
+            if r.status_code == 200:
+                return True
+            if r.status_code in (405, 501):
+                # Some WebDAV servers don't implement HEAD for collections
+                r2 = session.request(
+                    'PROPFIND',
+                    url,
+                    auth=(TB_WEBDAV_USER, TB_WEBDAV_PASS),
+                    headers={'Depth': '0'},
+                    timeout=TB_WEBDAV_TIMEOUT,
+                )
+                return r2.status_code == 207
+            return False
+        except Exception:
+            return False
+
+    def check_one(h: str) -> bool:
+        hh = (h or '').lower()
+        if not hh:
+            return False
+        for tmpl in TB_WEBDAV_TEMPLATES:
+            path = tmpl.replace('{hash}', hh)
+            full = f"{TB_WEBDAV_URL.rstrip('/')}/{path.lstrip('/')}"
+            if _exists(full):
+                return True
+        return False
+
+    out_map: Dict[str, bool] = {}
+    with ThreadPoolExecutor(max_workers=max(1, TB_WEBDAV_WORKERS)) as ex:
+        futs = {ex.submit(check_one, h): h for h in hashes}
+        for fut, h in futs.items():
+            try:
+                ok = fut.result()
+            except Exception:
+                ok = False
+            if ok:
+                out_map[(h or '').lower()] = True
+    return out_map
+
 def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
     """Return mapping of info-hash -> cached boolean.
 
@@ -615,9 +756,23 @@ def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
             break
     hashes = uniq
 
-    cached: Dict[str, bool] = {}
-    for i in range(0, len(hashes), TB_BATCH_SIZE):
-        batch = hashes[i:i + TB_BATCH_SIZE]
+    # WebDAV fast path (optional)
+    webdav_cached = {}
+    if USE_TB_WEBDAV and TB_WEBDAV_USER and TB_WEBDAV_PASS:
+        try:
+            webdav_cached = tb_webdav_batch_check(hashes)
+        except Exception:
+            webdav_cached = {}
+
+    # Only ask the API about hashes WebDAV did not confirm
+    remaining = [h for h in hashes if not webdav_cached.get(h.lower(), False)]
+    cached: Dict[str, bool] = dict(webdav_cached)
+
+    if not remaining:
+        return cached
+
+    for i in range(0, len(remaining), TB_BATCH_SIZE):
+        batch = remaining[i:i + TB_BATCH_SIZE]
         try:
             r = session.post(
                 f"{TB_BASE}/v1/api/torrents/checkcached",
@@ -782,7 +937,18 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     }
 # Helper for provider keys (customize as per env)
 def api_key_for_provider(provider: str) -> str:
-    return os.environ.get(f"{provider}_API_KEY", TB_API_KEY)  # Fallback to TB or add specifics
+    """Return the configured API key for a provider (no cross-provider fallback).
+
+    This avoids accidentally calling RD/AD endpoints with a TorBox token (and vice-versa).
+    """
+    provider = (provider or "").upper()
+    if provider == "RD":
+        return os.environ.get("RD_API_KEY", "")
+    if provider == "AD":
+        return os.environ.get("AD_API_KEY", "")
+    if provider == "TB":
+        return os.environ.get("TB_API_KEY", "")
+    return os.environ.get(f"{provider}_API_KEY", "")
 # ---------------------------
 # Expected metadata (real TMDB fetch)
 # ---------------------------
@@ -934,6 +1100,7 @@ class PipeStats:
     dropped_lang: int = 0
     dropped_low_premium: int = 0
     dropped_rd: int = 0
+    dropped_ad: int = 0
     dropped_low_res: int = 0
     dropped_old_age: int = 0
     dropped_blacklist: int = 0
@@ -982,6 +1149,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         # Optional hard drops first
         if DROP_RD and m.get("provider") == "RD":
             stats.dropped_rd += 1
+            continue
+        if DROP_AD and m.get("provider") == "AD":
+            stats.dropped_ad += 1
             continue
 
         if not VALIDATE_OFF:
@@ -1136,6 +1306,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 if h and cached_map:
                     ok = bool(cached_map.get(h, False))
                     _m['cached'] = ok
+                    if h:
+                        CACHED_HISTORY[h] = ok
                     return ok
                 # If we can't check TB cache status, be conservative unless the user opted to assume.
                 if ASSUME_PREMIUM_ON_FAIL:
@@ -1154,6 +1326,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 # Fallback heuristic
                 ok = _heuristic_cached(_s, _m)
                 _m['cached'] = ok
+                if h:
+                    CACHED_HISTORY[h] = ok
                 return ok
 
             if provider == 'AD':
@@ -1163,6 +1337,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     pass
                 ok = _heuristic_cached(_s, _m)
                 _m['cached'] = ok
+                if h:
+                    CACHED_HISTORY[h] = ok
                 return ok
 
             return True
@@ -1256,13 +1432,13 @@ def stream(type_: str, id_: str):
         return jsonify({"streams": []}), 200
     finally:
         logger.info(
-            "WRAP_STATS rid=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s deduped=%s delivered=%s ms=%s",
+            "WRAP_STATS rid=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s deduped=%s delivered=%s ms=%s",
             _rid(), type_, id_,
             stats.aio_in, stats.prov2_in, stats.merged_in,
             stats.dropped_error, stats.dropped_missing_url, stats.dropped_pollution,
             stats.dropped_low_seeders, stats.dropped_lang,
             stats.dropped_low_premium,
-            stats.dropped_rd, stats.dropped_low_res, stats.dropped_old_age,
+            stats.dropped_rd, stats.dropped_ad, stats.dropped_low_res, stats.dropped_old_age,
             stats.dropped_blacklist, stats.dropped_fakes_db, stats.dropped_dead_url, stats.dropped_uncached, stats.dropped_uncached_tb,
             stats.deduped, stats.delivered,
             int((time.time() - t0) * 1000),
