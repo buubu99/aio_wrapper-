@@ -79,6 +79,7 @@ TB_API_KEY = os.environ.get("TB_API_KEY", "")
 TB_BASE = "https://api.torbox.app"
 TB_BATCH_SIZE = int(os.environ.get("TB_BATCH_SIZE", "50"))
 TB_MAX_HASHES = int(os.environ.get("TB_MAX_HASHES", "200"))  # limit hashes checked per request for speed
+TB_API_MIN_HASHES = int(os.environ.get("TB_API_MIN_HASHES", "20"))  # skip TorBox API calls if fewer hashes
 TB_CACHE_HINTS = _parse_bool(os.environ.get("TB_CACHE_HINTS", "true"), True)  # enable TorBox cache hint lookups
 TB_USENET_CHECK = _parse_bool(os.environ.get("TB_USENET_CHECK", "false"), False)  # optional usenet cache checks (requires identifiers)
 REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "30"))
@@ -108,6 +109,7 @@ TB_WEBDAV_STRICT = _parse_bool(os.environ.get('TB_WEBDAV_STRICT', 'true'), True)
 
 # Optional: cached/instant validation for RD/AD (heuristics by default; strict workflow is opt-in)
 VERIFY_CACHED_ONLY = _parse_bool(os.environ.get("VERIFY_CACHED_ONLY", "false"), False)
+STRICT_PREMIUM_ONLY = _parse_bool(os.environ.get('STRICT_PREMIUM_ONLY', 'false'), False)  # loose default; strict drops uncached
 MIN_CACHE_CONFIDENCE = float(os.environ.get("MIN_CACHE_CONFIDENCE", "0.8"))
 VALIDATE_CACHE_TIMEOUT = float(os.environ.get("VALIDATE_CACHE_TIMEOUT", "10"))
 
@@ -343,7 +345,7 @@ def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
             # Common response style: {success: bool, data: {hash: {...}}}
             d = data.get('data') if isinstance(data, dict) else None
             if isinstance(d, dict):
-                cached = set(d.keys())
+                cached = {str(k).lower().strip() for k in d.keys() if k}
             elif isinstance(d, list):
                 cached = set()
                 for x in d:
@@ -352,11 +354,13 @@ def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
                     elif isinstance(x, dict):
                         hx = x.get('hash') or x.get('info_hash')
                         if isinstance(hx, str):
-                            cached.add(hx)
+                            cached.add(hx.lower().strip())
             else:
                 cached = set()
+            cached_norm = {str(x).lower().strip() for x in cached if x}
             for h in batch:
-                out[h] = h in cached
+                hh = (h or '').lower().strip()
+                out[hh] = hh in cached_norm
         except Exception:
             continue
     return out
@@ -389,7 +393,7 @@ def tb_get_usenet_cached(hashes: List[str]) -> Dict[str, bool]:
             data = r.json() if r.content else {}
             d = data.get('data') if isinstance(data, dict) else None
             if isinstance(d, dict):
-                cached = set(d.keys())
+                cached = {str(k).lower().strip() for k in d.keys() if k}
             elif isinstance(d, list):
                 cached = set([x for x in d if isinstance(x, str)])
             else:
@@ -890,6 +894,19 @@ def format_stream_inplace(
     line1_bits = [p for p in [audio, lang, codec, source] if p]
     line1 = ' • '.join(line1_bits) if line1_bits else res
     seeds_str = f"{seeders} Seeds" if seeders > 0 else "Seeds Unknown"
+
+    # Ensure machine-visible hints are present for downstream (Stremio UI + other tools)
+    bh = s.setdefault('behaviorHints', {})
+    bh['provider'] = prov
+    # Cached: booleans are API-truth for torrents; 'LIKELY' is heuristic for hashless/usenet.
+    if m.get('infohash'):
+        if isinstance(m.get('cached'), bool):
+            bh['cached'] = m.get('cached')
+    else:
+        if cached_hint == 'LIKELY':
+            bh['cached'] = 'LIKELY'
+    if m.get('source') and 'source' not in bh:
+        bh['source'] = m.get('source')
     line2_bits = [p for p in [size_str, seeds_str, (f"Grp {group}" if group else '')] if p]
     line2 = ' • '.join(line2_bits)
     if cached_hint:
@@ -1017,28 +1034,30 @@ class PipeStats:
 def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
     """Stable dedup key.
 
-    Do NOT use URL — providers often return multiple links for the same release.
-    Prefer infohash, then fall back to normalized filename/name + size + provider.
+    - Prefer infohash when present.
+    - For hashless streams (common with some Usenet/direct sources), use filename/bingeGroup/name + size bucket.
     """
     infohash = (meta.get('infohash') or '').lower().strip()
     size = int(meta.get('size') or 0)
-    prov = (meta.get('provider') or '').upper().strip()
-    res = (meta.get('res') or '').upper().strip()
-    lang = (meta.get('language') or '').upper().strip()
-    audio = (meta.get('audio') or '').upper().strip()
+    res = (meta.get('res') or 'SD').upper()
+    lang = (meta.get('language') or 'EN').upper()
+    audio = (meta.get('audio') or '').upper()
+    prov = (meta.get('provider') or 'ZZ').upper()
 
-    # Try to build a stable release label
     bh = stream.get('behaviorHints') or {}
-    filename = bh.get('filename') or ''
-    name = stream.get('name') or ''
-    label = (filename or name)
-    label = re.sub(r'\s+', ' ', str(label)).strip().lower()
+    normalized_label = normalize_label(
+        bh.get('filename') or bh.get('bingeGroup') or stream.get('name', '')
+    )
 
+    # Size bucketing helps merge near-duplicate remux/web-dl variants that differ by small amounts.
     if infohash:
-        return f"{infohash}:{size}:{res}:{lang}:{audio}:{prov}:{label}"
+        size_part = str(size)
+    else:
+        bucket = int(round(size / 1e8) * 1e8)  # 100MB bucket
+        size_part = str(bucket)
 
-    # Fallback: no infohash (e.g., some usenet/webdl sources)
-    return f"nohash:{size}:{res}:{lang}:{audio}:{prov}:{label}"
+    return f"{infohash or 'nohash'}:{size_part}:{res}:{lang}:{audio}:{prov}:{normalized_label}"
+
 
 def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0) -> Tuple[List[Dict[str, Any]], PipeStats]:
     stats = PipeStats()
@@ -1182,12 +1201,12 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     def sort_key(pair: Tuple[Dict[str, Any], Dict[str, Any]]):
         s, m = pair
         prov = (m.get('provider', 'ZZ') or 'ZZ').upper()
-        premium_idx = PREMIUM_PRIORITY.index(prov) if prov in PREMIUM_PRIORITY else len(PREMIUM_PRIORITY) + 1
-        res_match = re.search(r'(\d+)p', (s.get('description', '') or '') + ' ' + (s.get('name', '') or ''), re.I)
-        res = int(res_match.group(1) or 0) if res_match else 0
+        prov_idx = _provider_rank(prov)
+        cached = m.get('cached')
+        cached_val = 0 if cached is True else 1 if cached == 'LIKELY' else 2
+        res = _res_to_int(m.get('res') or 'SD')
         seeders = int(m.get('seeders') or 0)
-        size = int(m.get('size') or 0)
-        return (premium_idx, -res, -seeders, -size)
+        return (prov_idx, cached_val, -res, -seeders)
 
     out_pairs.sort(key=sort_key)
 
@@ -1233,65 +1252,6 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 candidates = [p for p in candidates if _keep_tb(p)]
                 stats.dropped_uncached_tb += before - len(candidates)
 
-    # TorBox cache hints / enforcement
-    cached_map: Dict[str, bool] = {}
-    if TB_API_KEY and TB_CACHE_HINTS and candidates:
-        hashes: list[str] = []
-        seen_h: set[str] = set()
-        max_check = min(TB_MAX_HASHES, len(candidates))
-        for _, meta in candidates:
-            h = (meta.get('infohash') or '').lower()
-            if not h or h in seen_h:
-                continue
-            seen_h.add(h)
-            hashes.append(h)
-            if len(hashes) >= max_check:
-                break
-        stats.tb_api_hashes = len(hashes)
-        t_api0 = time.time()
-        cached_map = tb_get_cached(hashes)
-        stats.ms_tb_api = int((time.time() - t_api0) * 1000)
-
-        # Re-sort candidates using cached hint as a tiebreaker.
-        def _cand_key(p):
-            _s, _m = p
-            prov = (_m.get('provider') or 'UNK').upper()
-            h = (_m.get('infohash') or '').lower()
-            res_i = _res_to_int((_m.get('res') or 'SD'))
-            seed = int(_m.get('seeders') or 0)
-            size = int(_m.get('size') or 0)
-            cached = bool(cached_map.get(h, False))
-            return (
-                _provider_rank(prov),
-                0 if cached else 1,
-                -res_i,
-                -seed,
-                -size,
-            )
-        candidates.sort(key=_cand_key)
-
-        # Optional: enforce TorBox cached-only (drop TB streams that are not cached).
-        if TORBOX_CACHE_CHECK and not VERIFY_TB_CACHE_OFF:
-            before = len(candidates)
-            def _is_tb_cached(pair):
-                _s, _m = pair
-                if _m.get('provider') != 'TB':
-                    return True
-                h = (_m.get('infohash') or '').lower()
-                return bool(h) and cached_map.get(h, False)
-            candidates = [p for p in candidates if _is_tb_cached(p)]
-            stats.dropped_uncached_tb += before - len(candidates)
-
-    # Clarity log: tells you if TB checks actually ran and how many hashes were checked.
-    logger.info(
-        "TB_CHECKS rid=%s webdav_active=%s webdav_strict=%s api_active=%s api_hashes=%s webdav_hashes=%s",
-        _rid(),
-        bool(USE_TB_WEBDAV and TB_WEBDAV_USER),
-        bool(TB_WEBDAV_STRICT),
-        bool(TB_API_KEY and TB_CACHE_HINTS),
-        int(stats.tb_api_hashes or 0),
-        int(stats.tb_webdav_hashes or 0),
-    )
 
     # Optional: TorBox Usenet cache checks (only when we can extract a usenet identifier).
     usenet_cached_map: Dict[str, bool] = {}
@@ -1312,57 +1272,83 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # Optional: cached/instant-only enforcement across providers.
     # - TB: requires TB_CACHE_HINTS + TB_API_KEY (otherwise we can't confirm)
     # - RD/AD: heuristic only (no API checks anymore)
+    # Cache checks / premium validation
+    cached_map: Dict[str, bool] = {}
     if VERIFY_CACHED_ONLY and not VALIDATE_OFF:
-        before = len(candidates)
-        strict_used = 0
+        # TorBox API cached check (batched). Skip very small hash sets to avoid rate-limit/reset churn.
+        if TB_CACHE_HINTS:
+            hashes: List[str] = []
+            seen_h: set = set()
+            for _s, _m in candidates:
+                if (_m.get('provider') == 'TB'):
+                    h = (_m.get('infohash') or '').lower().strip()
+                    if h and h not in seen_h:
+                        seen_h.add(h)
+                        hashes.append(h)
+            if len(hashes) >= TB_API_MIN_HASHES:
+                t0 = time.time()
+                cached_map = tb_get_cached(hashes[:TB_MAX_HASHES])
+                stats.ms_tb_api = int((time.time() - t0) * 1000)
+                stats.tb_api_hashes = len(hashes[:TB_MAX_HASHES])
+            else:
+                logger.info(f"TB_API_SKIP rid={_rid()} hashes={len(hashes)} <{TB_API_MIN_HASHES}")
 
-        def _is_cached(pair: Tuple[Dict[str, Any], Dict[str, Any]]):
-            _s, _m = pair
-            provider = _m.get('provider', 'UNK')
-            h = (_m.get('infohash') or '').lower()
+        # Attach cached markers to meta; in loose mode we do NOT hard-drop.
+        kept = []
+        dropped_uncached = 0
+        dropped_uncached_tb = 0
+        for _s, _m in candidates:
+            provider = (_m.get('provider') or '').upper()
+            h = (_m.get('infohash') or '').lower().strip()
+            bh = _s.get('behaviorHints') or {}
+            text = (str(_s.get('name') or '') + ' ' + str(_s.get('description') or '') + ' ' + str(bh.get('filename') or '') + ' ' + str(bh.get('bingeGroup') or '')).lower()
 
-            # Usenet providers: if we have a TorBox usenet identifier and checks are enabled, honor it.
-            if provider in USENET_PRIORITY:
-                uh = (_m.get('usenet_hash') or '').strip().lower()
-                if uh and usenet_cached_map:
-                    ok = bool(usenet_cached_map.get(uh, False))
-                    _m['cached'] = ok
-                    return ok
-                _m['cached'] = True
-                return True
-
-            # Unknown providers: treated as playable without cache confirmation.
-            if provider not in ('RD', 'AD', 'TB'):
-                _m['cached'] = True
-                return True
-
-            # Unknown providers: treat as playable without cache confirmation.
-            if provider not in ('RD', 'AD', 'TB'):
-                _m['cached'] = True
-                return True
-
+            cached_marker = None
             if provider == 'TB':
                 if h and cached_map:
-                    ok = bool(cached_map.get(h, False))
-                    _m['cached'] = ok
-                    if h:
-                        CACHED_HISTORY[h] = ok
-                    return ok
-                # If we can't check TB cache status, be conservative unless the user opted to assume.
-                if ASSUME_PREMIUM_ON_FAIL:
-                    _m['cached'] = True
-                    return True
-                return False
+                    cached_marker = bool(cached_map.get(h, False))
+                elif h and h in CACHED_HISTORY:
+                    cached_marker = bool(CACHED_HISTORY.get(h, False))
+                elif ASSUME_PREMIUM_ON_FAIL:
+                    cached_marker = True
+                else:
+                    cached_marker = False
+            elif provider in ('RD', 'AD'):
+                cached_marker = bool(_heuristic_cached(_s, _m))
+            elif provider in USENET_PRIORITY:
+                cached_marker = 'LIKELY' if _looks_instant(text) else None
+            else:
+                cached_marker = None
 
-            # RD/AD: heuristic only
-            ok = _heuristic_cached(_s, _m)
-            _m['cached'] = ok
-            if h:
-                CACHED_HISTORY[h] = ok
-            return ok
+            _m['cached'] = cached_marker
+            if h and isinstance(cached_marker, bool):
+                CACHED_HISTORY[h] = cached_marker
 
-        candidates = [p for p in candidates if _is_cached(p)]
-        stats.dropped_uncached += before - len(candidates)
+            if STRICT_PREMIUM_ONLY:
+                if cached_marker is True or cached_marker == 'LIKELY':
+                    kept.append((_s, _m))
+                else:
+                    dropped_uncached += 1
+                    if provider == 'TB':
+                        dropped_uncached_tb += 1
+            else:
+                kept.append((_s, _m))
+
+        candidates = kept
+        stats.dropped_uncached += dropped_uncached
+        stats.dropped_uncached_tb += dropped_uncached_tb
+
+
+    # Clarity log: tells you if TB checks actually ran and how many hashes were checked.
+    logger.info(
+        "TB_CHECKS rid=%s webdav_active=%s webdav_strict=%s api_active=%s api_hashes=%s webdav_hashes=%s",
+        _rid(),
+        bool(USE_TB_WEBDAV and TB_WEBDAV_USER),
+        bool(TB_WEBDAV_STRICT),
+        bool(TB_API_KEY and TB_CACHE_HINTS and (stats.tb_api_hashes or 0) > 0),
+        int(stats.tb_api_hashes or 0),
+        int(stats.tb_webdav_hashes or 0),
+    )
 
     # Ensure we keep/deliver some usenet entries (if configured).
     def _is_usenet(pair):
@@ -1396,19 +1382,33 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     else:
                         break
                 candidates = slice_ + candidates[MAX_DELIVER:]
-
     # Format (last step)
     delivered: List[Dict[str, Any]] = []
     for s, m in candidates[:MAX_DELIVER]:
-        h = (m.get('infohash') or '').lower()
-        is_cached = bool(m.get('cached')) or (h and cached_map.get(h, False))
-        cached_hint = "CACHED" if is_cached else ""
+        h = (m.get('infohash') or '').lower().strip()
+        cached_marker = m.get('cached')
+        is_confirmed = (cached_marker is True) or (h and cached_map.get(h, False) is True)
+        cached_hint = 'CACHED' if is_confirmed else ''
         if ADD_CACHE_HINT and not cached_hint:
-            if _looks_instant((s.get('name','') or '') + ' ' + (s.get('description','') or '')):
-                cached_hint = "LIKELY"
+            if cached_marker == 'LIKELY' or _looks_instant((s.get('name','') or '') + ' ' + (s.get('description','') or '')):
+                cached_hint = 'LIKELY'
+        # Always surface provider/cached in behaviorHints (even if reformat disabled)
+        bh = s.setdefault("behaviorHints", {})
+        bh.setdefault("provider", (m.get("provider") or "UNK").upper())
+        if m.get("infohash"):
+            if isinstance(cached_marker, bool):
+                bh.setdefault("cached", cached_marker)
+        elif cached_hint == "LIKELY":
+            bh.setdefault("cached", "LIKELY")
         if REFORMAT_STREAMS:
             format_stream_inplace(s, m, expected, cached_hint, type_, season, episode)
         delivered.append(s)
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"DELIVERED_TOP5 rid={_rid()} count={len(delivered)}")
+        for i, _s in enumerate(delivered[:5]):
+            _bh = _s.get('behaviorHints') or {}
+            logger.debug(f"  #{i} name='{_s.get('name')}' provider={_bh.get('provider','na')} cached={_bh.get('cached','na')} hash={'yes' if _s.get('infoHash') else 'no'} source={_bh.get('source','na')}")
 
     stats.delivered = len(delivered)
     return delivered, stats
@@ -1425,8 +1425,8 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.8",
-            "name": "AIO Wrapper (Unified 2 Providers) 8.8",
+            "version": "1.0.9",
+            "name": "AIO Wrapper (Unified 2 Providers) 8.9",
             "description": "Unified 2 providers into one stream list with hardened normalization + strict Stremio formatting. Adds premium-first sorting, optional title similarity gate, prettier labels with emojis, WebDAV strict TB drop, heuristic caching for RD/AD, dedup enhancement. VALIDATE_OFF bypass supported.",
             "resources": ["stream"],
             "types": ["movie", "series"],
