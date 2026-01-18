@@ -234,6 +234,20 @@ def _extract_year(text: str) -> Optional[int]:
     except Exception:
         return None
 
+def _extract_infohash(text: str) -> str | None:
+    '''Extract a 40-hex infohash from common patterns like IH:<hash>, infohash=<hash>, btih:<hash>.'''
+    if not text:
+        return None
+    m = re.search(r"\b(?:ih|infohash|btih)\s*[:=]\s*([0-9a-fA-F]{40})\b", text, flags=re.I)
+    if m:
+        return m.group(1).lower()
+    # Some providers embed the hash without a label; accept only if it appears as a standalone token.
+    m = re.search(r"\b([0-9a-fA-F]{40})\b", text)
+    if m:
+        return m.group(1).lower()
+    return None
+
+
 
 def is_premium_plan(provider: str, api_key: str = '') -> bool:
     prov = (provider or '').upper().strip()
@@ -793,6 +807,17 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     url = s.get("url", "") or s.get("externalUrl", "")
     hm = _HASH_RE.search(url)
     infohash = (hm.group(1) or hm.group(2)).lower() if hm else ""
+
+    # Fallback: some upstream add-ons put the infohash in the description as "IH:<hash>"
+    if not infohash:
+        cand = f"{text} {s.get('description','')} {s.get('name','')} {s.get('behaviorHints',{}).get('filename','')}"
+        ih = _extract_infohash(cand)
+        if ih:
+            infohash = ih
+
+    # Make it accessible to clients that support Stremio's infoHash field
+    if infohash and not s.get('infoHash'):
+        s['infoHash'] = infohash
 
     # Optional Usenet identifier (only used if TB_USENET_CHECK=true).
     bh = s.get("behaviorHints", {}) or {}
