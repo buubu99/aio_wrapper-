@@ -15,10 +15,11 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 import requests
-from flask import Flask, jsonify, g, has_request_context, request
+from flask import Flask, jsonify, g, has_request_context, request, redirect, make_response, Response
 from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+BUILD_TAG = '20260119-144131Z-headshim'
 
 def _parse_bool(v: str, default: bool = False) -> bool:
     if v is None:
@@ -564,10 +565,17 @@ def _cache_key(media_type: str, stremio_id: str) -> str:
     return f"{media_type}:{stremio_id}"
 
 
-def cache_get(media_type: str, stremio_id: str):
+def cache_get(media_type_or_key: str, stremio_id: Optional[str] = None):
+    """Return last known good streams.
+
+    Backwards/bug-compat:
+      - cache_get(type_, id_)  -> key built as "type:id"
+      - cache_get("type:id")  -> accepts pre-built key
+    """
     if FALLBACK_CACHE_TTL <= 0:
         return None
-    k = _cache_key(media_type, stremio_id)
+
+    k = media_type_or_key if (stremio_id is None) else _cache_key(media_type_or_key, stremio_id)
     now = time.time()
     with _CACHE_LOCK:
         ts = _LAST_GOOD_TS.get(k)
@@ -576,10 +584,26 @@ def cache_get(media_type: str, stremio_id: str):
         return _LAST_GOOD_STREAMS.get(k)
 
 
-def cache_set(media_type: str, stremio_id: str, streams):
-    if FALLBACK_CACHE_TTL <= 0 or not streams:
+def cache_set(media_type_or_key: str, stremio_id_or_streams, streams: Optional[list] = None):
+    """Store last known good streams.
+
+    Backwards/bug-compat:
+      - cache_set(type_, id_, streams)
+      - cache_set("type:id", streams)
+    """
+    if FALLBACK_CACHE_TTL <= 0:
         return
-    k = _cache_key(media_type, stremio_id)
+
+    if streams is None:
+        # Called as cache_set("type:id", streams)
+        k = media_type_or_key
+        streams = stremio_id_or_streams
+    else:
+        # Called as cache_set(type_, id_, streams)
+        k = _cache_key(media_type_or_key, stremio_id_or_streams)
+
+    if not streams:
+        return
     with _CACHE_LOCK:
         _LAST_GOOD_STREAMS[k] = streams
         _LAST_GOOD_TS[k] = time.time()
@@ -635,7 +659,7 @@ def add_common_headers(response):
 
 @app.route("/r/<token>", methods=["GET", "HEAD", "OPTIONS"])
 def redirect_stream_url(token: str):
-    """Redirector that is HEAD-friendly (returns 200 to HEAD).
+    """Redirector that is HEAD-friendly.
 
     Some Stremio clients (notably Android/TV builds) issue a HEAD request to validate
     stream URLs; certain upstream playback endpoints respond 405 to HEAD, causing the
@@ -654,14 +678,19 @@ def redirect_stream_url(token: str):
         return resp
 
     if request.method == "HEAD":
-        # Some Stremio clients preflight with HEAD and expect a redirect-style response.
-        resp = redirect(url, code=302)
+        # Some Stremio Android/TV builds validate stream URLs with HEAD and will reject
+        # endpoints that return 405. Return a fast 200 with range-friendly headers.
+        resp = Response(status=200)
+        resp.headers["Content-Type"] = "application/octet-stream"
+        resp.headers["Accept-Ranges"] = "bytes"
         resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Cache-Control"] = "no-store"
-        resp.set_data(b"")
         return resp
 
-    return redirect(url, code=302)
+    resp = redirect(url, code=302)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 def _log_level(v: str) -> int:
     return {
@@ -1653,8 +1682,8 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.10",
-            "name": "AIO Wrapper (Unified 2 Providers) 8.9.1",
+            "version": f"1.0.10-{BUILD_TAG}",
+            "name": f"AIO Wrapper (Unified 2 Providers) 8.9.1 ({BUILD_TAG})",
             "description": "Unified 2 providers into one stream list with hardened normalization + strict Stremio formatting. Adds premium-first sorting, optional title similarity gate, prettier labels with emojis, WebDAV strict TB drop, heuristic caching for RD/AD, dedup enhancement. VALIDATE_OFF bypass supported.",
             "resources": ["stream"],
             "types": ["movie", "series"],
@@ -1805,7 +1834,8 @@ def handle_unhandled_exception(e):
     # Last-resort safety net so Stremio doesn't get HTML 500s (which break jq/tests).
     logger.exception("UNHANDLED %s %s: %s", request.method, request.path, e)
     if request.path.endswith('/manifest.json'):
-        return jsonify(manifest()), 200
+        # manifest() already returns a proper Flask Response
+        return manifest()
     if request.path.startswith('/stream/'):
         # Never fail hard for stream endpoints; empty list is better than a 500.
         cached = cache_get(request.path.replace('/stream/','',1).replace('.json','',1).replace('/',':',1))
