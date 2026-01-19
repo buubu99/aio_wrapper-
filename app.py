@@ -702,7 +702,17 @@ def redirect_stream_url(token: str):
         resp.headers["Access-Control-Allow-Headers"] = "*"
         return resp
 
-    # For both GET and HEAD, return a redirect with Location header.
+    if request.method == "HEAD":
+        # IMPORTANT: return 200 and DO NOT redirect. Some clients will follow a HEAD redirect
+        # and then HEAD the upstream playback URL (often 405), causing the stream to be rejected.
+        resp = make_response("", 200)
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["Content-Type"] = "application/octet-stream"
+        resp.headers["Accept-Ranges"] = "bytes"
+        return resp
+
+    # GET: normal redirect to real playback
     resp = redirect(url, code=302)
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Cache-Control"] = "no-store"
