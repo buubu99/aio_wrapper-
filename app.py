@@ -613,9 +613,25 @@ def _rid() -> str:
     return g.request_id if has_request_context() and hasattr(g, "request_id") else "GLOBAL"
 
 def is_android_client() -> bool:
-    """Best-effort detection of Android/Google TV Stremio clients."""
+    """Best-effort detection of Android/Google TV Stremio clients.
+
+    IMPORTANT: Some Android TV / Google TV Stremio builds send an empty User-Agent
+    (it shows up as '-' in some access logs). Treat empty UA as Android/TV so
+    we take the fast path and avoid client-side timeouts.
+    """
     ua = request.headers.get("User-Agent", "") if has_request_context() else ""
-    return ("Android" in ua) or ("okhttp" in ua.lower())
+    ua_l = (ua or "").strip().lower()
+
+    # Key fix: Google TV clients may omit UA entirely.
+    if not ua_l:
+        return True
+
+    return (
+        ('android' in ua_l)
+        or ('okhttp' in ua_l)
+        or ('exoplayer' in ua_l)
+        or ('stremio' in ua_l and 'tv' in ua_l)
+    )
 
 
 # ---------------------------
@@ -630,6 +646,13 @@ retry = Retry(total=3, backoff_factor=0.6, status_forcelist=[500, 502, 503, 504]
 adapter = HTTPAdapter(max_retries=retry)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
+
+# Fast path session: no retries (Android/TV clients are latency-sensitive)
+fast_session = requests.Session()
+fast_retry = Retry(total=0)
+fast_adapter = HTTPAdapter(max_retries=fast_retry)
+fast_session.mount("http://", fast_adapter)
+fast_session.mount("https://", fast_adapter)
 
 # ---------------------------
 # Simple in-process rate limiting (no extra deps)
@@ -991,14 +1014,15 @@ def _auth_headers(auth: str) -> Dict[str, str]:
     headers['Authorization'] = auth
     return headers
 
-def _fetch_streams_from_base(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float = REQUEST_TIMEOUT) -> List[Dict[str, Any]]:
+def _fetch_streams_from_base(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float = REQUEST_TIMEOUT, no_retry: bool = False) -> List[Dict[str, Any]]:
     if not base:
         return []
     url = f"{base}/stream/{type_}/{id_}.json"
     headers = _auth_headers(auth)
     logger.info(f'{tag} fetch URL: {url}')
     try:
-        resp = session.get(url, headers=headers, timeout=timeout)
+        sess = fast_session if no_retry else session
+        resp = sess.get(url, headers=headers, timeout=timeout)
         logger.info(f'{tag} status={resp.status_code} bytes={len(resp.content)}')
         if resp.status_code != 200:
             return []
@@ -1018,10 +1042,10 @@ def _fetch_streams_from_base(base: str, auth: str, type_: str, id_: str, tag: st
         return []
 
 
-def get_streams_single(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float) -> tuple[list[dict[str, Any]], int, int]:
+def get_streams_single(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float, no_retry: bool = False) -> tuple[list[dict[str, Any]], int, int]:
     """Fetch a single provider and return (streams, count, ms)."""
     t0 = time.time()
-    streams = _fetch_streams_from_base(base, auth, type_, id_, tag, timeout=timeout)
+    streams = _fetch_streams_from_base(base, auth, type_, id_, tag, timeout=timeout, no_retry=no_retry)
     ms = int((time.time() - t0) * 1000)
     return streams, len(streams), ms
 
@@ -1553,7 +1577,7 @@ def stream_p2(type_: str, id_: str):
     t0 = time.time()
     stats = PipeStats()
     try:
-        streams, prov2_in, ms_p2 = get_streams_single(PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG, timeout=ANDROID_FAST_TIMEOUT)
+        streams, prov2_in, ms_p2 = get_streams_single(PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG, timeout=ANDROID_FAST_TIMEOUT, no_retry=True)
         stats.prov2_in = prov2_in
         stats.merged_in = len(streams)
         stats.ms_fetch_p2 = ms_p2
@@ -1594,7 +1618,7 @@ def stream(type_: str, id_: str):
     try:
         # Android quick path: Viren/P2 only, no TMDB/TorBox, return fast
         if is_android and ANDROID_FAST and PROV2_BASE:
-            streams, prov2_in, ms_p2 = get_streams_single(PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG, timeout=ANDROID_FAST_TIMEOUT)
+            streams, prov2_in, ms_p2 = get_streams_single(PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG, timeout=ANDROID_FAST_TIMEOUT, no_retry=True)
             aio_in = 0
             ms_aio = 0
             stats.prov2_in = prov2_in
