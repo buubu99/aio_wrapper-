@@ -1799,6 +1799,21 @@ def stream(type_: str, id_: str):
             int((time.time() - t0) * 1000),
         )
 
+
+@app.errorhandler(Exception)
+def handle_unhandled_exception(e):
+    # Last-resort safety net so Stremio doesn't get HTML 500s (which break jq/tests).
+    logger.exception("UNHANDLED %s %s: %s", request.method, request.path, e)
+    if request.path.endswith('/manifest.json'):
+        return jsonify(manifest()), 200
+    if request.path.startswith('/stream/'):
+        # Never fail hard for stream endpoints; empty list is better than a 500.
+        cached = cache_get(request.path.replace('/stream/','',1).replace('.json','',1).replace('/',':',1))
+        if cached:
+            return jsonify({'streams': cached}), 200
+        return jsonify({'streams': []}), 200
+    return ("Internal Server Error", 500)
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=LOG_LEVEL == logging.DEBUG, use_reloader=False)
