@@ -529,6 +529,7 @@ import base64
 WRAP_PLAYBACK_URLS = os.getenv("WRAP_PLAYBACK_URLS", "1").strip() not in ("0", "false", "False")
 PLAYBACK_HEAD_WORKAROUND_SUBSTR = os.getenv("PLAYBACK_HEAD_WORKAROUND_SUBSTR", "/api/v1/debrid/playback/")
 USENET_PSEUDO_INFOHASH = os.getenv("USENET_PSEUDO_INFOHASH", "1").strip() not in ("0", "false", "False")
+WRAP_DEBUG = os.getenv("WRAP_DEBUG", "0").strip() in ("1", "true", "True")
 
 def _pseudo_infohash_usenet(usenet_hash: str) -> str:
     """Create a deterministic 40-hex pseudo-infohash for Usenet items.
@@ -576,7 +577,10 @@ def wrap_playback_url(url: str) -> str:
     except Exception:
         pass
     if u.startswith('http://') or u.startswith('https://'):
-        return _public_base_url() + 'r/' + _b64u_encode(u)
+        wrapped = _public_base_url() + 'r/' + _b64u_encode(u)
+        if WRAP_DEBUG:
+            logging.getLogger("aio-wrapper").info(f"WRAP_URL -> {wrapped}")
+        return wrapped
     return u
 
 app = Flask(__name__)
@@ -675,11 +679,16 @@ def add_common_headers(response):
 
 @app.route("/r/<token>", methods=["GET", "HEAD", "OPTIONS"])
 def redirect_stream_url(token: str):
-    """Redirector that is HEAD-friendly (returns 200 to HEAD).
+    """Redirector that is HEAD-friendly.
 
-    Some Stremio clients (notably Android/TV builds) issue a HEAD request to validate
-    stream URLs; certain upstream playback endpoints respond 405 to HEAD, causing the
-    client to silently discard all streams.
+    Key behavior:
+    - HEAD returns **302 with Location** (not 200), because some Android/TV clients treat
+      a 200-without-Location as a dead link.
+    - GET returns 302 like a normal redirect.
+    - OPTIONS supports CORS preflight.
+
+    This exists because many upstream playback endpoints return 405 to HEAD, which makes
+    Stremio Android/Google TV discard streams.
     """
     try:
         url = _b64u_decode(token)
@@ -693,16 +702,12 @@ def redirect_stream_url(token: str):
         resp.headers["Access-Control-Allow-Headers"] = "*"
         return resp
 
-    if request.method == "HEAD":
-        # Android/TV validation step: must not be 405; return 200 quickly with no body.
-        resp = Response(status=200)
-        resp.headers["Content-Type"] = "application/octet-stream"
-        resp.headers["Accept-Ranges"] = "bytes"
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Cache-Control"] = "no-store"
-        return resp
-
-    return redirect(url, code=302)
+    # For both GET and HEAD, return a redirect with Location header.
+    resp = redirect(url, code=302)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers.setdefault("Accept-Ranges", "bytes")
+    return resp
 
 def _log_level(v: str) -> int:
     return {
