@@ -56,6 +56,9 @@ PROV2_URL = os.environ.get("PROV2_URL", "")
 PROV2_BASE = _normalize_base(os.environ.get("PROV2_BASE", "") or PROV2_URL)
 PROV2_AUTH = os.environ.get("PROV2_AUTH", "")  # 'user:pass' for Basic auth if needed
 PROV2_TAG = os.environ.get("PROV2_TAG", "P2")
+ANDROID_FAST = _parse_bool(os.environ.get("ANDROID_FAST", "true"), True)
+ANDROID_FAST_TIMEOUT = float(os.environ.get("ANDROID_FAST_TIMEOUT", "4.0"))
+ANDROID_MAX_DELIVER = int(os.environ.get("ANDROID_MAX_DELIVER", "60"))
 INPUT_CAP = int(os.environ.get("INPUT_CAP", "4500"))
 MAX_DELIVER = int(os.environ.get("MAX_DELIVER", "80"))
 # Formatting / UI constraints
@@ -988,14 +991,14 @@ def _auth_headers(auth: str) -> Dict[str, str]:
     headers['Authorization'] = auth
     return headers
 
-def _fetch_streams_from_base(base: str, auth: str, type_: str, id_: str, tag: str) -> List[Dict[str, Any]]:
+def _fetch_streams_from_base(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float = REQUEST_TIMEOUT) -> List[Dict[str, Any]]:
     if not base:
         return []
     url = f"{base}/stream/{type_}/{id_}.json"
     headers = _auth_headers(auth)
     logger.info(f'{tag} fetch URL: {url}')
     try:
-        resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        resp = session.get(url, headers=headers, timeout=timeout)
         logger.info(f'{tag} status={resp.status_code} bytes={len(resp.content)}')
         if resp.status_code != 200:
             return []
@@ -1013,6 +1016,14 @@ def _fetch_streams_from_base(base: str, auth: str, type_: str, id_: str, tag: st
     except Exception as e:
         logger.error(f'{tag} fetch error: {e}')
         return []
+
+
+def get_streams_single(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float) -> tuple[list[dict[str, Any]], int, int]:
+    """Fetch a single provider and return (streams, count, ms)."""
+    t0 = time.time()
+    streams = _fetch_streams_from_base(base, auth, type_, id_, tag, timeout=timeout)
+    ms = int((time.time() - t0) * 1000)
+    return streams, len(streams), ms
 
 def get_streams(type_: str, id_: str) -> Tuple[List[Dict[str, Any]], int, int, int, int]:
     """Fetch both providers in parallel (best-effort) and return merged streams + counts."""
@@ -1116,15 +1127,23 @@ def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
     return f"{infohash or 'nohash'}:{size_part}:{res}:{lang}:{audio}:{prov}:{normalized_label}"
 
 
-def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0, is_android: bool = False) -> Tuple[List[Dict[str, Any]], PipeStats]:
+def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0, is_android: bool = False, fast_mode: bool = False, deliver_cap: Optional[int] = None) -> Tuple[List[Dict[str, Any]], PipeStats]:
     stats = PipeStats()
     stats.aio_in = aio_in
     stats.prov2_in = prov2_in
     stats.merged_in = len(streams)
 
-    t_tmdb0 = time.time()
-    expected = get_expected_metadata(type_, id_)
-    stats.ms_tmdb = int((time.time() - t_tmdb0) * 1000)
+    deliver_cap_eff = int(deliver_cap or MAX_DELIVER or 60)
+
+    cached_map: Dict[str, bool] = {}
+
+    if fast_mode:
+        expected = {}
+        stats.ms_tmdb = 0
+    else:
+        t_tmdb0 = time.time()
+        expected = get_expected_metadata(type_, id_)
+        stats.ms_tmdb = int((time.time() - t_tmdb0) * 1000)
 
     # parse season/episode from id for series (tmdb:123:1:3 or tt..:1:3)
     season = episode = None
@@ -1206,7 +1225,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     continue
 
             # Optional URL verification (expensive)
-            if VERIFY_STREAM and not _verify_stream_url(s):
+            if (not fast_mode) and VERIFY_STREAM and not _verify_stream_url(s):
                 stats.dropped_dead_url += 1
                 continue
 
@@ -1228,7 +1247,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # Optional: title/year validation gate (local similarity; useful to drop obvious mismatches)
     # Uses parsed title from classify() when available (streams often have empty s['title']).
-    if (not VALIDATE_OFF) and (TRAKT_VALIDATE_TITLES or TRAKT_STRICT_YEAR):
+    if (not fast_mode) and (not VALIDATE_OFF) and (TRAKT_VALIDATE_TITLES or TRAKT_STRICT_YEAR):
         expected_title = (expected.get('title') or '').lower().strip()
         expected_year = expected.get('year')
         filtered_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
@@ -1268,12 +1287,12 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     out_pairs.sort(key=sort_key)
 
     # Candidate window: a little bigger so we can satisfy usenet quotas.
-    window = max(MAX_DELIVER, MIN_USENET_KEEP, MIN_USENET_DELIVER, 1)
+    window = max(deliver_cap_eff, MIN_USENET_KEEP, MIN_USENET_DELIVER, 1)
     candidates = out_pairs[: window * 4]
 
     # WebDAV strict (optional): drop TB items that WebDAV cannot confirm.
     # This can be used even without TB_API_KEY / TB_CACHE_HINTS.
-    if (not VALIDATE_OFF) and USE_TB_WEBDAV and TB_WEBDAV_USER and TB_WEBDAV_PASS and candidates and (TB_WEBDAV_STRICT or (not VERIFY_TB_CACHE_OFF)):
+    if (not fast_mode) and (not VALIDATE_OFF) and USE_TB_WEBDAV and TB_WEBDAV_USER and TB_WEBDAV_PASS and candidates and (TB_WEBDAV_STRICT or (not VERIFY_TB_CACHE_OFF)):
         tb_hashes: list[str] = []
         seen_tb: set[str] = set()
         for _s, _m in candidates:
@@ -1312,7 +1331,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # Optional: TorBox Usenet cache checks (only when we can extract a usenet identifier).
     usenet_cached_map: Dict[str, bool] = {}
-    if TB_USENET_CHECK and TB_API_KEY and candidates:
+    if (not fast_mode) and TB_USENET_CHECK and TB_API_KEY and candidates:
         uhashes: List[str] = []
         seen_u: set[str] = set()
         for _s, _m in candidates:
@@ -1331,7 +1350,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # - RD/AD: heuristic only (no API checks anymore)
     # Cache checks / premium validation
     cached_map: Dict[str, bool] = {}
-    if VERIFY_CACHED_ONLY and not VALIDATE_OFF:
+    if (not fast_mode) and VERIFY_CACHED_ONLY and not VALIDATE_OFF:
         # TorBox API cached check (batched). Skip very small hash sets to avoid rate-limit/reset churn.
         if TB_CACHE_HINTS:
             hashes: List[str] = []
@@ -1424,10 +1443,10 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                             break
         # DELIVER: ensure at least MIN_USENET_DELIVER within the first MAX_DELIVER
         if MIN_USENET_DELIVER:
-            slice_ = candidates[:MAX_DELIVER]
+            slice_ = candidates[:deliver_cap_eff]
             have = sum(1 for p in slice_ if _is_usenet(p))
             if have < MIN_USENET_DELIVER:
-                extras = [p for p in candidates[MAX_DELIVER:] + out_pairs[len(candidates):] if _is_usenet(p) and p not in slice_]
+                extras = [p for p in candidates[deliver_cap_eff:] + out_pairs[len(candidates):] if _is_usenet(p) and p not in slice_]
                 i = 0
                 while have < MIN_USENET_DELIVER and i < len(extras):
                     for j in range(len(slice_) - 1, -1, -1):
@@ -1438,7 +1457,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                             break
                     else:
                         break
-                candidates = slice_ + candidates[MAX_DELIVER:]
+                candidates = slice_ + candidates[deliver_cap_eff:]
     # Android/Google TV clients can't handle magnet: links; drop them and backfill with direct URLs.
     if is_android:
         def _is_magnet(u: str) -> bool:
@@ -1456,7 +1475,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     continue
                 seen.add(key)
                 kept.append((s, m))
-            if len(kept) < MAX_DELIVER:
+            if len(kept) < deliver_cap_eff:
                 for s, m in out_pairs:
                     u = (s or {}).get("url", "")
                     if _is_magnet(u):
@@ -1466,7 +1485,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                         continue
                     seen.add(key)
                     kept.append((s, m))
-                    if len(kept) >= MAX_DELIVER:
+                    if len(kept) >= deliver_cap_eff:
                         break
             stats.dropped_uncached += magnets
             logger.info(f"ANDROID_FILTER rid={rid} dropped_magnets={magnets}")
@@ -1474,7 +1493,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # Format (last step)
     delivered: List[Dict[str, Any]] = []
-    for s, m in candidates[:MAX_DELIVER]:
+    for s, m in candidates[:deliver_cap_eff]:
         h = (m.get('infohash') or '').lower().strip()
         cached_marker = m.get('cached')
         is_confirmed = (cached_marker is True) or (h and cached_map.get(h, False) is True)
@@ -1525,6 +1544,45 @@ def manifest():
         }
     )
 
+@app.get("/stream_p2/<type_>/<id_>.json")
+def stream_p2(type_: str, id_: str):
+    if not _is_valid_stream_id(type_, id_):
+        return jsonify({"streams": []}), 400
+    if not PROV2_BASE:
+        return jsonify({"streams": []}), 200
+    t0 = time.time()
+    stats = PipeStats()
+    try:
+        streams, prov2_in, ms_p2 = get_streams_single(PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG, timeout=ANDROID_FAST_TIMEOUT)
+        stats.prov2_in = prov2_in
+        stats.merged_in = len(streams)
+        stats.ms_fetch_p2 = ms_p2
+        out, stats = filter_and_format(type_, id_, streams, aio_in=0, prov2_in=prov2_in, is_android=is_android_client(), fast_mode=True, deliver_cap=ANDROID_MAX_DELIVER)
+        return jsonify({"streams": out}), 200
+    except Exception as e:
+        logger.exception(f"stream_p2 error: {e}")
+        return jsonify({"streams": []}), 200
+    finally:
+        logger.info(
+            "WRAP_TIMING rid=%s type=%s id=%s aio_ms=%s p2_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_api_hashes=%s tb_wd_hashes=%s",
+            _rid(), type_, id_,
+            0, stats.ms_fetch_p2, stats.ms_tmdb, stats.ms_tb_api, stats.ms_tb_webdav,
+            stats.tb_api_hashes, stats.tb_webdav_hashes,
+        )
+        logger.info(
+            "WRAP_STATS rid=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s deduped=%s delivered=%s ms=%s",
+            _rid(), type_, id_,
+            0, stats.prov2_in, stats.merged_in,
+            stats.dropped_error, stats.dropped_missing_url, stats.dropped_pollution,
+            stats.dropped_low_seeders, stats.dropped_lang,
+            stats.dropped_low_premium,
+            stats.dropped_rd, stats.dropped_ad, stats.dropped_low_res, stats.dropped_old_age,
+            stats.dropped_blacklist, stats.dropped_fakes_db, stats.dropped_title_mismatch, stats.dropped_dead_url, stats.dropped_uncached, stats.dropped_uncached_tb,
+            stats.deduped, stats.delivered,
+            int((time.time() - t0) * 1000),
+        )
+
+
 @app.get("/stream/<type_>/<id_>.json")
 def stream(type_: str, id_: str):
     if not _is_valid_stream_id(type_, id_):
@@ -1534,6 +1592,18 @@ def stream(type_: str, id_: str):
     is_android = is_android_client()
 
     try:
+        # Android quick path: Viren/P2 only, no TMDB/TorBox, return fast
+        if is_android and ANDROID_FAST and PROV2_BASE:
+            streams, prov2_in, ms_p2 = get_streams_single(PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG, timeout=ANDROID_FAST_TIMEOUT)
+            aio_in = 0
+            ms_aio = 0
+            stats.prov2_in = prov2_in
+            stats.aio_in = 0
+            stats.ms_fetch_p2 = ms_p2
+            stats.ms_fetch_aio = 0
+            out, stats = filter_and_format(type_, id_, streams, aio_in=0, prov2_in=prov2_in, is_android=True, fast_mode=True, deliver_cap=ANDROID_MAX_DELIVER)
+            return jsonify({"streams": out}), 200
+
         streams, aio_in, prov2_in, ms_aio, ms_p2 = get_streams(type_, id_)
         stats.aio_in = aio_in
         stats.prov2_in = prov2_in
