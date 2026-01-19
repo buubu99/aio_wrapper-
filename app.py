@@ -8,13 +8,15 @@ import time
 import unicodedata
 import uuid
 import difflib
+import ipaddress
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 import requests
-from flask import Flask, jsonify, g, has_request_context, request
+from flask import Flask, jsonify, g, has_request_context, request, Response
 from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -86,6 +88,14 @@ TB_API_MIN_HASHES = int(os.environ.get("TB_API_MIN_HASHES", "20"))  # skip TorBo
 TB_CACHE_HINTS = _parse_bool(os.environ.get("TB_CACHE_HINTS", "true"), True)  # enable TorBox cache hint lookups
 TB_USENET_CHECK = _parse_bool(os.environ.get("TB_USENET_CHECK", "false"), False)  # optional usenet cache checks (requires identifiers)
 REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "30"))
+
+# Some Stremio Android/TV builds issue HEAD requests to stream URLs.
+# Some upstream providers (incl. certain /debrid/playback endpoints) return 405 for HEAD,
+# which can cause "Loading..." with no streams played. We can proxy media URLs through
+# this wrapper so HEAD works reliably.
+PROXY_STREAM_URLS = _parse_bool(os.environ.get("PROXY_STREAM_URLS", "true"), True)
+PROXY_ANDROID_ONLY = _parse_bool(os.environ.get("PROXY_ANDROID_ONLY", "false"), False)
+PROXY_TIMEOUT = float(os.environ.get("PROXY_TIMEOUT", "60"))
 TMDB_TIMEOUT = float(os.environ.get("TMDB_TIMEOUT", "8"))
 # TMDB for metadata
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
@@ -632,6 +642,65 @@ def is_android_client() -> bool:
         or ('exoplayer' in ua_l)
         or ('stremio' in ua_l and 'tv' in ua_l)
     )
+
+
+def _is_private_address(host: str) -> bool:
+    """Best-effort SSRF guard for proxy endpoint."""
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
+    except ValueError:
+        # Not an IP literal.
+        return False
+
+
+def _proxy_allowed(url: str) -> Tuple[bool, str]:
+    """Validate proxy target. Returns (ok, reason_if_not_ok)."""
+    if not url or not isinstance(url, str):
+        return False, "missing url"
+    if len(url) > 4096:
+        return False, "url too long"
+
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(url)
+    except Exception:
+        return False, "bad url"
+
+    if u.scheme not in ("http", "https"):
+        return False, "unsupported scheme"
+    if not u.netloc:
+        return False, "missing host"
+
+    host = u.hostname or ""
+    if _is_private_address(host):
+        return False, "blocked host"
+
+    return True, ""
+
+
+def _make_proxy_url(target_url: str) -> str:
+    base = request.url_root.rstrip('/')
+    return f"{base}/p?url={quote(target_url, safe='')}"
+
+
+def _maybe_proxy_stream_urls(streams: List[Dict[str, Any]], is_android: bool) -> None:
+    """In-place rewrite of stream URLs to go through /p when enabled."""
+    if not PROXY_STREAM_URLS:
+        return
+    if PROXY_ON_ANDROID_ONLY and not is_android:
+        return
+
+    for s in streams:
+        u = s.get("url")
+        if not isinstance(u, str) or not u:
+            continue
+        if not (u.startswith("http://") or u.startswith("https://")):
+            continue
+        # Avoid double-proxying
+        if "/p?url=" in u:
+            continue
+        s["url"] = _make_proxy_url(u)
 
 
 # ---------------------------
@@ -1568,6 +1637,102 @@ def manifest():
         }
     )
 
+
+@app.route("/p", methods=["GET", "HEAD", "OPTIONS"])
+def proxy_media():
+    """Proxy a media URL so clients that issue HEAD requests don't break.
+
+    Stremio Android/TV often performs a HEAD request to validate/inspect a stream URL.
+    Some upstream providers return HTTP 405 for HEAD (method not allowed), which can
+    lead to an infinite "Loading..." in certain Stremio builds.
+
+    Usage: /p?url=<absolute http(s) url>
+    """
+    if request.method == "OPTIONS":
+        resp = Response(status=204)
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "*"
+        return resp
+
+    target = request.args.get("url", "").strip()
+    if not _proxy_allowed(target):
+        return Response("bad url", status=400)
+
+    # Forward a small, safe header subset (Range is important for playback).
+    fwd_headers: Dict[str, str] = {}
+    for h in ("Range", "User-Agent", "Accept", "Accept-Language", "Origin", "Referer"):
+        if h in request.headers:
+            fwd_headers[h] = request.headers[h]
+
+    try:
+        if request.method == "HEAD":
+            # Many providers don't support HEAD; do a tiny ranged GET instead.
+            head_headers = dict(fwd_headers)
+            head_headers.setdefault("Range", "bytes=0-0")
+            upstream = requests.get(
+                target,
+                headers=head_headers,
+                stream=True,
+                allow_redirects=True,
+                timeout=PROXY_TIMEOUT,
+            )
+            try:
+                resp = Response(status=upstream.status_code)
+                for hk in (
+                    "Content-Type",
+                    "Content-Length",
+                    "Content-Range",
+                    "Accept-Ranges",
+                    "Content-Disposition",
+                    "ETag",
+                    "Last-Modified",
+                ):
+                    if hk in upstream.headers:
+                        resp.headers[hk] = upstream.headers[hk]
+                resp.headers["Access-Control-Allow-Origin"] = "*"
+                resp.headers["Cache-Control"] = "no-store"
+                return resp
+            finally:
+                upstream.close()
+
+        # GET: stream body through.
+        upstream = requests.get(
+            target,
+            headers=fwd_headers,
+            stream=True,
+            allow_redirects=True,
+            timeout=PROXY_TIMEOUT,
+        )
+
+        def _gen():
+            try:
+                for chunk in upstream.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        yield chunk
+            finally:
+                upstream.close()
+
+        resp = Response(_gen(), status=upstream.status_code)
+        for hk in (
+            "Content-Type",
+            "Content-Length",
+            "Content-Range",
+            "Accept-Ranges",
+            "Content-Disposition",
+            "ETag",
+            "Last-Modified",
+        ):
+            if hk in upstream.headers:
+                resp.headers[hk] = upstream.headers[hk]
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    except Exception as e:
+        logger.warning(f"proxy_media error: {e}")
+        return Response("proxy error", status=502)
+
 @app.get("/stream_p2/<type_>/<id_>.json")
 def stream_p2(type_: str, id_: str):
     if not _is_valid_stream_id(type_, id_):
@@ -1582,6 +1747,7 @@ def stream_p2(type_: str, id_: str):
         stats.merged_in = len(streams)
         stats.ms_fetch_p2 = ms_p2
         out, stats = filter_and_format(type_, id_, streams, aio_in=0, prov2_in=prov2_in, is_android=is_android_client(), fast_mode=True, deliver_cap=ANDROID_MAX_DELIVER)
+        _maybe_proxy_stream_urls(out, is_android_client())
         return jsonify({"streams": out}), 200
     except Exception as e:
         logger.exception(f"stream_p2 error: {e}")
@@ -1626,6 +1792,7 @@ def stream(type_: str, id_: str):
             stats.ms_fetch_p2 = ms_p2
             stats.ms_fetch_aio = 0
             out, stats = filter_and_format(type_, id_, streams, aio_in=0, prov2_in=prov2_in, is_android=True, fast_mode=True, deliver_cap=ANDROID_MAX_DELIVER)
+            _maybe_proxy_stream_urls(out, True)
             return jsonify({"streams": out}), 200
 
         streams, aio_in, prov2_in, ms_aio, ms_p2 = get_streams(type_, id_)
@@ -1634,6 +1801,7 @@ def stream(type_: str, id_: str):
         stats.ms_fetch_aio = ms_aio
         stats.ms_fetch_p2 = ms_p2
         out, stats = filter_and_format(type_, id_, streams, aio_in=aio_in, prov2_in=prov2_in, is_android=is_android)
+        _maybe_proxy_stream_urls(out, is_android)
         return jsonify({"streams": out}), 200
     except Exception as e:
         logger.exception(f"Stream error: {e}")
