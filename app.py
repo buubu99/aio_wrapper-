@@ -1,5 +1,6 @@
 from __future__ import annotations
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -19,7 +20,6 @@ from flask import Flask, jsonify, g, has_request_context, request, redirect, mak
 from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-BUILD_TAG = '20260119-144131Z-headshim'
 
 def _parse_bool(v: str, default: bool = False) -> bool:
     if v is None:
@@ -528,6 +528,21 @@ import base64
 
 WRAP_PLAYBACK_URLS = os.getenv("WRAP_PLAYBACK_URLS", "1").strip() not in ("0", "false", "False")
 PLAYBACK_HEAD_WORKAROUND_SUBSTR = os.getenv("PLAYBACK_HEAD_WORKAROUND_SUBSTR", "/api/v1/debrid/playback/")
+USENET_PSEUDO_INFOHASH = os.getenv("USENET_PSEUDO_INFOHASH", "1").strip() not in ("0", "false", "False")
+
+def _pseudo_infohash_usenet(usenet_hash: str) -> str:
+    """Create a deterministic 40-hex pseudo-infohash for Usenet items.
+
+    Usenet has no BitTorrent infohash. We use SHA1("usenet:"+hash) to create
+    a stable 40-hex identifier useful for dedup/sorting.
+    """
+    h = (usenet_hash or "").strip().lower()
+    if not h:
+        return ""
+    if re.fullmatch(r"[0-9a-f]{40}", h):
+        return h
+    return hashlib.sha1(("usenet:" + h).encode("utf-8")).hexdigest()
+
 
 def _public_base_url() -> str:
     """Best-effort public base URL behind proxies/CDN."""
@@ -543,13 +558,26 @@ def _b64u_decode(token: str) -> str:
     return base64.urlsafe_b64decode((token + pad).encode("ascii")).decode("utf-8")
 
 def wrap_playback_url(url: str) -> str:
-    """Wrap URLs that are known to 405 on HEAD so Stremio TV/Android doesn't drop them."""
+    """Wrap outbound http(s) URLs behind our HEAD-friendly redirector.
+
+    Why: Android/Google TV Stremio often does a HEAD probe first; many upstream playback
+    endpoints return 405 to HEAD, which makes the client discard streams.
+
+    We wrap ANY http(s) URL (unless it is already our /r/ redirect) when enabled.
+    """
     if not url or not WRAP_PLAYBACK_URLS:
         return url
-    # Only wrap known-problem endpoints to avoid adding hops unnecessarily.
-    if PLAYBACK_HEAD_WORKAROUND_SUBSTR and (PLAYBACK_HEAD_WORKAROUND_SUBSTR in url):
-        return _public_base_url() + "r/" + _b64u_encode(url)
-    return url
+    u = str(url)
+    # Avoid double-wrapping
+    try:
+        base = _public_base_url().rstrip('/')
+        if u.startswith(base + '/r/') or u.startswith(base + '/r/'):
+            return u
+    except Exception:
+        pass
+    if u.startswith('http://') or u.startswith('https://'):
+        return _public_base_url() + 'r/' + _b64u_encode(u)
+    return u
 
 app = Flask(__name__)
 
@@ -565,17 +593,14 @@ def _cache_key(media_type: str, stremio_id: str) -> str:
     return f"{media_type}:{stremio_id}"
 
 
-def cache_get(media_type_or_key: str, stremio_id: Optional[str] = None):
-    """Return last known good streams.
-
-    Backwards/bug-compat:
-      - cache_get(type_, id_)  -> key built as "type:id"
-      - cache_get("type:id")  -> accepts pre-built key
-    """
+def cache_get(media_type: str, stremio_id: str = None):
+    """Get last-good streams by either (media_type, stremio_id) or a single key 'type:id'."""
     if FALLBACK_CACHE_TTL <= 0:
         return None
-
-    k = media_type_or_key if (stremio_id is None) else _cache_key(media_type_or_key, stremio_id)
+    if stremio_id is None:
+        k = str(media_type)
+    else:
+        k = _cache_key(media_type, stremio_id)
     now = time.time()
     with _CACHE_LOCK:
         ts = _LAST_GOOD_TS.get(k)
@@ -584,29 +609,20 @@ def cache_get(media_type_or_key: str, stremio_id: Optional[str] = None):
         return _LAST_GOOD_STREAMS.get(k)
 
 
-def cache_set(media_type_or_key: str, stremio_id_or_streams, streams: Optional[list] = None):
-    """Store last known good streams.
-
-    Backwards/bug-compat:
-      - cache_set(type_, id_, streams)
-      - cache_set("type:id", streams)
-    """
-    if FALLBACK_CACHE_TTL <= 0:
-        return
-
+def cache_set(media_type: str, stremio_id: str = None, streams=None):
+    """Set last-good streams by either (media_type, stremio_id, streams) or (key, streams)."""
     if streams is None:
-        # Called as cache_set("type:id", streams)
-        k = media_type_or_key
-        streams = stremio_id_or_streams
+        # called as cache_set(key, streams)
+        k = str(media_type)
+        streams = stremio_id
     else:
-        # Called as cache_set(type_, id_, streams)
-        k = _cache_key(media_type_or_key, stremio_id_or_streams)
-
-    if not streams:
+        k = _cache_key(media_type, stremio_id)
+    if FALLBACK_CACHE_TTL <= 0 or not streams:
         return
     with _CACHE_LOCK:
         _LAST_GOOD_STREAMS[k] = streams
         _LAST_GOOD_TS[k] = time.time()
+
 app.config["JSON_AS_ASCII"] = False
 
 # ---------------------------
@@ -659,7 +675,7 @@ def add_common_headers(response):
 
 @app.route("/r/<token>", methods=["GET", "HEAD", "OPTIONS"])
 def redirect_stream_url(token: str):
-    """Redirector that is HEAD-friendly.
+    """Redirector that is HEAD-friendly (returns 200 to HEAD).
 
     Some Stremio clients (notably Android/TV builds) issue a HEAD request to validate
     stream URLs; certain upstream playback endpoints respond 405 to HEAD, causing the
@@ -678,8 +694,7 @@ def redirect_stream_url(token: str):
         return resp
 
     if request.method == "HEAD":
-        # Some Stremio Android/TV builds validate stream URLs with HEAD and will reject
-        # endpoints that return 405. Return a fast 200 with range-friendly headers.
+        # Android/TV validation step: must not be 405; return 200 quickly with no body.
         resp = Response(status=200)
         resp.headers["Content-Type"] = "application/octet-stream"
         resp.headers["Accept-Ranges"] = "bytes"
@@ -687,10 +702,7 @@ def redirect_stream_url(token: str):
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
-    resp = redirect(url, code=302)
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+    return redirect(url, code=302)
 
 def _log_level(v: str) -> int:
     return {
@@ -982,6 +994,13 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(v, str) and v.strip():
             usenet_hash = v.strip().lower()
             break
+    # Fallback: extract a Usenet identifier from the playback URL if present (e.g. TorBox hash/guid)
+    if not usenet_hash and url:
+        m2 = re.search(r'\"hash\"\s*:\s*\"([0-9a-fA-F]{8,64})\"', url)
+        if not m2:
+            m2 = re.search(r'/download/\d+/([0-9a-fA-F]{8,64})', url)
+        if m2:
+            usenet_hash = m2.group(1).lower()
     # Group
     gm = _GROUP_RE.search(filename)
     group = gm.group(1).upper() if gm else ""
@@ -1099,6 +1118,13 @@ def format_stream_inplace(
     ih = (m.get('infohash') or '').strip().lower()
     if ih and not s.get('infoHash'):
         s['infoHash'] = ih
+    elif USENET_PSEUDO_INFOHASH and not s.get('infoHash'):
+        uh = (m.get('usenet_hash') or '').strip().lower()
+        pseudo = _pseudo_infohash_usenet(uh) if uh else ''
+        if pseudo:
+            s['infoHash'] = pseudo
+            bh['usenetHash'] = uh
+
 
     bh['provider'] = prov
     # Cached: booleans are API-truth for torrents; 'LIKELY' is heuristic for hashless/usenet.
@@ -1682,8 +1708,8 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": f"1.0.10-{BUILD_TAG}",
-            "name": f"AIO Wrapper (Unified 2 Providers) 8.9.1 ({BUILD_TAG})",
+            "version": "1.0.10",
+            "name": "AIO Wrapper (Unified 2 Providers) 8.9.1",
             "description": "Unified 2 providers into one stream list with hardened normalization + strict Stremio formatting. Adds premium-first sorting, optional title similarity gate, prettier labels with emojis, WebDAV strict TB drop, heuristic caching for RD/AD, dedup enhancement. VALIDATE_OFF bypass supported.",
             "resources": ["stream"],
             "types": ["movie", "series"],
@@ -1834,8 +1860,7 @@ def handle_unhandled_exception(e):
     # Last-resort safety net so Stremio doesn't get HTML 500s (which break jq/tests).
     logger.exception("UNHANDLED %s %s: %s", request.method, request.path, e)
     if request.path.endswith('/manifest.json'):
-        # manifest() already returns a proper Flask Response
-        return manifest()
+        return jsonify(manifest()), 200
     if request.path.startswith('/stream/'):
         # Never fail hard for stream endpoints; empty list is better than a 500.
         cached = cache_get(request.path.replace('/stream/','',1).replace('.json','',1).replace('/',':',1))
