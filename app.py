@@ -683,7 +683,7 @@ def root():
     return "ok", 200
 
 
-@app.route("/r/<token>", methods=["GET", "HEAD", "OPTIONS"])
+@app.route("/r/<path:token>", methods=["GET", "HEAD", "OPTIONS"])
 def redirect_stream_url(token: str):
     """Redirector that is HEAD-friendly.
 
@@ -706,23 +706,29 @@ def redirect_stream_url(token: str):
         resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Access-Control-Allow-Methods"] = "GET,HEAD,OPTIONS"
         resp.headers["Access-Control-Allow-Headers"] = "*"
+        resp.headers["Access-Control-Max-Age"] = "86400"
         return resp
 
-    if request.method == "HEAD":
-        # IMPORTANT: return 200 and DO NOT redirect. Some clients will follow a HEAD redirect
-        # and then HEAD the upstream playback URL (often 405), causing the stream to be rejected.
-        resp = make_response("", 200)
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Cache-Control"] = "no-store"
-        resp.headers["Content-Type"] = "application/octet-stream"
-        resp.headers["Accept-Ranges"] = "bytes"
-        return resp
-
-    # GET: normal redirect to real playback
-    resp = redirect(url, code=302)
+    # IMPORTANT (Google TV / Android): many clients HEAD-check stream URLs and discard links
+    # unless the HEAD is redirect-like. We therefore return a redirect for BOTH HEAD and GET.
+    # If an upstream doesn't support HEAD, this wrapper prevents the client from probing upstream.
+    resp = make_response("", 302)
+    resp.headers["Location"] = url
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Cache-Control"] = "no-store"
-    resp.headers.setdefault("Accept-Ranges", "bytes")
+    resp.headers["Content-Type"] = "application/octet-stream"
+    resp.headers["Accept-Ranges"] = "bytes"
+    resp.headers["Content-Length"] = "0"
+    
+    # High-signal debug for Problem 0 without spamming
+    try:
+        ua = request.headers.get("User-Agent", "")
+        logger.info(
+            "R_PROXY rid=%s method=%s ua_len=%d status=%s has_loc=%s",
+            _rid(), request.method, len(ua or ""), resp.status_code, True
+        )
+    except Exception:
+        pass
     return resp
 
 def _log_level(v: str) -> int:
