@@ -683,18 +683,20 @@ def root():
     return "ok", 200
 
 
+
 @app.route("/r/<path:token>", methods=["GET", "HEAD", "OPTIONS"])
 def redirect_stream_url(token: str):
-    """Redirector that is HEAD-friendly.
+    """Redirector used to wrap playback URLs.
 
-    Key behavior:
-    - HEAD returns **302 with Location** (not 200), because some Android/TV clients treat
-      a 200-without-Location as a dead link.
-    - GET returns 302 like a normal redirect.
-    - OPTIONS supports CORS preflight.
+    Some Stremio clients (especially Android/Google TV) HEAD-probe stream URLs.
+    Many upstream playback endpoints return 405 to HEAD, which makes the client discard
+    the stream before it ever tries to play it.
 
-    This exists because many upstream playback endpoints return 405 to HEAD, which makes
-    Stremio Android/Google TV discard streams.
+    Behavior:
+    - HEAD: returns 200 with no body (does NOT redirect) so the client never HEADs the upstream.
+            Includes a Location header as a hint for clients that expect it.
+    - GET:  302 redirect to the real playback URL.
+    - OPTIONS: CORS preflight.
     """
     try:
         url = _b64u_decode(token)
@@ -709,28 +711,34 @@ def redirect_stream_url(token: str):
         resp.headers["Access-Control-Max-Age"] = "86400"
         return resp
 
-    # IMPORTANT (Google TV / Android): many clients HEAD-check stream URLs and discard links
-    # unless the HEAD is redirect-like. We therefore return a redirect for BOTH HEAD and GET.
-    # If an upstream doesn't support HEAD, this wrapper prevents the client from probing upstream.
-    resp = make_response("", 302)
-    resp.headers["Location"] = url
+    if request.method == "HEAD":
+        # IMPORTANT: do NOT redirect on HEAD.
+        # Many clients follow redirects for HEAD too; if the upstream returns 405 to HEAD,
+        # the client will discard the stream. So we answer locally with an empty 200.
+        resp = make_response("", 200)
+        resp.headers["Location"] = url  # hint only
+        resp.headers["X-Head-Bypass"] = "1"
+    else:
+        # Real playback happens on GET.
+        resp = make_response("", 302)
+        resp.headers["Location"] = url
+
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["Content-Type"] = "application/octet-stream"
     resp.headers["Accept-Ranges"] = "bytes"
     resp.headers["Content-Length"] = "0"
-    
+
     # High-signal debug for Problem 0 without spamming
     try:
         ua = request.headers.get("User-Agent", "")
         logger.info(
             "R_PROXY rid=%s method=%s ua_len=%d status=%s has_loc=%s",
-            _rid(), request.method, len(ua or ""), resp.status_code, True
+            _rid(), request.method, len(ua or ""), resp.status_code, ("Location" in resp.headers)
         )
     except Exception:
         pass
     return resp
-
 def _log_level(v: str) -> int:
     return {
         "DEBUG": logging.DEBUG,
