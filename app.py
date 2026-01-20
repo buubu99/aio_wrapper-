@@ -72,13 +72,6 @@ MAX_DESC_CHARS = int(os.environ.get("MAX_DESC_CHARS", "180"))
 # Optional: prettier names (emojis + single-line)
 PRETTY_EMOJIS = _parse_bool(os.environ.get("PRETTY_EMOJIS", "true"), True)
 NAME_SINGLE_LINE = _parse_bool(os.environ.get("NAME_SINGLE_LINE", "true"), True)
-# Android/Google TV compatibility: keep JSON minimal + avoid schema edge-cases
-ANDROID_STRICT_JSON = _parse_bool(os.environ.get("ANDROID_STRICT_JSON", "true"), True)
-ANDROID_EMPTY_UA_IS_ANDROID = _parse_bool(os.environ.get("ANDROID_EMPTY_UA_IS_ANDROID", "true"), True)
-# Stremio clients vary: some Android TV builds mis-handle streams that include both url + infoHash.
-# Default OFF (safer): only expose infoHash when explicitly enabled.
-EXPOSE_INFOHASH = _parse_bool(os.environ.get("EXPOSE_INFOHASH", "false"), False)
-
 # Optional: title similarity drop (Trakt-like naming; works without Trakt)
 TRAKT_VALIDATE_TITLES = _parse_bool(os.environ.get("TRAKT_VALIDATE_TITLES", "true"), True)
 TRAKT_TITLE_MIN_RATIO = float(os.environ.get("TRAKT_TITLE_MIN_RATIO", "0.65"))
@@ -859,9 +852,8 @@ def is_android_client() -> bool:
     ua_l = (ua or "").strip().lower()
 
     # Key fix: Google TV clients may omit UA entirely.
-    # Make it configurable because some non-Android probes also omit UA.
     if not ua_l:
-        return ANDROID_EMPTY_UA_IS_ANDROID
+        return True
 
     return (
         ('android' in ua_l)
@@ -1205,7 +1197,6 @@ def format_stream_inplace(
     type_: str = "",
     season: Optional[int] = None,
     episode: Optional[int] = None,
-    strict_android: bool = False,
 ) -> None:
     # Clean, modern formatting: sparse emojis + • separators + optional 2-line description.
     prov = (m.get('provider') or 'UNK').upper().strip()
@@ -1219,7 +1210,7 @@ def format_stream_inplace(
     seeders = int(m.get('seeders') or 0)
 
     # Emoji mapping (kept intentionally sparse)
-    if PRETTY_EMOJIS and not strict_android:
+    if PRETTY_EMOJIS:
         prov_emoji = {
             'TB': '♻️',
             'RD': '🔴',
@@ -1253,30 +1244,30 @@ def format_stream_inplace(
     # Description: 2 clean lines (or single line if NAME_SINGLE_LINE)
     line1_bits = [p for p in [audio, lang, codec, source] if p]
     line1 = ' • '.join(line1_bits) if line1_bits else res
-    seeds_str = f"{seeders} Seeds" if seeders > 0 else "Seeds Unknown"    # Ensure machine-visible hints are present for downstream (Stremio UI + other tools)
+    seeds_str = f"{seeders} Seeds" if seeders > 0 else "Seeds Unknown"
+
+    # Ensure machine-visible hints are present for downstream (Stremio UI + other tools)
     bh = s.setdefault('behaviorHints', {})
     ih = (m.get('infohash') or '').strip().lower()
-    if EXPOSE_INFOHASH and (not strict_android):
-        if ih and not s.get('infoHash'):
-            s['infoHash'] = ih
-        elif USENET_PSEUDO_INFOHASH and not s.get('infoHash'):
-            uh = (m.get('usenet_hash') or '').strip().lower()
-            pseudo = _pseudo_infohash_usenet(uh) if uh else ''
-            if pseudo:
-                s['infoHash'] = pseudo
-                bh['usenetHash'] = uh
+    if ih and not s.get('infoHash'):
+        s['infoHash'] = ih
+    elif USENET_PSEUDO_INFOHASH and not s.get('infoHash'):
+        uh = (m.get('usenet_hash') or '').strip().lower()
+        pseudo = _pseudo_infohash_usenet(uh) if uh else ''
+        if pseudo:
+            s['infoHash'] = pseudo
+            bh['usenetHash'] = uh
 
 
-    if not strict_android:
-        bh['provider'] = prov
+    bh['provider'] = prov
     # Cached: booleans are API-truth for torrents; 'LIKELY' is heuristic for hashless/usenet.
-    if not strict_android and m.get('infohash'):
+    if m.get('infohash'):
         if isinstance(m.get('cached'), bool):
             bh['cached'] = m.get('cached')
     else:
-        if not strict_android and cached_hint == 'LIKELY':
+        if cached_hint == 'LIKELY':
             bh['cached'] = 'LIKELY'
-    if not strict_android and m.get('source') and 'source' not in bh:
+    if m.get('source') and 'source' not in bh:
         bh['source'] = m.get('source')
     line2_bits = [p for p in [size_str, seeds_str, (f"Grp {group}" if group else '')] if p]
     line2 = ' • '.join(line2_bits)
@@ -1287,26 +1278,6 @@ def format_stream_inplace(
     if NAME_SINGLE_LINE:
         desc = desc.replace("\n", " • ")
     s['description'] = desc
-
-def android_strict_sanitize_stream(s: Dict[str, Any]) -> None:
-    """Minimize stream objects for Android/Google TV Stremio.
-
-    Keeps only safe fields and removes infoHash + custom behaviorHints keys that
-    have caused some Android TV builds to drop streams from the UI.
-    """
-    # Remove any accidental infoHash
-    s.pop('infoHash', None)
-    # Keep only core keys
-    keep = {'name','title','description','url','behaviorHints'}
-    for k in list(s.keys()):
-        if k not in keep:
-            s.pop(k, None)
-    bh = s.get('behaviorHints')
-    if isinstance(bh, dict):
-        bh_keep = {'filename','videoSize','bingeGroup','notWebReady','proxyHeaders','subtitles','subtitleTrack'}
-        for k in list(bh.keys()):
-            if k not in bh_keep:
-                bh.pop(k, None)
 
 # ---------------------------
 # Fetch streams
@@ -1860,7 +1831,6 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # Format (last step)
     delivered: List[Dict[str, Any]] = []
-    strict_android = bool(is_android and ANDROID_STRICT_JSON)
     for s, m in candidates[:deliver_cap_eff]:
         h = (m.get('infohash') or '').lower().strip()
         cached_marker = m.get('cached')
@@ -1869,21 +1839,18 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         if ADD_CACHE_HINT and not cached_hint:
             if cached_marker == 'LIKELY' or _looks_instant((s.get('name','') or '') + ' ' + (s.get('description','') or '')):
                 cached_hint = 'LIKELY'
-        # Provider/cached hints are helpful on desktop, but can break some Android TV builds.
-        if not strict_android:
-            bh = s.setdefault("behaviorHints", {})
-            bh.setdefault("provider", (m.get("provider") or "UNK").upper())
-            if m.get("infohash"):
-                if isinstance(cached_marker, bool):
-                    bh.setdefault("cached", cached_marker)
-            elif cached_hint == "LIKELY":
-                bh.setdefault("cached", "LIKELY")
+        # Always surface provider/cached in behaviorHints (even if reformat disabled)
+        bh = s.setdefault("behaviorHints", {})
+        bh.setdefault("provider", (m.get("provider") or "UNK").upper())
+        if m.get("infohash"):
+            if isinstance(cached_marker, bool):
+                bh.setdefault("cached", cached_marker)
+        elif cached_hint == "LIKELY":
+            bh.setdefault("cached", "LIKELY")
         if REFORMAT_STREAMS:
-            format_stream_inplace(s, m, expected, cached_hint, type_, season, episode, strict_android=strict_android)
+            format_stream_inplace(s, m, expected, cached_hint, type_, season, episode)
         if WRAP_PLAYBACK_URLS and isinstance(s.get("url"), str) and s.get("url"):
             s["url"] = wrap_playback_url(s["url"])
-        if strict_android:
-            android_strict_sanitize_stream(s)
         delivered.append(s)
 
     if logger.isEnabledFor(logging.DEBUG):
