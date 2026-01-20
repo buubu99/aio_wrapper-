@@ -72,6 +72,13 @@ MAX_DESC_CHARS = int(os.environ.get("MAX_DESC_CHARS", "180"))
 # Optional: prettier names (emojis + single-line)
 PRETTY_EMOJIS = _parse_bool(os.environ.get("PRETTY_EMOJIS", "true"), True)
 NAME_SINGLE_LINE = _parse_bool(os.environ.get("NAME_SINGLE_LINE", "true"), True)
+# Android/Google TV compatibility: keep JSON minimal + avoid schema edge-cases
+ANDROID_STRICT_JSON = _parse_bool(os.environ.get("ANDROID_STRICT_JSON", "true"), True)
+ANDROID_EMPTY_UA_IS_ANDROID = _parse_bool(os.environ.get("ANDROID_EMPTY_UA_IS_ANDROID", "true"), True)
+# Stremio clients vary: some Android TV builds mis-handle streams that include both url + infoHash.
+# Default OFF (safer): only expose infoHash when explicitly enabled.
+EXPOSE_INFOHASH = _parse_bool(os.environ.get("EXPOSE_INFOHASH", "false"), False)
+
 # Optional: title similarity drop (Trakt-like naming; works without Trakt)
 TRAKT_VALIDATE_TITLES = _parse_bool(os.environ.get("TRAKT_VALIDATE_TITLES", "true"), True)
 TRAKT_TITLE_MIN_RATIO = float(os.environ.get("TRAKT_TITLE_MIN_RATIO", "0.65"))
@@ -142,6 +149,12 @@ TORBOX_CACHE_CHECK = _parse_bool(os.environ.get("TORBOX_CACHE_CHECK", "true"), T
 VERIFY_TB_CACHE_OFF = _parse_bool(os.environ.get("VERIFY_TB_CACHE_OFF", "false"), False)
 
 # Wrapper behavior toggles
+
+# Use short opaque /r/<token> urls instead of base64-encoding the full upstream URL.
+# Fixes Android/Google TV URL-length limits and keeps playback URLs private.
+WRAP_URL_SHORT = _parse_bool(os.environ.get("WRAP_URL_SHORT", "true"), True)
+WRAP_URL_TTL = int(os.environ.get("WRAP_URL_TTL", "3600"))  # seconds
+WRAP_HEAD_MODE = (os.environ.get("WRAP_HEAD_MODE", "200_noloc") or "200_noloc").strip().lower()
 WRAPPER_DEDUP = _parse_bool(os.environ.get("WRAPPER_DEDUP", "true"), True)
 
 VERIFY_STREAM = _parse_bool(os.environ.get("VERIFY_STREAM", "true"), True)
@@ -527,7 +540,7 @@ LANG_MAP = {
 # --- Playback URL HEAD workaround (some clients HEAD-check stream URLs) ---
 import base64
 
-WRAP_PLAYBACK_URLS = os.getenv("WRAP_PLAYBACK_URLS", "1").strip() not in ("0", "false", "False")
+WRAP_PLAYBACK_URLS = _parse_bool(os.environ.get("WRAP_PLAYBACK_URLS", "true"), True)
 PLAYBACK_HEAD_WORKAROUND_SUBSTR = os.getenv("PLAYBACK_HEAD_WORKAROUND_SUBSTR", "/api/v1/debrid/playback/")
 USENET_PSEUDO_INFOHASH = os.getenv("USENET_PSEUDO_INFOHASH", "1").strip() not in ("0", "false", "False")
 WRAP_DEBUG = os.getenv("WRAP_DEBUG", "0").strip() in ("1", "true", "True")
@@ -559,13 +572,40 @@ def _b64u_decode(token: str) -> str:
     pad = '=' * (-len(token) % 4)
     return base64.urlsafe_b64decode((token + pad).encode("ascii")).decode("utf-8")
 
+# In-memory short URL map for /r/<token> -> upstream URL
+# Note: With WEB_CONCURRENCY>1, each worker has its own map; keep concurrency=1 for reliability.
+_WRAP_URL_MAP = {}  # token -> (url, expires_epoch)
+_WRAP_URL_LOCK = threading.Lock()
+
+def _wrap_url_store(url: str) -> str:
+    """Store a playback URL and return an opaque short token."""
+    import os, time, base64
+    # 9 random bytes -> 12 chars base64url (no padding)
+    token = base64.urlsafe_b64encode(os.urandom(9)).decode('ascii').rstrip('=')
+    exp = time.time() + max(60, int(WRAP_URL_TTL or 3600))
+    with _WRAP_URL_LOCK:
+        _WRAP_URL_MAP[token] = (url, exp)
+    return token
+
+def _wrap_url_load(token: str) -> Optional[str]:
+    now = time.time()
+    with _WRAP_URL_LOCK:
+        val = _WRAP_URL_MAP.get(token)
+        if not val:
+            return None
+        url, exp = val
+        if exp and now > exp:
+            _WRAP_URL_MAP.pop(token, None)
+            return None
+        return url
+
 def wrap_playback_url(url: str) -> str:
     """Wrap outbound http(s) URLs behind our HEAD-friendly redirector.
 
-    Why: Android/Google TV Stremio often does a HEAD probe first; many upstream playback
-    endpoints return 405 to HEAD, which makes the client discard streams.
+    For Android/Google TV Stremio, keep the stream URL short and HEAD-safe.
 
-    We wrap ANY http(s) URL (unless it is already our /r/ redirect) when enabled.
+    - If WRAP_URL_SHORT=true, we store the upstream URL in an in-memory map and emit /r/<token>.
+    - Otherwise, fall back to base64-encoding the full URL (legacy).
     """
     if not url or not WRAP_PLAYBACK_URLS:
         return url
@@ -578,11 +618,16 @@ def wrap_playback_url(url: str) -> str:
     except Exception:
         pass
     if u.startswith('http://') or u.startswith('https://'):
-        wrapped = _public_base_url() + 'r/' + _b64u_encode(u)
-        if WRAP_DEBUG:
-            logging.getLogger("aio-wrapper").info(f"WRAP_URL -> {wrapped}")
+        if WRAP_URL_SHORT:
+            tok = _wrap_url_store(u)
+            wrapped = _public_base_url() + 'r/' + tok
+        else:
+            wrapped = _public_base_url() + 'r/' + _b64u_encode(u)
+        if 'WRAP_DEBUG' in globals() and WRAP_DEBUG:
+            logging.getLogger('aio-wrapper').info(f'WRAP_URL -> {wrapped}')
         return wrapped
     return u
+
 
 app = Flask(__name__)
 
@@ -683,28 +728,34 @@ def root():
     return "ok", 200
 
 
+
 @app.route("/r/<path:token>", methods=["GET", "HEAD", "OPTIONS"])
 def redirect_stream_url(token: str):
-    """Playback URL wrapper for Android/Google TV quirks.
+    """Redirector used to wrap playback URLs.
 
-    Why:
-    - Some clients (Android/Google TV) HEAD-probe stream URLs.
-    - Many upstream playback URLs return 405 to HEAD.
-    - If the client follows the HEAD redirect to upstream and gets 405, it may discard the stream.
+    Key goals for Google TV / Android Stremio:
+    - Keep stream URLs SHORT (avoid URL-length limits) via WRAP_URL_SHORT + in-memory map.
+    - Make HEAD validation succeed WITHOUT causing the client to HEAD the upstream.
 
-    Behavior:
-    - OPTIONS: CORS preflight (204)
-    - HEAD: bypass response (default 200, no body) so clients don't HEAD the upstream.
-      Tune via env:
-        WRAP_HEAD_MODE=200_noloc (default) -> 200, NO Location
-        WRAP_HEAD_MODE=200_loc            -> 200, includes Location
-        WRAP_HEAD_MODE=302                -> 302 redirect (not recommended; can cause upstream HEAD=405)
-    - GET: 302 redirect to the real playback URL.
+    Behavior controlled by WRAP_HEAD_MODE:
+      - 200_noloc (recommended): HEAD=200, no Location
+      - 200_loc:               HEAD=200, include Location hint
+      - 302:                   HEAD=302 redirect (not recommended)
+
+    GET always returns 302 Location to the real upstream playback URL.
     """
-    try:
-        url = _b64u_decode(token)
-    except Exception:
-        return ("", 400)
+    # Resolve token -> upstream URL
+    url = None
+    if WRAP_URL_SHORT:
+        url = _wrap_url_load(token)
+    if not url:
+        # Legacy: token may be base64 of the full URL
+        try:
+            url = _b64u_decode(token)
+        except Exception:
+            url = None
+    if not url:
+        return ("", 404)
 
     if request.method == "OPTIONS":
         resp = make_response("", 204)
@@ -714,55 +765,46 @@ def redirect_stream_url(token: str):
         resp.headers["Access-Control-Max-Age"] = "86400"
         return resp
 
-    head_mode = (os.environ.get("WRAP_HEAD_MODE", "200_noloc") or "200_noloc").strip().lower()
-
-    if request.method == "HEAD":
-        resp = make_response("", 200)
-        resp.headers["X-Head-Bypass"] = "1"
-
-        if head_mode == "200_loc":
-            resp.headers["Location"] = url
-        elif head_mode == "302":
-            resp.status_code = 302
-            resp.headers["Location"] = url
-        else:
-            # Default: never include Location (avoid any redirect-follow behavior).
-            resp.headers.pop("Location", None)
-            # Optional hint headers for debugging (clients ignore these).
-            resp.headers["Content-Location"] = url
-            resp.headers["X-Stream-Location"] = url
-
+    # Common headers
+    def _base(resp: Response) -> Response:
         resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Cache-Control"] = "no-store"
         resp.headers["Content-Type"] = "application/octet-stream"
         resp.headers["Accept-Ranges"] = "bytes"
         resp.headers["Content-Length"] = "0"
-
-        try:
-            ua = request.headers.get("User-Agent", "")
-            logger.info(
-                "R_PROXY rid=%s method=%s ua_len=%d status=%s head_mode=%s has_loc=%s",
-                _rid(), request.method, len(ua or ""), resp.status_code, head_mode, ("Location" in resp.headers)
-            )
-        except Exception:
-            pass
         return resp
 
-    # GET: normal redirect to real playback
-    resp = redirect(url, code=302)
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers.setdefault("Accept-Ranges", "bytes")
+    if request.method == "HEAD":
+        mode = (WRAP_HEAD_MODE or "200_noloc").lower()
+        if mode == "302":
+            resp = make_response("", 302)
+            resp.headers["Location"] = url
+        else:
+            resp = make_response("", 200)
+            # Do NOT set Location unless explicitly requested
+            if mode == "200_loc":
+                resp.headers["Location"] = url
+            # Safe hint headers (do not trigger redirect logic)
+            resp.headers["X-Head-Bypass"] = "1"
+            resp.headers["X-Stream-Location"] = url
+        resp = _base(resp)
+    else:
+        # GET: real playback
+        resp = make_response("", 302)
+        resp.headers["Location"] = url
+        resp = _base(resp)
 
+    # High-signal debug
     try:
         ua = request.headers.get("User-Agent", "")
         logger.info(
-            "R_PROXY rid=%s method=%s ua_len=%d status=%s head_mode=%s has_loc=%s",
-            _rid(), request.method, len(ua or ""), resp.status_code, head_mode, ("Location" in resp.headers)
+            "R_PROXY rid=%s method=%s ua_len=%d status=%s tok_len=%d short=%s",
+            _rid(), request.method, len(ua or ""), resp.status_code, len(token or ""), bool(WRAP_URL_SHORT)
         )
     except Exception:
         pass
     return resp
+
 
 def _log_level(v: str) -> int:
     return {
@@ -817,8 +859,9 @@ def is_android_client() -> bool:
     ua_l = (ua or "").strip().lower()
 
     # Key fix: Google TV clients may omit UA entirely.
+    # Make it configurable because some non-Android probes also omit UA.
     if not ua_l:
-        return True
+        return ANDROID_EMPTY_UA_IS_ANDROID
 
     return (
         ('android' in ua_l)
@@ -1162,6 +1205,7 @@ def format_stream_inplace(
     type_: str = "",
     season: Optional[int] = None,
     episode: Optional[int] = None,
+    strict_android: bool = False,
 ) -> None:
     # Clean, modern formatting: sparse emojis + • separators + optional 2-line description.
     prov = (m.get('provider') or 'UNK').upper().strip()
@@ -1175,7 +1219,7 @@ def format_stream_inplace(
     seeders = int(m.get('seeders') or 0)
 
     # Emoji mapping (kept intentionally sparse)
-    if PRETTY_EMOJIS:
+    if PRETTY_EMOJIS and not strict_android:
         prov_emoji = {
             'TB': '♻️',
             'RD': '🔴',
@@ -1209,30 +1253,30 @@ def format_stream_inplace(
     # Description: 2 clean lines (or single line if NAME_SINGLE_LINE)
     line1_bits = [p for p in [audio, lang, codec, source] if p]
     line1 = ' • '.join(line1_bits) if line1_bits else res
-    seeds_str = f"{seeders} Seeds" if seeders > 0 else "Seeds Unknown"
-
-    # Ensure machine-visible hints are present for downstream (Stremio UI + other tools)
+    seeds_str = f"{seeders} Seeds" if seeders > 0 else "Seeds Unknown"    # Ensure machine-visible hints are present for downstream (Stremio UI + other tools)
     bh = s.setdefault('behaviorHints', {})
     ih = (m.get('infohash') or '').strip().lower()
-    if ih and not s.get('infoHash'):
-        s['infoHash'] = ih
-    elif USENET_PSEUDO_INFOHASH and not s.get('infoHash'):
-        uh = (m.get('usenet_hash') or '').strip().lower()
-        pseudo = _pseudo_infohash_usenet(uh) if uh else ''
-        if pseudo:
-            s['infoHash'] = pseudo
-            bh['usenetHash'] = uh
+    if EXPOSE_INFOHASH and (not strict_android):
+        if ih and not s.get('infoHash'):
+            s['infoHash'] = ih
+        elif USENET_PSEUDO_INFOHASH and not s.get('infoHash'):
+            uh = (m.get('usenet_hash') or '').strip().lower()
+            pseudo = _pseudo_infohash_usenet(uh) if uh else ''
+            if pseudo:
+                s['infoHash'] = pseudo
+                bh['usenetHash'] = uh
 
 
-    bh['provider'] = prov
+    if not strict_android:
+        bh['provider'] = prov
     # Cached: booleans are API-truth for torrents; 'LIKELY' is heuristic for hashless/usenet.
-    if m.get('infohash'):
+    if not strict_android and m.get('infohash'):
         if isinstance(m.get('cached'), bool):
             bh['cached'] = m.get('cached')
     else:
-        if cached_hint == 'LIKELY':
+        if not strict_android and cached_hint == 'LIKELY':
             bh['cached'] = 'LIKELY'
-    if m.get('source') and 'source' not in bh:
+    if not strict_android and m.get('source') and 'source' not in bh:
         bh['source'] = m.get('source')
     line2_bits = [p for p in [size_str, seeds_str, (f"Grp {group}" if group else '')] if p]
     line2 = ' • '.join(line2_bits)
@@ -1243,6 +1287,26 @@ def format_stream_inplace(
     if NAME_SINGLE_LINE:
         desc = desc.replace("\n", " • ")
     s['description'] = desc
+
+def android_strict_sanitize_stream(s: Dict[str, Any]) -> None:
+    """Minimize stream objects for Android/Google TV Stremio.
+
+    Keeps only safe fields and removes infoHash + custom behaviorHints keys that
+    have caused some Android TV builds to drop streams from the UI.
+    """
+    # Remove any accidental infoHash
+    s.pop('infoHash', None)
+    # Keep only core keys
+    keep = {'name','title','description','url','behaviorHints'}
+    for k in list(s.keys()):
+        if k not in keep:
+            s.pop(k, None)
+    bh = s.get('behaviorHints')
+    if isinstance(bh, dict):
+        bh_keep = {'filename','videoSize','bingeGroup','notWebReady','proxyHeaders','subtitles','subtitleTrack'}
+        for k in list(bh.keys()):
+            if k not in bh_keep:
+                bh.pop(k, None)
 
 # ---------------------------
 # Fetch streams
@@ -1796,6 +1860,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # Format (last step)
     delivered: List[Dict[str, Any]] = []
+    strict_android = bool(is_android and ANDROID_STRICT_JSON)
     for s, m in candidates[:deliver_cap_eff]:
         h = (m.get('infohash') or '').lower().strip()
         cached_marker = m.get('cached')
@@ -1804,18 +1869,21 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         if ADD_CACHE_HINT and not cached_hint:
             if cached_marker == 'LIKELY' or _looks_instant((s.get('name','') or '') + ' ' + (s.get('description','') or '')):
                 cached_hint = 'LIKELY'
-        # Always surface provider/cached in behaviorHints (even if reformat disabled)
-        bh = s.setdefault("behaviorHints", {})
-        bh.setdefault("provider", (m.get("provider") or "UNK").upper())
-        if m.get("infohash"):
-            if isinstance(cached_marker, bool):
-                bh.setdefault("cached", cached_marker)
-        elif cached_hint == "LIKELY":
-            bh.setdefault("cached", "LIKELY")
+        # Provider/cached hints are helpful on desktop, but can break some Android TV builds.
+        if not strict_android:
+            bh = s.setdefault("behaviorHints", {})
+            bh.setdefault("provider", (m.get("provider") or "UNK").upper())
+            if m.get("infohash"):
+                if isinstance(cached_marker, bool):
+                    bh.setdefault("cached", cached_marker)
+            elif cached_hint == "LIKELY":
+                bh.setdefault("cached", "LIKELY")
         if REFORMAT_STREAMS:
-            format_stream_inplace(s, m, expected, cached_hint, type_, season, episode)
+            format_stream_inplace(s, m, expected, cached_hint, type_, season, episode, strict_android=strict_android)
         if WRAP_PLAYBACK_URLS and isinstance(s.get("url"), str) and s.get("url"):
             s["url"] = wrap_playback_url(s["url"])
+        if strict_android:
+            android_strict_sanitize_stream(s)
         delivered.append(s)
 
     if logger.isEnabledFor(logging.DEBUG):
