@@ -20,6 +20,7 @@ from flask import Flask, jsonify, g, has_request_context, request, redirect, mak
 from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from werkzeug.exceptions import HTTPException
 
 def _parse_bool(v: str, default: bool = False) -> bool:
     if v is None:
@@ -83,7 +84,7 @@ DROP_POLLUTED = _parse_bool(os.environ.get("DROP_POLLUTED", "true"), True)  # op
 TB_API_KEY = os.environ.get("TB_API_KEY", "")
 TB_BASE = "https://api.torbox.app"
 TB_BATCH_SIZE = int(os.environ.get("TB_BATCH_SIZE", "50"))
-TB_MAX_HASHES = int(os.environ.get("TB_MAX_HASHES", "200"))  # limit hashes checked per request for speed
+TB_MAX_HASHES = int(os.environ.get("TB_MAX_HASHES", "60"))  # limit hashes checked per request for speed
 TB_API_MIN_HASHES = int(os.environ.get("TB_API_MIN_HASHES", "20"))  # skip TorBox API calls if fewer hashes
 TB_CACHE_HINTS = _parse_bool(os.environ.get("TB_CACHE_HINTS", "true"), True)  # enable TorBox cache hint lookups
 TB_USENET_CHECK = _parse_bool(os.environ.get("TB_USENET_CHECK", "false"), False)  # optional usenet cache checks (requires identifiers)
@@ -677,6 +678,11 @@ def add_common_headers(response):
     return response
 
 
+@app.get("/")
+def root():
+    return "ok", 200
+
+
 @app.route("/r/<token>", methods=["GET", "HEAD", "OPTIONS"])
 def redirect_stream_url(token: str):
     """Redirector that is HEAD-friendly.
@@ -928,23 +934,48 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     desc = s.get("description", "").lower()
     filename = s.get("behaviorHints", {}).get("filename", "").lower()
     text = f"{name} {desc} {filename}"
-    # Provider
+    # Provider (prefer formatter-injected shortName tokens; keep word boundaries to avoid HDR->RD)
     provider = "UNK"
-    if "real-debrid" in text or "rd" in text:
-        provider = "RD"
-    elif "torbox" in text or "tb" in text:
-        provider = "TB"
-    elif "alldebrid" in text or "ad" in text:
-        provider = "AD"
-    elif "aio" in text:
-        provider = "AIOStreams" # Short badge for unknowns
-    # Usenet providers
-    elif "nzbdav" in text or "nzb" in text:
-        provider = "ND"
-    elif "eweka" in text:
-        provider = "EW"
-    elif "nzgeek" in text:
-        provider = "NG"
+    m_sn = re.search(r"\b(TB|TORBOX|RD|REAL[- ]?DEBRID|REALDEBRID|PM|PREMIUMIZE|AD|ALLDEBRID|DL|DEBRID[- ]?LINK|ND|NZBDAV|EW|EWEKA|NG|NZGEEK)\b", text, re.I)
+    if m_sn:
+        tok = m_sn.group(1).upper().replace(' ', '').replace('-', '')
+        provider_map = {
+            'TB': 'TB', 'TORBOX': 'TB',
+            'RD': 'RD', 'REALDEBRID': 'RD',
+            'PM': 'PM', 'PREMIUMIZE': 'PM',
+            'AD': 'AD', 'ALLDEBRID': 'AD',
+            'DL': 'DL', 'DEBRIDLINK': 'DL',
+            'ND': 'ND', 'NZBDAV': 'ND',
+            'EW': 'EW', 'EWEKA': 'EW',
+            'NG': 'NG', 'NZGEEK': 'NG',
+        }
+        provider = provider_map.get(tok, provider)
+
+    # Conservative fallback (keeps compatibility when formatter is missing)
+    if provider == "UNK":
+        if re.search(r"\breal[- ]?debrid\b", text):
+            provider = "RD"
+        elif re.search(r"\brd\b", text):
+            provider = "RD"
+        elif re.search(r"\btorbox\b", text):
+            provider = "TB"
+        elif re.search(r"\btb\b", text):
+            provider = "TB"
+        elif re.search(r"\ball[- ]?debrid\b", text):
+            provider = "AD"
+        elif re.search(r"\bad\b", text):
+            provider = "AD"
+        elif re.search(r"\bpremiumize\b", text):
+            provider = "PM"
+        elif re.search(r"\bpm\b", text):
+            provider = "PM"
+        elif re.search(r"\bnzbdav\b", text) or re.search(r"\bnzb\b", text):
+            provider = "ND"
+        elif re.search(r"\beweka\b", text):
+            provider = "EW"
+        elif re.search(r"\bnzgeek\b", text):
+            provider = "NG"
+
     # Resolution
     m = _RES_RE.search(text)
     res = (m.group(1).upper() if m else "SD")
@@ -987,15 +1018,27 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     seeders = int(re.search(r"(\d+) seeds?", text).group(1)) if re.search(r"(\d+) seeds?", text) else 0
     # Infohash
     url = s.get("url", "") or s.get("externalUrl", "")
-    hm = _HASH_RE.search(url)
-    infohash = (hm.group(1) or hm.group(2)).lower() if hm else ""
+    infohash = ""
+    hash_src = ""
 
-    # Fallback: some upstream add-ons put the infohash in the description as "IH:<hash>"
+    ih_field = s.get("infoHash")
+    if isinstance(ih_field, str) and re.fullmatch(r"[0-9a-fA-F]{40}", (ih_field or '').strip()):
+        infohash = ih_field.strip().lower()
+        hash_src = "field"
+
+    if not infohash and url:
+        hm = _HASH_RE.search(url)
+        if hm:
+            infohash = (hm.group(1) or hm.group(2)).lower()
+            hash_src = "url"
+
+    # Fallback: formatter-injected "IH:<hash>" (or similar labels) in text/description/name/filename
     if not infohash:
         cand = f"{text} {s.get('description','')} {s.get('name','')} {s.get('behaviorHints',{}).get('filename','')}"
         ih = _extract_infohash(cand)
         if ih:
             infohash = ih
+            hash_src = "desc"
 
     # Make it accessible to clients that support Stremio's infoHash field
     if infohash and not s.get('infoHash'):
@@ -1033,6 +1076,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
         "size": size,
         "seeders": seeders,
         "infohash": infohash,
+        "hash_src": hash_src,
         "usenet_hash": usenet_hash,
         "group": group,
         "title_raw": title_raw,
@@ -1284,34 +1328,53 @@ class PipeStats:
     tb_webdav_hashes: int = 0
     tb_usenet_hashes: int = 0
 
+
+def hash_stats(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
+    total = len(pairs)
+    with_hash = 0
+    uniq_hashes: set[str] = set()
+    prov_total: Dict[str, int] = {}
+    prov_with: Dict[str, int] = {}
+    src_count: Dict[str, int] = {}
+
+    for _s, m in pairs:
+        prov = (m.get('provider') or 'UNK').upper()
+        prov_total[prov] = prov_total.get(prov, 0) + 1
+
+        h = (m.get('infohash') or '').lower().strip()
+        if h:
+            with_hash += 1
+            uniq_hashes.add(h)
+            prov_with[prov] = prov_with.get(prov, 0) + 1
+
+        src = (m.get('hash_src') or '').strip().lower()
+        if src:
+            src_count[src] = src_count.get(src, 0) + 1
+
+    return total, with_hash, len(uniq_hashes), prov_total, prov_with, src_count
+
 def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
     """Stable dedup key.
 
-    - Prefer infohash when present.
-    - For hashless streams (common with some Usenet/direct sources), use filename/bingeGroup/name + size bucket.
+    - Prefer infohash when present (universal across providers).
+    - Fallback to normalized label when infohash is missing.
     """
     infohash = (meta.get('infohash') or '').lower().strip()
-    size = int(meta.get('size') or 0)
     res = (meta.get('res') or 'SD').upper()
-    lang = (meta.get('language') or 'EN').upper()
-    audio = (meta.get('audio') or '').upper()
-    prov = (meta.get('provider') or 'ZZ').upper()
+
+    if infohash:
+        return f"{infohash}:{res}"
+
     bh = stream.get('behaviorHints') or {}
     try:
         normalized_label = normalize_label(
-            bh.get('filename') or bh.get('bingeGroup') or stream.get('name', '')
+            bh.get('filename') or bh.get('bingeGroup') or stream.get('name', '') or stream.get('description', '')
         )
     except Exception:
         normalized_label = ''
 
-    # Size bucketing helps merge near-duplicate remux/web-dl variants that differ by small amounts.
-    if infohash:
-        size_part = str(size)
-    else:
-        bucket = int(round(size / 1e8) * 1e8)  # 100MB bucket
-        size_part = str(bucket)
+    return f"nohash:{normalized_label}:{res}"
 
-    return f"{infohash or 'nohash'}:{size_part}:{res}:{lang}:{audio}:{prov}:{normalized_label}"
 
 
 def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0, is_android: bool = False, fast_mode: bool = False, deliver_cap: Optional[int] = None) -> Tuple[List[Dict[str, Any]], PipeStats]:
@@ -1458,6 +1521,17 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
         out_pairs = filtered_pairs
 
+
+    # Global hash visibility (per request)
+    try:
+        hs_total, hs_with, hs_uniq, hs_prov_total, hs_prov_with, hs_src = hash_stats(out_pairs)
+        logger.info(
+            "HASH_STATS rid=%s total=%d with_hash=%d uniq_hash=%d prov_total=%s prov_with_hash=%s hash_src=%s",
+            _rid(), hs_total, hs_with, hs_uniq, hs_prov_total, hs_prov_with, hs_src
+        )
+    except Exception as _e:
+        logger.debug(f"HASH_STATS_ERR rid={_rid()} err={_e}")
+
     # Sorting: enforce premium streams first, then resolution/seeders.
     # This makes the first MAX_DELIVER feel like a true "premium" view.
 
@@ -1543,16 +1617,19 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             hashes: List[str] = []
             seen_h: set = set()
             for _s, _m in candidates:
-                if (_m.get('provider') == 'TB'):
-                    h = (_m.get('infohash') or '').lower().strip()
-                    if h and h not in seen_h:
-                        seen_h.add(h)
-                        hashes.append(h)
+                if len(hashes) >= TB_MAX_HASHES:
+                    break
+                if (_m.get('provider') or '').upper() != 'TB':
+                    continue
+                h = (_m.get('infohash') or '').lower().strip()
+                if h and h not in seen_h:
+                    seen_h.add(h)
+                    hashes.append(h)
             if len(hashes) >= TB_API_MIN_HASHES:
                 t0 = time.time()
-                cached_map = tb_get_cached(hashes[:TB_MAX_HASHES])
+                cached_map = tb_get_cached(hashes)
                 stats.ms_tb_api = int((time.time() - t0) * 1000)
-                stats.tb_api_hashes = len(hashes[:TB_MAX_HASHES])
+                stats.tb_api_hashes = len(hashes)
             else:
                 logger.info(f"TB_API_SKIP rid={_rid()} hashes={len(hashes)} <{TB_API_MIN_HASHES}")
 
@@ -1872,6 +1949,10 @@ def stream(type_: str, id_: str):
 
 @app.errorhandler(Exception)
 def handle_unhandled_exception(e):
+    # Pass through HTTP errors (404/405/etc) so they don't become fake 500s in logs.
+    if isinstance(e, HTTPException):
+        return e
+
     # Last-resort safety net so Stremio doesn't get HTML 500s (which break jq/tests).
     logger.exception("UNHANDLED %s %s: %s", request.method, request.path, e)
     if request.path.endswith('/manifest.json'):
