@@ -683,20 +683,23 @@ def root():
     return "ok", 200
 
 
-
 @app.route("/r/<path:token>", methods=["GET", "HEAD", "OPTIONS"])
 def redirect_stream_url(token: str):
-    """Redirector used to wrap playback URLs.
+    """Playback URL wrapper for Android/Google TV quirks.
 
-    Some Stremio clients (especially Android/Google TV) HEAD-probe stream URLs.
-    Many upstream playback endpoints return 405 to HEAD, which makes the client discard
-    the stream before it ever tries to play it.
+    Why:
+    - Some clients (Android/Google TV) HEAD-probe stream URLs.
+    - Many upstream playback URLs return 405 to HEAD.
+    - If the client follows the HEAD redirect to upstream and gets 405, it may discard the stream.
 
     Behavior:
-    - HEAD: returns 200 with no body (does NOT redirect) so the client never HEADs the upstream.
-            Includes a Location header as a hint for clients that expect it.
-    - GET:  302 redirect to the real playback URL.
-    - OPTIONS: CORS preflight.
+    - OPTIONS: CORS preflight (204)
+    - HEAD: bypass response (default 200, no body) so clients don't HEAD the upstream.
+      Tune via env:
+        WRAP_HEAD_MODE=200_noloc (default) -> 200, NO Location
+        WRAP_HEAD_MODE=200_loc            -> 200, includes Location
+        WRAP_HEAD_MODE=302                -> 302 redirect (not recommended; can cause upstream HEAD=405)
+    - GET: 302 redirect to the real playback URL.
     """
     try:
         url = _b64u_decode(token)
@@ -711,34 +714,56 @@ def redirect_stream_url(token: str):
         resp.headers["Access-Control-Max-Age"] = "86400"
         return resp
 
-    if request.method == "HEAD":
-        # IMPORTANT: do NOT redirect on HEAD.
-        # Many clients follow redirects for HEAD too; if the upstream returns 405 to HEAD,
-        # the client will discard the stream. So we answer locally with an empty 200.
-        resp = make_response("", 200)
-        resp.headers["Location"] = url  # hint only
-        resp.headers["X-Head-Bypass"] = "1"
-    else:
-        # Real playback happens on GET.
-        resp = make_response("", 302)
-        resp.headers["Location"] = url
+    head_mode = (os.environ.get("WRAP_HEAD_MODE", "200_noloc") or "200_noloc").strip().lower()
 
+    if request.method == "HEAD":
+        resp = make_response("", 200)
+        resp.headers["X-Head-Bypass"] = "1"
+
+        if head_mode == "200_loc":
+            resp.headers["Location"] = url
+        elif head_mode == "302":
+            resp.status_code = 302
+            resp.headers["Location"] = url
+        else:
+            # Default: never include Location (avoid any redirect-follow behavior).
+            resp.headers.pop("Location", None)
+            # Optional hint headers for debugging (clients ignore these).
+            resp.headers["Content-Location"] = url
+            resp.headers["X-Stream-Location"] = url
+
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["Content-Type"] = "application/octet-stream"
+        resp.headers["Accept-Ranges"] = "bytes"
+        resp.headers["Content-Length"] = "0"
+
+        try:
+            ua = request.headers.get("User-Agent", "")
+            logger.info(
+                "R_PROXY rid=%s method=%s ua_len=%d status=%s head_mode=%s has_loc=%s",
+                _rid(), request.method, len(ua or ""), resp.status_code, head_mode, ("Location" in resp.headers)
+            )
+        except Exception:
+            pass
+        return resp
+
+    # GET: normal redirect to real playback
+    resp = redirect(url, code=302)
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Cache-Control"] = "no-store"
-    resp.headers["Content-Type"] = "application/octet-stream"
-    resp.headers["Accept-Ranges"] = "bytes"
-    resp.headers["Content-Length"] = "0"
+    resp.headers.setdefault("Accept-Ranges", "bytes")
 
-    # High-signal debug for Problem 0 without spamming
     try:
         ua = request.headers.get("User-Agent", "")
         logger.info(
-            "R_PROXY rid=%s method=%s ua_len=%d status=%s has_loc=%s",
-            _rid(), request.method, len(ua or ""), resp.status_code, ("Location" in resp.headers)
+            "R_PROXY rid=%s method=%s ua_len=%d status=%s head_mode=%s has_loc=%s",
+            _rid(), request.method, len(ua or ""), resp.status_code, head_mode, ("Location" in resp.headers)
         )
     except Exception:
         pass
     return resp
+
 def _log_level(v: str) -> int:
     return {
         "DEBUG": logging.DEBUG,
