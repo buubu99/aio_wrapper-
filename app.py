@@ -66,6 +66,8 @@ INPUT_CAP = int(os.environ.get("INPUT_CAP", "4500"))
 MAX_DELIVER = int(os.environ.get("MAX_DELIVER", "80"))
 # Formatting / UI constraints
 REFORMAT_STREAMS = _parse_bool(os.environ.get("REFORMAT_STREAMS", "true"), True)
+OUTPUT_NEW_OBJECT = _parse_bool(os.environ.get("OUTPUT_NEW_OBJECT", "true"), True)  # build brand-new stream objects (safe schema)
+OUTPUT_LEFT_LINES = int(os.environ.get("OUTPUT_LEFT_LINES", "2"))  # UI: 2 lines on left (quality + provider)
 FORCE_ASCII_TITLE = _parse_bool(os.environ.get("FORCE_ASCII_TITLE", "true"), True)
 MAX_TITLE_CHARS = int(os.environ.get("MAX_TITLE_CHARS", "110"))
 MAX_DESC_CHARS = int(os.environ.get("MAX_DESC_CHARS", "180"))
@@ -142,6 +144,12 @@ TORBOX_CACHE_CHECK = _parse_bool(os.environ.get("TORBOX_CACHE_CHECK", "true"), T
 VERIFY_TB_CACHE_OFF = _parse_bool(os.environ.get("VERIFY_TB_CACHE_OFF", "false"), False)
 
 # Wrapper behavior toggles
+
+# Use short opaque /r/<token> urls instead of base64-encoding the full upstream URL.
+# Fixes Android/Google TV URL-length limits and keeps playback URLs private.
+WRAP_URL_SHORT = _parse_bool(os.environ.get("WRAP_URL_SHORT", "true"), True)
+WRAP_URL_TTL = int(os.environ.get("WRAP_URL_TTL", "3600"))  # seconds
+WRAP_HEAD_MODE = (os.environ.get("WRAP_HEAD_MODE", "200_noloc") or "200_noloc").strip().lower()
 WRAPPER_DEDUP = _parse_bool(os.environ.get("WRAPPER_DEDUP", "true"), True)
 
 VERIFY_STREAM = _parse_bool(os.environ.get("VERIFY_STREAM", "true"), True)
@@ -527,15 +535,9 @@ LANG_MAP = {
 # --- Playback URL HEAD workaround (some clients HEAD-check stream URLs) ---
 import base64
 
-WRAP_PLAYBACK_URLS = os.getenv("WRAP_PLAYBACK_URLS", "1").strip() not in ("0", "false", "False")
+WRAP_PLAYBACK_URLS = _parse_bool(os.environ.get("WRAP_PLAYBACK_URLS", "true"), True)
 PLAYBACK_HEAD_WORKAROUND_SUBSTR = os.getenv("PLAYBACK_HEAD_WORKAROUND_SUBSTR", "/api/v1/debrid/playback/")
-# IMPORTANT: emitting `infoHash` in the Stremio stream object makes many clients
-# treat the stream as a BitTorrent/torrent-engine stream. Stremio Desktop can
-# handle that, but Stremio Web / iOS / many Android-TV clients will hide such
-# streams entirely. Since we primarily emit HTTP(S) debrid playback URLs, we
-# default to NOT emitting infoHash.
-WRAP_EMIT_INFOHASH = os.getenv("WRAP_EMIT_INFOHASH", "0").strip() in ("1", "true", "True")
-USENET_PSEUDO_INFOHASH = os.getenv("USENET_PSEUDO_INFOHASH", "0").strip() not in ("0", "false", "False")
+USENET_PSEUDO_INFOHASH = os.getenv("USENET_PSEUDO_INFOHASH", "1").strip() not in ("0", "false", "False")
 WRAP_DEBUG = os.getenv("WRAP_DEBUG", "0").strip() in ("1", "true", "True")
 
 def _pseudo_infohash_usenet(usenet_hash: str) -> str:
@@ -565,13 +567,40 @@ def _b64u_decode(token: str) -> str:
     pad = '=' * (-len(token) % 4)
     return base64.urlsafe_b64decode((token + pad).encode("ascii")).decode("utf-8")
 
+# In-memory short URL map for /r/<token> -> upstream URL
+# Note: With WEB_CONCURRENCY>1, each worker has its own map; keep concurrency=1 for reliability.
+_WRAP_URL_MAP = {}  # token -> (url, expires_epoch)
+_WRAP_URL_LOCK = threading.Lock()
+
+def _wrap_url_store(url: str) -> str:
+    """Store a playback URL and return an opaque short token."""
+    import os, time, base64
+    # 9 random bytes -> 12 chars base64url (no padding)
+    token = base64.urlsafe_b64encode(os.urandom(9)).decode('ascii').rstrip('=')
+    exp = time.time() + max(60, int(WRAP_URL_TTL or 3600))
+    with _WRAP_URL_LOCK:
+        _WRAP_URL_MAP[token] = (url, exp)
+    return token
+
+def _wrap_url_load(token: str) -> Optional[str]:
+    now = time.time()
+    with _WRAP_URL_LOCK:
+        val = _WRAP_URL_MAP.get(token)
+        if not val:
+            return None
+        url, exp = val
+        if exp and now > exp:
+            _WRAP_URL_MAP.pop(token, None)
+            return None
+        return url
+
 def wrap_playback_url(url: str) -> str:
     """Wrap outbound http(s) URLs behind our HEAD-friendly redirector.
 
-    Why: Android/Google TV Stremio often does a HEAD probe first; many upstream playback
-    endpoints return 405 to HEAD, which makes the client discard streams.
+    For Android/Google TV Stremio, keep the stream URL short and HEAD-safe.
 
-    We wrap ANY http(s) URL (unless it is already our /r/ redirect) when enabled.
+    - If WRAP_URL_SHORT=true, we store the upstream URL in an in-memory map and emit /r/<token>.
+    - Otherwise, fall back to base64-encoding the full URL (legacy).
     """
     if not url or not WRAP_PLAYBACK_URLS:
         return url
@@ -584,11 +613,16 @@ def wrap_playback_url(url: str) -> str:
     except Exception:
         pass
     if u.startswith('http://') or u.startswith('https://'):
-        wrapped = _public_base_url() + 'r/' + _b64u_encode(u)
-        if WRAP_DEBUG:
-            logging.getLogger("aio-wrapper").info(f"WRAP_URL -> {wrapped}")
+        if WRAP_URL_SHORT:
+            tok = _wrap_url_store(u)
+            wrapped = _public_base_url() + 'r/' + tok
+        else:
+            wrapped = _public_base_url() + 'r/' + _b64u_encode(u)
+        if 'WRAP_DEBUG' in globals() and WRAP_DEBUG:
+            logging.getLogger('aio-wrapper').info(f'WRAP_URL -> {wrapped}')
         return wrapped
     return u
+
 
 app = Flask(__name__)
 
@@ -689,23 +723,34 @@ def root():
     return "ok", 200
 
 
+
 @app.route("/r/<path:token>", methods=["GET", "HEAD", "OPTIONS"])
 def redirect_stream_url(token: str):
-    """Redirector that is HEAD-friendly.
+    """Redirector used to wrap playback URLs.
 
-    Key behavior:
-    - HEAD returns **302 with Location** (not 200), because some Android/TV clients treat
-      a 200-without-Location as a dead link.
-    - GET returns 302 like a normal redirect.
-    - OPTIONS supports CORS preflight.
+    Key goals for Google TV / Android Stremio:
+    - Keep stream URLs SHORT (avoid URL-length limits) via WRAP_URL_SHORT + in-memory map.
+    - Make HEAD validation succeed WITHOUT causing the client to HEAD the upstream.
 
-    This exists because many upstream playback endpoints return 405 to HEAD, which makes
-    Stremio Android/Google TV discard streams.
+    Behavior controlled by WRAP_HEAD_MODE:
+      - 200_noloc (recommended): HEAD=200, no Location
+      - 200_loc:               HEAD=200, include Location hint
+      - 302:                   HEAD=302 redirect (not recommended)
+
+    GET always returns 302 Location to the real upstream playback URL.
     """
-    try:
-        url = _b64u_decode(token)
-    except Exception:
-        return ("", 400)
+    # Resolve token -> upstream URL
+    url = None
+    if WRAP_URL_SHORT:
+        url = _wrap_url_load(token)
+    if not url:
+        # Legacy: token may be base64 of the full URL
+        try:
+            url = _b64u_decode(token)
+        except Exception:
+            url = None
+    if not url:
+        return ("", 404)
 
     if request.method == "OPTIONS":
         resp = make_response("", 204)
@@ -715,27 +760,46 @@ def redirect_stream_url(token: str):
         resp.headers["Access-Control-Max-Age"] = "86400"
         return resp
 
-    # IMPORTANT (Google TV / Android): many clients HEAD-check stream URLs and discard links
-    # unless the HEAD is redirect-like. We therefore return a redirect for BOTH HEAD and GET.
-    # If an upstream doesn't support HEAD, this wrapper prevents the client from probing upstream.
-    resp = make_response("", 302)
-    resp.headers["Location"] = url
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["Content-Type"] = "application/octet-stream"
-    resp.headers["Accept-Ranges"] = "bytes"
-    resp.headers["Content-Length"] = "0"
-    
-    # High-signal debug for Problem 0 without spamming
+    # Common headers
+    def _base(resp: Response) -> Response:
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["Content-Type"] = "application/octet-stream"
+        resp.headers["Accept-Ranges"] = "bytes"
+        resp.headers["Content-Length"] = "0"
+        return resp
+
+    if request.method == "HEAD":
+        mode = (WRAP_HEAD_MODE or "200_noloc").lower()
+        if mode == "302":
+            resp = make_response("", 302)
+            resp.headers["Location"] = url
+        else:
+            resp = make_response("", 200)
+            # Do NOT set Location unless explicitly requested
+            if mode == "200_loc":
+                resp.headers["Location"] = url
+            # Safe hint headers (do not trigger redirect logic)
+            resp.headers["X-Head-Bypass"] = "1"
+            resp.headers["X-Stream-Location"] = url
+        resp = _base(resp)
+    else:
+        # GET: real playback
+        resp = make_response("", 302)
+        resp.headers["Location"] = url
+        resp = _base(resp)
+
+    # High-signal debug
     try:
         ua = request.headers.get("User-Agent", "")
         logger.info(
-            "R_PROXY rid=%s method=%s ua_len=%d status=%s has_loc=%s",
-            _rid(), request.method, len(ua or ""), resp.status_code, True
+            "R_PROXY rid=%s method=%s ua_len=%d status=%s tok_len=%d short=%s",
+            _rid(), request.method, len(ua or ""), resp.status_code, len(token or ""), bool(WRAP_URL_SHORT)
         )
     except Exception:
         pass
     return resp
+
 
 def _log_level(v: str) -> int:
     return {
@@ -1052,15 +1116,6 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
             infohash = ih
             hash_src = "desc"
 
-    # IMPORTANT: Stremio Web / iOS / many Android-TV clients will hide streams
-    # that include `infoHash` (they're treated as torrent-engine streams).
-    # For HTTP(S) debrid playback URLs, we default to *not* emitting infoHash.
-    if WRAP_EMIT_INFOHASH:
-        if infohash and not s.get('infoHash'):
-            s['infoHash'] = infohash
-    else:
-        s.pop('infoHash', None)
-
     # Optional Usenet identifier (only used if TB_USENET_CHECK=true).
     bh = s.get("behaviorHints", {}) or {}
     usenet_hash = ""
@@ -1192,18 +1247,14 @@ def format_stream_inplace(
     # Ensure machine-visible hints are present for downstream (Stremio UI + other tools)
     bh = s.setdefault('behaviorHints', {})
     ih = (m.get('infohash') or '').strip().lower()
-    if WRAP_EMIT_INFOHASH:
-        if ih and not s.get('infoHash'):
-            s['infoHash'] = ih
-        elif USENET_PSEUDO_INFOHASH and not s.get('infoHash'):
-            uh = (m.get('usenet_hash') or '').strip().lower()
-            pseudo = _pseudo_infohash_usenet(uh) if uh else ''
-            if pseudo:
-                s['infoHash'] = pseudo
-                bh['usenetHash'] = uh
-    else:
-        # Force-remove any upstream infoHash to keep streams web/iOS friendly.
-        s.pop('infoHash', None)
+    if ih and not s.get('infoHash'):
+        s['infoHash'] = ih
+    elif USENET_PSEUDO_INFOHASH and not s.get('infoHash'):
+        uh = (m.get('usenet_hash') or '').strip().lower()
+        pseudo = _pseudo_infohash_usenet(uh) if uh else ''
+        if pseudo:
+            s['infoHash'] = pseudo
+            bh['usenetHash'] = uh
 
 
     bh['provider'] = prov
@@ -1229,6 +1280,291 @@ def format_stream_inplace(
 # ---------------------------
 # Fetch streams
 # ---------------------------
+def _quality_label(res: str) -> tuple[str, str]:
+    r = (res or "").upper().strip()
+    if r in ("4K", "2160", "2160P", "2160P+", "UHD"):
+        return "🔥", "4K UHD"
+    if r in ("1440P", "1440"):
+        return "💎", "1440p"
+    if r in ("1080P", "1080"):
+        return "✨", "1080p"
+    if r in ("720P", "720"):
+        return "📺", "720p"
+    if r in ("480P", "480"):
+        return "📼", "480p"
+    return "📼", "SD"
+
+def _svc_label_and_dot(provider: str) -> tuple[str, str]:
+    p = (provider or "UNK").upper().strip()
+    # Service supplier label (what you pay for): TB/RD/AD; usenet collapses to NZB
+    if p in ("TB", "TORBOX"):
+        return "TB", "🟢"
+    if p in ("RD", "REALDEBRID"):
+        return "RD", "🔴"
+    if p in ("AD", "ALLDEBRID"):
+        return "AD", "🟡"
+    if p in ("PM", "PREMIUMIZE"):
+        return "PM", "🟠"
+    if p in ("DL", "DEBRIDLINK"):
+        return "DL", "🟤"
+    if p in ("ND", "NZBDAV", "EW", "EWEKA", "NG", "NZGEEK"):
+        return "NZB", "🟣"
+    return p, "⚪"
+
+def _extract_addon_label(raw_name: str, res: str = "") -> str:
+    n = (raw_name or "").strip()
+    if not n:
+        return ""
+    # Strip bracket tags like "[TB⚡]" and leading emoji noise
+    n = re.sub(r"^\s*[^\w\[]*\s*", "", n)
+    n = re.sub(r"\[[^\]]+\]\s*", "", n)
+    # Drop trailing resolution token if present
+    r = (res or "").upper().replace("P", "p")
+    n = re.sub(r"\b(2160p|1080p|720p|480p|4k)\b", "", n, flags=re.I).strip()
+    # Collapse extra spaces
+    n = re.sub(r"\s{2,}", " ", n).strip()
+    # Keep it short for left column
+    if len(n) > 26:
+        n = n[:25].rstrip() + "…"
+    return n
+
+def _extract_flag_emojis(text: str) -> list[str]:
+    if not text:
+        return []
+    # Country flags are pairs of regional indicator symbols
+    flags = re.findall(r"[\U0001F1E6-\U0001F1FF]{2}", text)
+    out = []
+    seen = set()
+    for f in flags:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
+
+def _detect_tokens(text: str) -> Dict[str, Any]:
+    t = (text or "").lower()
+    # Video flags
+    hdr10p = "hdr10+" if "hdr10+" in t else ""
+    hdr10 = "hdr10" if ("hdr10" in t and "hdr10+" not in t) else ""
+    dv = "DV" if ("dolby vision" in t or re.search(r"\bdv\b", t)) else ""
+    hdr = "HDR" if ("hdr" in t) else ""
+    if hdr10p:
+        hdr = "HDR"  # keep HDR too
+    bit10 = "10bit" if ("10bit" in t or "10-bit" in t) else ""
+    remux = True if "remux" in t else False
+
+    # Audio tokens
+    audio = []
+    for tok, nice in [
+        ("atmos", "Atmos"),
+        ("truehd", "TrueHD"),
+        ("dts-hd", "DTS-HD"),
+        ("dts hd", "DTS-HD"),
+        ("dts", "DTS"),
+        ("ddp", "DD+"),
+        ("dd+", "DD+"),
+        ("eac3", "DD+"),
+        ("aac", "AAC"),
+        ("ac3", "AC3"),
+        ("flac", "FLAC"),
+    ]:
+        if tok in t and nice not in audio:
+            audio.append(nice)
+
+    ch = ""
+    m = re.search(r"\b(7\.1|5\.1|2\.0)\b", t)
+    if m:
+        ch = m.group(1)
+
+    # Languages: keep simple + pass through any flag emojis
+    lang_words = []
+    for w, nice in [
+        ("multi", "Multi"),
+        ("dual", "Dual Audio"),
+        ("english", "English"),
+        ("italian", "Italian"),
+        ("french", "French"),
+        ("spanish", "Spanish"),
+        ("german", "German"),
+        ("polish", "Polish"),
+        ("russian", "Russian"),
+        ("ukrain", "Ukrainian"),
+        ("hindi", "Hindi"),
+        ("japan", "Japanese"),
+        ("korean", "Korean"),
+        ("thai", "Thai"),
+    ]:
+        if w in t and nice not in lang_words:
+            lang_words.append(nice)
+
+    return {
+        "hdr10p": hdr10p,
+        "hdr10": hdr10,
+        "dv": dv,
+        "hdr": hdr,
+        "bit10": bit10,
+        "remux": remux,
+        "audio": audio,
+        "channels": ch,
+        "lang_words": lang_words,
+    }
+
+def _fmt_gb(size_bytes: Any) -> str:
+    try:
+        b = int(size_bytes)
+        if b <= 0:
+            return ""
+        gb = b / (1024 ** 3)
+        if gb >= 1:
+            return f"{gb:.2f} GB".rstrip('0').rstrip('.')
+        mb = b / (1024 ** 2)
+        return f"{mb:.0f} MB"
+    except Exception:
+        return ""
+
+def build_stream_object_rich(
+    raw_s: Dict[str, Any],
+    m: Dict[str, Any],
+    expected: Dict[str, Any],
+    out_url: str,
+    is_confirmed: bool,
+    cached_hint: str,
+    type_: str = "",
+    season: Optional[int] = None,
+    episode: Optional[int] = None,
+) -> Dict[str, Any]:
+    # Brand-new stream object for strict clients: only {name, description, url, behaviorHints}
+    raw_name = raw_s.get("name", "") or ""
+    raw_desc = raw_s.get("description", "") or ""
+    raw_bh = raw_s.get("behaviorHints") or {}
+
+    # Title (English) + year
+    title = (expected or {}).get("title") or m.get("title_raw") or ""
+    year = (expected or {}).get("year")
+    if type_ == "series" and season and episode:
+        se = f"S{int(season):02d}E{int(episode):02d}"
+    else:
+        se = ""
+    title_line = title.strip()
+    if year:
+        title_line = f"{title_line} ({year})" if title_line else f"({year})"
+    if se:
+        title_line = f"{title_line} {se}".strip()
+
+    # Left (2 lines): quality + supplier/provider
+    q_emoji, q_label = _quality_label(m.get("res") or "")
+    svc, dot = _svc_label_and_dot(m.get("provider") or "")
+    addon = _extract_addon_label(raw_name, m.get("res") or "")
+
+    cache_mark = "⚡" if (is_confirmed or (cached_hint or "").upper() == "LIKELY") else ""
+    # Keep addon label on the left if present
+    left2 = f"{dot}{svc}{cache_mark}" + (f" {addon}" if addon else "")
+    left1 = f"{q_emoji}{q_label}"
+    name = f"{left1}\n{left2}" if OUTPUT_LEFT_LINES >= 2 else left1
+
+    # Right (3–4 lines): rich but schema-safe
+    blob = f"{raw_name}\n{raw_desc}\n{raw_bh.get('filename','')}"
+    tok = _detect_tokens(blob)
+    flags = _extract_flag_emojis(blob)
+
+    # Line 1: title
+    parts = []
+    if title_line:
+        parts.append(f"🎬 {title_line}")
+    # Line 2: source/codec/video flags
+    src = (m.get("source") or "").upper().strip()
+    if tok["remux"] and "REMUX" not in src:
+        src = (src + " REMUX").strip()
+    codec = (m.get("codec") or "").upper().strip()
+    line2 = ""
+    vflags = []
+    if tok["hdr10p"]:
+        vflags.append("HDR10+")
+    if tok["hdr10"]:
+        vflags.append("HDR10")
+    if tok["dv"]:
+        vflags.append("DV")
+    if tok["hdr"]:
+        # avoid duplicating HDR when only HDR10/HDR10+ present; keep as generic marker too
+        if "HDR" not in vflags:
+            vflags.append("HDR")
+    if tok["bit10"]:
+        vflags.append("10bit")
+    vflag_txt = ("📺 " + " | ".join(vflags)) if vflags else ""
+    if src or codec or vflag_txt:
+        line2 = " ".join([x for x in [("🎥 " + src) if src else "", ("🎞️ " + codec) if codec else "", vflag_txt] if x]).strip()
+        if line2:
+            parts.append(line2)
+
+    # Line 3: audio + langs
+    audio_bits = []
+    if tok["audio"]:
+        audio_bits.append("🎧 " + " | ".join(tok["audio"]))
+    if tok["channels"]:
+        audio_bits.append("🔊 " + tok["channels"])
+    lang_bits = []
+    # Prefer explicit flags if present
+    if flags:
+        lang_bits.append(" / ".join(flags))
+    elif tok["lang_words"]:
+        lang_bits.append(" | ".join(tok["lang_words"]))
+    if lang_bits:
+        audio_bits.append("🗣️ " + " / ".join(lang_bits))
+    if audio_bits:
+        parts.append(" ".join(audio_bits).strip())
+
+    # Line 4: size + seeders + group + readiness + addon/indexer
+    size_txt = _fmt_gb(m.get("size"))
+    seed = m.get("seeders") or 0
+    group = (m.get("group") or "").strip()
+    line4_parts = []
+    if size_txt:
+        line4_parts.append(f"📦 {size_txt}")
+    if isinstance(seed, int) and seed > 0:
+        line4_parts.append(f"👥 {seed}")
+    if group:
+        line4_parts.append(f"🏷️ {group}")
+
+    ready_txt = ""
+    if svc in ("TB", "RD", "AD", "PM", "DL", "NZB"):
+        ready_txt = f"⚡Ready ({svc})" if (is_confirmed or (cached_hint or '').upper() == 'LIKELY') else f"⏳Unchecked ({svc})"
+        line4_parts.append(ready_txt)
+
+    prox = "⛊ Proxied" if WRAP_PLAYBACK_URLS else "🔓 Not Proxied"
+    line4_parts.append(prox)
+
+    # Try to surface the upstream addon/indexer name (Comet/Torrentio/StremThru/etc.)
+    if addon:
+        line4_parts.append(f"🔍 {addon}")
+
+    if line4_parts:
+        parts.append(" ".join(line4_parts).strip())
+
+    # Keep 3–4 lines max (UI friendly)
+    description = "\n".join(parts[:4]).strip()
+
+    # behaviorHints: keep ONLY known-safe keys (strict clients)
+    bh_out: Dict[str, Any] = {}
+    def _copy_bh_key(k: str, types: tuple[type, ...]):
+        v = raw_bh.get(k)
+        if isinstance(v, types):
+            bh_out[k] = v
+
+    _copy_bh_key("filename", (str,))
+    _copy_bh_key("videoSize", (int, float))
+    _copy_bh_key("videoHash", (str,))
+    _copy_bh_key("bingeGroup", (str,))
+    # If subtitles is a list/dict, keep it (Stremio uses it sometimes)
+    v_sub = raw_bh.get("subtitles")
+    if isinstance(v_sub, (list, dict)):
+        bh_out["subtitles"] = v_sub
+
+    return {
+        "name": name,
+        "description": description,
+        "url": out_url,
+        "behaviorHints": bh_out,
+    }
 def _auth_headers(auth: str) -> Dict[str, str]:
     headers: Dict[str, str] = {}
     if not auth:
@@ -1779,27 +2115,47 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # Format (last step)
     delivered: List[Dict[str, Any]] = []
     for s, m in candidates[:deliver_cap_eff]:
-        h = (m.get('infohash') or '').lower().strip()
-        cached_marker = m.get('cached')
+        h = (m.get("infohash") or "").lower().strip()
+        cached_marker = m.get("cached")
         is_confirmed = (cached_marker is True) or (h and cached_map.get(h, False) is True)
-        cached_hint = 'CACHED' if is_confirmed else ''
-        if ADD_CACHE_HINT and not cached_hint:
-            if cached_marker == 'LIKELY' or _looks_instant((s.get('name','') or '') + ' ' + (s.get('description','') or '')):
-                cached_hint = 'LIKELY'
-        # Always surface provider/cached in behaviorHints (even if reformat disabled)
-        bh = s.setdefault("behaviorHints", {})
-        bh.setdefault("provider", (m.get("provider") or "UNK").upper())
-        if m.get("infohash"):
-            if isinstance(cached_marker, bool):
-                bh.setdefault("cached", cached_marker)
-        elif cached_hint == "LIKELY":
-            bh.setdefault("cached", "LIKELY")
-        if REFORMAT_STREAMS:
-            format_stream_inplace(s, m, expected, cached_hint, type_, season, episode)
-        if WRAP_PLAYBACK_URLS and isinstance(s.get("url"), str) and s.get("url"):
-            s["url"] = wrap_playback_url(s["url"])
-        delivered.append(s)
 
+        cached_hint = "CACHED" if is_confirmed else ""
+        if ADD_CACHE_HINT and not cached_hint:
+            if cached_marker == "LIKELY" or _looks_instant((s.get("name", "") or "") + " " + (s.get("description", "") or "")):
+                cached_hint = "LIKELY"
+
+        raw_url = s.get("url") or s.get("externalUrl") or ""
+        out_url = raw_url
+        if WRAP_PLAYBACK_URLS and isinstance(raw_url, str) and raw_url:
+            out_url = wrap_playback_url(raw_url)
+
+        if OUTPUT_NEW_OBJECT:
+            delivered.append(
+                build_stream_object_rich(
+                    raw_s=s,
+                    m=m,
+                    expected=expected,
+                    out_url=out_url,
+                    is_confirmed=is_confirmed,
+                    cached_hint=cached_hint,
+                    type_=type_,
+                    season=season,
+                    episode=episode,
+                )
+            )
+        else:
+            # Legacy behavior (kept as a safety switch)
+            bh = s.setdefault("behaviorHints", {})
+            bh.setdefault("provider", (m.get("provider") or "UNK").upper())
+            if m.get("infohash"):
+                if isinstance(cached_marker, bool):
+                    bh.setdefault("cached", cached_marker)
+            elif cached_hint == "LIKELY":
+                bh.setdefault("cached", "LIKELY")
+            if REFORMAT_STREAMS:
+                format_stream_inplace(s, m, expected, cached_hint, type_, season, episode)
+            s["url"] = out_url
+            delivered.append(s)
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(f"DELIVERED_TOP5 rid={_rid()} count={len(delivered)}")
         for i, _s in enumerate(delivered[:5]):
@@ -1821,9 +2177,9 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.10",
-            "name": "AIO Wrapper (Unified 2 Providers) 8.9.1",
-            "description": "Unified 2 providers into one stream list with hardened normalization + strict Stremio formatting. Adds premium-first sorting, optional title similarity gate, prettier labels with emojis, WebDAV strict TB drop, heuristic caching for RD/AD, dedup enhancement. VALIDATE_OFF bypass supported.",
+            "version": "1.0.11",
+            "name": "AIO Wrapper (Rich Output, 2 Lines Left) 9.0",
+            "description": "Merges 2 providers and outputs a brand-new, strict-client-safe stream schema with rich AIOStreams-style emoji formatting (2-line left column).",
             "resources": ["stream"],
             "types": ["movie", "series"],
             "catalogs": [],
