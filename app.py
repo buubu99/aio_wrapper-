@@ -59,8 +59,12 @@ PROV2_URL = os.environ.get("PROV2_URL", "")
 PROV2_BASE = _normalize_base(os.environ.get("PROV2_BASE", "") or PROV2_URL)
 PROV2_AUTH = os.environ.get("PROV2_AUTH", "")  # 'user:pass' for Basic auth if needed
 PROV2_TAG = os.environ.get("PROV2_TAG", "P2")
-ANDROID_FAST = _parse_bool(os.environ.get("ANDROID_FAST", "true"), True)
+ANDROID_FAST = _parse_bool(os.environ.get("ANDROID_FAST", "false"), False)
 ANDROID_FAST_TIMEOUT = float(os.environ.get("ANDROID_FAST_TIMEOUT", "4.0"))
+ANDROID_AIO_TIMEOUT = float(os.environ.get("ANDROID_AIO_TIMEOUT", "6.0"))  # allow slow AIO (debrid) on Android
+ANDROID_P2_TIMEOUT  = float(os.environ.get("ANDROID_P2_TIMEOUT",  "2.5"))  # keep usenet/prov2 from blowing Android time budget
+ANDROID_NO_RETRY    = _parse_bool(os.environ.get("ANDROID_NO_RETRY", "true"), True)
+
 ANDROID_MAX_DELIVER = int(os.environ.get("ANDROID_MAX_DELIVER", "60"))
 INPUT_CAP = int(os.environ.get("INPUT_CAP", "4500"))
 MAX_DELIVER = int(os.environ.get("MAX_DELIVER", "80"))
@@ -890,6 +894,33 @@ fast_session.mount("https://", fast_adapter)
 # ---------------------------
 _rate_buckets: dict[str, deque] = defaultdict(deque)
 
+def finalize_streams_for_client(streams: List[Dict[str, Any]], is_android: bool) -> List[Dict[str, Any]]:
+    """Final guardrail: Android/TV core can drop *all* results if any stream is malformed."""
+    cleaned: List[Dict[str, Any]] = []
+    if not streams:
+        return cleaned
+    for s in streams:
+        if not isinstance(s, dict):
+            continue
+        url = s.get('url')
+        if not isinstance(url, str) or not url.strip():
+            continue
+        # Android/TV can't use magnet URLs; keep only playable HTTP(S) links.
+        if is_android and url.startswith('magnet:'):
+            continue
+        # Ensure absolute URLs (some clients don't resolve relative paths).
+        if url.startswith('/'):
+            url = f"{BASE_URL}{url}"
+        s['url'] = url
+        if is_android:
+            # Collapse newlines/whitespace for maximum client compatibility.
+            for k in ('name', 'title', 'description'):
+                v = s.get(k)
+                if isinstance(v, str):
+                    s[k] = ' '.join(v.split())
+        cleaned.append(s)
+    return cleaned
+
 def _parse_rate_limit(limit: str) -> tuple[int, int]:
     s = (limit or '').strip().lower()
     m = re.match(r'^(\d+)\s*/\s*(second|sec|minute|min|hour|hr)$', s)
@@ -1613,7 +1644,7 @@ def get_streams_single(base: str, auth: str, type_: str, id_: str, tag: str, tim
     ms = int((time.time() - t0) * 1000)
     return streams, len(streams), ms
 
-def get_streams(type_: str, id_: str) -> Tuple[List[Dict[str, Any]], int, int, int, int]:
+def get_streams(type_: str, id_: str, *, aio_timeout: float = REQUEST_TIMEOUT, p2_timeout: float = REQUEST_TIMEOUT, aio_no_retry: bool = False, p2_no_retry: bool = False) -> Tuple[List[Dict[str, Any]], int, int, int, int]:
     """Fetch both providers in parallel (best-effort) and return merged streams + counts."""
     s1: List[Dict[str, Any]] = []
     s2: List[Dict[str, Any]] = []
@@ -1624,10 +1655,10 @@ def get_streams(type_: str, id_: str) -> Tuple[List[Dict[str, Any]], int, int, i
     tasks = []
     with ThreadPoolExecutor(max_workers=2) as ex:
         t_aio0 = time.time()
-        tasks.append(("AIO", t_aio0, ex.submit(_fetch_streams_from_base, AIO_BASE, AIOSTREAMS_AUTH, type_, id_, 'AIO')))
+        tasks.append(("AIO", t_aio0, ex.submit(_fetch_streams_from_base, AIO_BASE, AIOSTREAMS_AUTH, type_, id_, 'AIO', timeout=aio_timeout, no_retry=aio_no_retry)))
         if PROV2_BASE:
             t_p20 = time.time()
-            tasks.append(("P2", t_p20, ex.submit(_fetch_streams_from_base, PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG)))
+            tasks.append(("P2", t_p20, ex.submit(_fetch_streams_from_base, PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG, timeout=p2_timeout, no_retry=p2_no_retry)))
 
         for tag, t_start, fut in tasks:
             try:
@@ -2237,7 +2268,7 @@ def stream(type_: str, id_: str):
     try:
         # Android quick path: prefer Viren/P2 only, skip TMDB/TorBox, return fast.
         # Some Android/TV clients appear to HEAD-check stream URLs; we also wrap playback URLs elsewhere.
-        if is_android and ANDROID_FAST and PROV2_BASE:
+        if is_android and ANDROID_FAST and (not _parse_bool(os.environ.get('ANDROID_FORCE_FULL', 'true'), True)) and PROV2_BASE:
             streams = []
             prov2_in = 0
             ms_p2 = 0
@@ -2281,9 +2312,16 @@ def stream(type_: str, id_: str):
                 cached = cache_get(cache_key)
                 if cached:
                     out = cached
-            return jsonify({"streams": out}), 200
+            out = finalize_streams_for_client(out, is_android)
+            return jsonify({'streams': out, 'cacheMaxAge': CACHE_TTL}), 200
 
-        streams, aio_in, prov2_in, ms_aio, ms_p2 = get_streams(type_, id_)
+        streams, aio_in, prov2_in, ms_aio, ms_p2 = get_streams(
+            type_, id_,
+            aio_timeout=(ANDROID_AIO_TIMEOUT if is_android else REQUEST_TIMEOUT),
+            p2_timeout=(ANDROID_P2_TIMEOUT if is_android else REQUEST_TIMEOUT),
+            aio_no_retry=(ANDROID_NO_RETRY if is_android else False),
+            p2_no_retry=(ANDROID_NO_RETRY if is_android else False),
+        )
         stats.aio_in = aio_in
         stats.prov2_in = prov2_in
         stats.ms_fetch_aio = ms_aio
@@ -2296,7 +2334,8 @@ def stream(type_: str, id_: str):
             cached = cache_get(cache_key)
             if cached:
                 out = cached
-        return jsonify({"streams": out}), 200
+        out = finalize_streams_for_client(out, is_android)
+        return jsonify({'streams': out, 'cacheMaxAge': CACHE_TTL}), 200
     except Exception as e:
         logger.exception(f"Stream error: {e}")
         cached = cache_get(f"{type_}:{id_}")
