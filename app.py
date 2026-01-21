@@ -12,7 +12,7 @@ import difflib
 import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 import requests
@@ -31,23 +31,6 @@ def _parse_bool(v: str, default: bool = False) -> bool:
     if s in ("0","false","no","n","off"):
         return False
     return default
-
-# Build tag shown in /health to confirm which code is deployed
-BUILD_TAG = os.environ.get("BUILD_TAG", "no_fastpass_fixed_final_v2")
-
-def envfloat(name: str, default: float, min_v: float | None = None, max_v: float | None = None) -> float:
-    """Read an environment variable as float with optional clamping."""
-    raw = os.environ.get(name, "")
-    try:
-        v = float(raw) if raw.strip() != "" else float(default)
-    except Exception:
-        v = float(default)
-    if min_v is not None:
-        v = max(float(min_v), v)
-    if max_v is not None:
-        v = min(float(max_v), v)
-    return v
-
 
 def _normalize_base(raw: str) -> str:
     raw = (raw or "").strip()
@@ -76,8 +59,13 @@ PROV2_URL = os.environ.get("PROV2_URL", "")
 PROV2_BASE = _normalize_base(os.environ.get("PROV2_BASE", "") or PROV2_URL)
 PROV2_AUTH = os.environ.get("PROV2_AUTH", "")  # 'user:pass' for Basic auth if needed
 PROV2_TAG = os.environ.get("PROV2_TAG", "P2")
-ANDROID_MAX_DELIVER = int(os.environ.get("ANDROID_MAX_DELIVER", "60"))
+ANDROID_FAST = _parse_bool(os.environ.get("ANDROID_FAST", "false"), False)
+ANDROID_FAST_TIMEOUT = float(os.environ.get("ANDROID_FAST_TIMEOUT", "4.0"))
+ANDROID_AIO_TIMEOUT = float(os.environ.get("ANDROID_AIO_TIMEOUT", "6.0"))  # allow slow AIO (debrid) on Android
+ANDROID_P2_TIMEOUT  = float(os.environ.get("ANDROID_P2_TIMEOUT",  "2.5"))  # keep usenet/prov2 from blowing Android time budget
+ANDROID_NO_RETRY    = _parse_bool(os.environ.get("ANDROID_NO_RETRY", "true"), True)
 
+ANDROID_MAX_DELIVER = int(os.environ.get("ANDROID_MAX_DELIVER", "60"))
 INPUT_CAP = int(os.environ.get("INPUT_CAP", "4500"))
 MAX_DELIVER = int(os.environ.get("MAX_DELIVER", "80"))
 # Formatting / UI constraints
@@ -106,23 +94,7 @@ TB_MAX_HASHES = int(os.environ.get("TB_MAX_HASHES", "60"))  # limit hashes check
 TB_API_MIN_HASHES = int(os.environ.get("TB_API_MIN_HASHES", "20"))  # skip TorBox API calls if fewer hashes
 TB_CACHE_HINTS = _parse_bool(os.environ.get("TB_CACHE_HINTS", "true"), True)  # enable TorBox cache hint lookups
 TB_USENET_CHECK = _parse_bool(os.environ.get("TB_USENET_CHECK", "false"), False)  # optional usenet cache checks (requires identifiers)
-REQUEST_TIMEOUT = envfloat("REQUEST_TIMEOUT", 30.0, min_v=5.0, max_v=30.0)
-# Stream response cache TTL exposed to Stremio clients (seconds)
-CACHE_TTL = int(envfloat("CACHE_TTL", 600.0, min_v=60.0, max_v=86400.0))
-
-# Client-side time budgets (seconds). These are upper bounds; we return as soon as we have results.
-ANDROID_STREAM_TIMEOUT = envfloat("ANDROID_STREAM_TIMEOUT", 12.0, min_v=2.0, max_v=12.0)
-DESKTOP_STREAM_TIMEOUT = envfloat("DESKTOP_STREAM_TIMEOUT", 25.0, min_v=3.0, max_v=25.0)
-
-# Upstream fetch timeouts (seconds) used inside /stream.
-# We keep P2 tighter because it can hang and trigger Gunicorn worker aborts if retries are enabled.
-ANDROID_AIO_TIMEOUT = envfloat("ANDROID_AIO_TIMEOUT", 10.0, min_v=2.0, max_v=10.0)
-ANDROID_P2_TIMEOUT = envfloat("ANDROID_P2_TIMEOUT", 6.0, min_v=1.0, max_v=8.0)
-DESKTOP_AIO_TIMEOUT = envfloat("DESKTOP_AIO_TIMEOUT", 20.0, min_v=2.0, max_v=20.0)
-DESKTOP_P2_TIMEOUT = envfloat("DESKTOP_P2_TIMEOUT", 12.0, min_v=1.0, max_v=12.0)
-
-# TorBox API call timeout (seconds) used during cache checks.
-TB_API_TIMEOUT = float(os.environ.get("TB_API_TIMEOUT", "8"))
+REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "30"))
 TMDB_TIMEOUT = float(os.environ.get("TMDB_TIMEOUT", "8"))
 # TMDB for metadata
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
@@ -165,7 +137,7 @@ DEPRIORITIZE_RD = _parse_bool(os.environ.get("DEPRIORITIZE_RD", "false"), False)
 DROP_RD = _parse_bool(os.environ.get("DROP_RD", "false"), False)
 DROP_AD = _parse_bool(os.environ.get("DROP_AD", "false"), False)
 
-MIN_RES = max(int(os.environ.get("MIN_RES", "1080")), 1080)  # hard floor: never below 1080
+MIN_RES = int(os.environ.get("MIN_RES", "1080"))  # e.g. 720, 1080, 2160
 MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", "0"))  # 0 = off
 USE_AGE_HEURISTIC = _parse_bool(os.environ.get("USE_AGE_HEURISTIC", "true"), True)
 
@@ -186,14 +158,6 @@ WRAPPER_DEDUP = _parse_bool(os.environ.get("WRAPPER_DEDUP", "true"), True)
 
 VERIFY_STREAM = _parse_bool(os.environ.get("VERIFY_STREAM", "true"), True)
 VERIFY_STREAM_TIMEOUT = float(os.environ.get("VERIFY_STREAM_TIMEOUT", "4"))
-
-# Stronger playback verification (catches upstream /static/500.mp4 placeholders)
-VERIFY_RANGE = _parse_bool(os.environ.get("VERIFY_RANGE", "true"), True)
-VERIFY_DROP_STATIC_500 = _parse_bool(os.environ.get("VERIFY_DROP_STATIC_500", "true"), True)
-VERIFY_MIN_TOTAL_BYTES = int(os.environ.get("VERIFY_MIN_TOTAL_BYTES", "5000000"))  # 5MB floor
-ANDROID_VERIFY_TOP_N = int(os.environ.get("ANDROID_VERIFY_TOP_N", "12"))
-ANDROID_VERIFY_TIMEOUT = envfloat("ANDROID_VERIFY_TIMEOUT", 8.0, min_v=1.0, max_v=8.0)
-
 
 # Force a minimum share of usenet results (if they exist)
 MIN_USENET_KEEP = int(os.environ.get("MIN_USENET_KEEP", "3"))
@@ -384,23 +348,7 @@ def _load_fakes_db() -> set:
     return hashes
 
 
-def _parse_content_range_total(cr: Optional[str]) -> Optional[int]:
-    # Example: "bytes 0-0/16440"
-    if not cr or "/" not in cr:
-        return None
-    try:
-        total = cr.split("/")[-1].strip()
-        return int(total) if total.isdigit() else None
-    except Exception:
-        return None
-
-
-def _looks_like_static_500(url: str) -> bool:
-    u = (url or "").lower()
-    return "500.mp4" in u and "/static/" in u
-
-
-def _verify_stream_url(s: Dict[str, Any], timeout: Optional[float] = None, range_mode: Optional[bool] = None) -> bool:
+def _verify_stream_url(s: Dict[str, Any]) -> bool:
     # Keep this cheap: allow magnets and stremio://
     url = (s.get('url') or '').strip()
     if not url:
@@ -409,30 +357,10 @@ def _verify_stream_url(s: Dict[str, Any], timeout: Optional[float] = None, range
         return True
     if not (url.startswith('http://') or url.startswith('https://')):
         return True
-
-    t = VERIFY_STREAM_TIMEOUT if timeout is None else timeout
-    rm = VERIFY_RANGE if range_mode is None else range_mode
-
     try:
-        if rm:
-            r = session.get(
-                url,
-                headers={'Range': 'bytes=0-0', 'User-Agent': ''},
-                timeout=t,
-                allow_redirects=True,
-                stream=True,
-            )
-            final_url = getattr(r, 'url', '') or ''
-            if VERIFY_DROP_STATIC_500 and _looks_like_static_500(final_url):
-                return False
-            total = _parse_content_range_total(r.headers.get('Content-Range'))
-            if total is not None and total < VERIFY_MIN_TOTAL_BYTES:
-                return False
-            return 200 <= r.status_code < 400
-
-        r = session.head(url, timeout=t, allow_redirects=True, headers={'User-Agent': ''})
+        r = session.head(url, timeout=VERIFY_STREAM_TIMEOUT, allow_redirects=True)
         if r.status_code in (405, 403, 401):
-            r = session.get(url, timeout=t, stream=True, allow_redirects=True, headers={'User-Agent': ''})
+            r = session.get(url, timeout=VERIFY_STREAM_TIMEOUT, stream=True)
         return 200 <= r.status_code < 400
     except Exception:
         return False
@@ -462,7 +390,7 @@ def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
         batch = hashes[i:i+TB_BATCH_SIZE]
         try:
             # TorBox `format` supports "object" or "list" ("list" is fastest). Using "hash" causes a 400.
-            r = session.post(url, params={'format': 'list', 'list_files': '0'}, json={'hashes': batch}, headers=headers, timeout=TB_API_TIMEOUT)
+            r = session.post(url, params={'format': 'list', 'list_files': '0'}, json={'hashes': batch}, headers=headers, timeout=REQUEST_TIMEOUT)
             if r.status_code != 200:
                 continue
             data = r.json()
@@ -511,7 +439,7 @@ def tb_get_usenet_cached(hashes: List[str]) -> Dict[str, bool]:
             # Swagger/Postman show `hash` as the repeated query parameter; `format=list` returns the cached hashes.
             params = [('format', 'list')]
             params.extend([('hash', h) for h in batch])
-            r = session.get(url, params=params, headers=headers, timeout=TB_API_TIMEOUT)
+            r = session.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
             if r.status_code != 200:
                 continue
             data = r.json() if r.content else {}
@@ -924,7 +852,7 @@ def is_android_client() -> bool:
 
     IMPORTANT: Some Android TV / Google TV Stremio builds send an empty User-Agent
     (it shows up as '-' in some access logs). Treat empty UA as Android/TV so
-    we apply Android/TV-friendly time budgets and avoid client-side timeouts.
+    we take the fast path and avoid client-side timeouts.
     """
     ua = request.headers.get("User-Agent", "") if has_request_context() else ""
     ua_l = (ua or "").strip().lower()
@@ -954,7 +882,7 @@ adapter = HTTPAdapter(max_retries=retry)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
 
-# No-retry session: used for /stream fetches so a slow upstream doesn't balloon into 30s+
+# Fast path session: no retries (Android/TV clients are latency-sensitive)
 fast_session = requests.Session()
 fast_retry = Retry(total=0)
 fast_adapter = HTTPAdapter(max_retries=fast_retry)
@@ -965,6 +893,33 @@ fast_session.mount("https://", fast_adapter)
 # Simple in-process rate limiting (no extra deps)
 # ---------------------------
 _rate_buckets: dict[str, deque] = defaultdict(deque)
+
+def finalize_streams_for_client(streams: List[Dict[str, Any]], is_android: bool) -> List[Dict[str, Any]]:
+    """Final guardrail: Android/TV core can drop *all* results if any stream is malformed."""
+    cleaned: List[Dict[str, Any]] = []
+    if not streams:
+        return cleaned
+    for s in streams:
+        if not isinstance(s, dict):
+            continue
+        url = s.get('url')
+        if not isinstance(url, str) or not url.strip():
+            continue
+        # Android/TV can't use magnet URLs; keep only playable HTTP(S) links.
+        if is_android and url.startswith('magnet:'):
+            continue
+        # Ensure absolute URLs (some clients don't resolve relative paths).
+        if url.startswith('/'):
+            url = f"{BASE_URL}{url}"
+        s['url'] = url
+        if is_android:
+            # Collapse newlines/whitespace for maximum client compatibility.
+            for k in ('name', 'title', 'description'):
+                v = s.get(k)
+                if isinstance(v, str):
+                    s[k] = ' '.join(v.split())
+        cleaned.append(s)
+    return cleaned
 
 def _parse_rate_limit(limit: str) -> tuple[int, int]:
     s = (limit or '').strip().lower()
@@ -1689,113 +1644,77 @@ def get_streams_single(base: str, auth: str, type_: str, id_: str, tag: str, tim
     ms = int((time.time() - t0) * 1000)
     return streams, len(streams), ms
 
-def get_streams(
-    type_: str,
-    id_: str,
-    *,
-    is_android: bool = False,
-    client_timeout_s: float | None = None,
-) -> Tuple[List[Dict[str, Any]], int, int, int, int]:
-    """Fetch provider streams in parallel (best-effort) and return merged results.
+def get_streams(type_: str, id_: str, *, aio_timeout: float = REQUEST_TIMEOUT, p2_timeout: float = REQUEST_TIMEOUT, aio_no_retry: bool = False, p2_no_retry: bool = False) -> Tuple[List[Dict[str, Any]], int, int, int, int]:
+    """Fetch both providers in parallel (best-effort) and return merged streams + counts."""
+    s1: List[Dict[str, Any]] = []
+    s2: List[Dict[str, Any]] = []
 
-    Key behavior: after AIO returns, we only wait a *small grace period* for P2.
-    This prevents slow P2 reads from causing client timeouts / Gunicorn aborts.
-    """
-    aio_streams: List[Dict[str, Any]] = []
-    prov2_streams: List[Dict[str, Any]] = []
-    aio_ms = 0
-    p2_ms = 0
+    ms_aio = 0
+    ms_p2 = 0
 
-    total_timeout = float(
-        client_timeout_s
-        if client_timeout_s is not None
-        else (ANDROID_STREAM_TIMEOUT if is_android else DESKTOP_STREAM_TIMEOUT)
-    )
-    aio_timeout = float(ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT)
-    p2_timeout = float(ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT)
-
-    # After AIO completes, don't block long for P2.
-    p2_grace = 1.5 if is_android else 4.0
-
-    # Fire both fetches at once. Always use the no-retry session so read timeouts don't balloon.
-    aio_in = 0
-    p2_in = 0
-    merged: List[Dict[str, Any]] = []
-
-    deadline = time.monotonic() + max(0.1, total_timeout)
-
+    tasks = []
     with ThreadPoolExecutor(max_workers=2) as ex:
         t_aio0 = time.time()
-        aio_fut = ex.submit(
-            _fetch_streams_from_base,
-            AIO_BASE,
-            AIO_AUTH,
-            type_,
-            id_,
-            "AIO",
-            timeout=aio_timeout,
-            no_retry=True,
-        )
-
-        p2_fut = None
-        t_p20 = None
+        tasks.append(("AIO", t_aio0, ex.submit(_fetch_streams_from_base, AIO_BASE, AIOSTREAMS_AUTH, type_, id_, 'AIO', timeout=aio_timeout, no_retry=aio_no_retry)))
         if PROV2_BASE:
             t_p20 = time.time()
-            p2_fut = ex.submit(
-                _fetch_streams_from_base,
-                PROV2_BASE,
-                PROV2_AUTH,
-                type_,
-                id_,
-                "P2",
-                timeout=p2_timeout,
-                no_retry=True,
-            )
+            tasks.append(("P2", t_p20, ex.submit(_fetch_streams_from_base, PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG, timeout=p2_timeout, no_retry=p2_no_retry)))
 
-        # 1) Primary: AIO
-        try:
-            rem = max(0.05, deadline - time.monotonic())
-            streams, ms = aio_fut.result(timeout=min(aio_timeout + 0.2, rem))
-            aio_streams = streams
-            aio_ms = ms
-        except FuturesTimeoutError:
-            aio_ms = int((time.time() - t_aio0) * 1000)
-            log.error("AIO fetch timeout")
-        except Exception as e:
-            aio_ms = int((time.time() - t_aio0) * 1000)
-            log.error(f"AIO fetch error: {e}")
-
-        # 2) Secondary: P2 (best-effort)
-        if p2_fut is not None and t_p20 is not None:
+        for tag, t_start, fut in tasks:
             try:
-                rem = max(0.0, deadline - time.monotonic())
-                if aio_streams:
-                    # AIO gave us something; only wait a short grace period for P2.
-                    wait_s = min(p2_grace, rem)
-                else:
-                    # If AIO failed/empty, give P2 more room (still bounded by deadline).
-                    wait_s = min(p2_timeout + 0.2, rem)
-
-                if wait_s > 0:
-                    streams, ms = p2_fut.result(timeout=wait_s)
-                    prov2_streams = streams
-                    p2_ms = ms
-            except FuturesTimeoutError:
-                p2_ms = int((time.time() - t_p20) * 1000)
-                log.error("P2 fetch timeout")
+                res = fut.result(timeout=REQUEST_TIMEOUT + 2)
             except Exception as e:
-                p2_ms = int((time.time() - t_p20) * 1000)
-                log.error(f"P2 fetch error: {e}")
+                logger.error(f'{tag} fetch error (parallel): {e}')
+                res = []
+            if tag == 'AIO':
+                s1 = res
+                ms_aio = int((time.time() - t_start) * 1000)
+            else:
+                s2 = res
+                ms_p2 = int((time.time() - t_start) * 1000)
 
-    aio_in = len(aio_streams)
-    p2_in = len(prov2_streams)
+    merged = (s1 + s2)[:INPUT_CAP]
+    return merged, len(s1), len(s2), ms_aio, ms_p2
 
-    if aio_streams:
-        merged.extend(aio_streams)
-    if prov2_streams:
-        merged.extend(prov2_streams)
+# ---------------------------
+# Pipeline
+# ---------------------------
+@dataclass
+class PipeStats:
+    aio_in: int = 0
+    prov2_in: int = 0
+    merged_in: int = 0
+    dropped_error: int = 0
+    dropped_missing_url: int = 0
+    dropped_pollution: int = 0
+    dropped_low_seeders: int = 0
+    dropped_lang: int = 0
+    dropped_low_premium: int = 0
+    dropped_rd: int = 0
+    dropped_ad: int = 0
+    dropped_low_res: int = 0
+    dropped_old_age: int = 0
+    dropped_blacklist: int = 0
+    dropped_fakes_db: int = 0
+    dropped_title_mismatch: int = 0
+    dropped_dead_url: int = 0
+    dropped_uncached: int = 0
+    dropped_uncached_tb: int = 0
+    deduped: int = 0
+    delivered: int = 0
 
-    return merged, aio_in, p2_in, aio_ms, p2_ms
+    # Timing/diagnostics (ms)
+    ms_fetch_aio: int = 0
+    ms_fetch_p2: int = 0
+    ms_tmdb: int = 0
+    ms_tb_api: int = 0
+    ms_tb_webdav: int = 0
+    ms_tb_usenet: int = 0
+
+    # Hash counts (diagnostics)
+    tb_api_hashes: int = 0
+    tb_webdav_hashes: int = 0
+    tb_usenet_hashes: int = 0
 
 
 def hash_stats(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
@@ -1844,31 +1763,6 @@ def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
 
     return f"nohash:{normalized_label}:{res}"
 
-
-
-def _drop_bad_top_n(
-    candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]],
-    top_n: int,
-    timeout: float,
-) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
-    """Drop obviously broken playback placeholders (e.g., redirects to /static/500.mp4) among top candidates."""
-    if top_n <= 0 or not candidates:
-        return candidates
-    kept: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-    i = 0
-    while i < len(candidates):
-        s, m = candidates[i]
-        if len(kept) < top_n:
-            try:
-                ok = _verify_stream_url(s, timeout=timeout, range_mode=True)
-                if not ok:
-                    i += 1
-                    continue
-            except Exception:
-                pass
-        kept.append((s, m))
-        i += 1
-    return kept
 
 
 def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0, is_android: bool = False, fast_mode: bool = False, deliver_cap: Optional[int] = None) -> Tuple[List[Dict[str, Any]], PipeStats]:
@@ -2044,13 +1938,6 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # Candidate window: a little bigger so we can satisfy usenet quotas.
     window = max(deliver_cap_eff, MIN_USENET_KEEP, MIN_USENET_DELIVER, 1)
     candidates = out_pairs[: window * 4]
-
-    # Android/TV: remove streams that resolve to known error placeholders (e.g., /static/500.mp4)
-    if is_android:
-        try:
-            candidates = _drop_bad_top_n(candidates, ANDROID_VERIFY_TOP_N, ANDROID_VERIFY_TIMEOUT)
-        except Exception:
-            pass
 
     # WebDAV strict (optional): drop TB items that WebDAV cannot confirm.
     # This can be used even without TB_API_KEY / TB_CACHE_HINTS.
@@ -2321,7 +2208,7 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.12",
+            "version": "1.0.11",
             "name": "AIO Wrapper (Rich Output, 2 Lines Left) 9.0",
             "description": "Merges 2 providers and outputs a brand-new, strict-client-safe stream schema with rich AIOStreams-style emoji formatting (2-line left column).",
             "resources": ["stream"],
@@ -2330,6 +2217,45 @@ def manifest():
             "idPrefixes": ["tt", "tmdb"],
         }
     )
+
+@app.get("/stream_p2/<type_>/<id_>.json")
+def stream_p2(type_: str, id_: str):
+    if not _is_valid_stream_id(type_, id_):
+        return jsonify({"streams": []}), 400
+    if not PROV2_BASE:
+        return jsonify({"streams": []}), 200
+    t0 = time.time()
+    stats = PipeStats()
+    try:
+        streams, prov2_in, ms_p2 = get_streams_single(PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG, timeout=ANDROID_FAST_TIMEOUT, no_retry=False)
+        stats.prov2_in = prov2_in
+        stats.merged_in = len(streams)
+        stats.ms_fetch_p2 = ms_p2
+        out, stats = filter_and_format(type_, id_, streams, aio_in=0, prov2_in=prov2_in, is_android=is_android_client(), fast_mode=True, deliver_cap=ANDROID_MAX_DELIVER)
+        return jsonify({"streams": out}), 200
+    except Exception as e:
+        logger.exception(f"stream_p2 error: {e}")
+        return jsonify({"streams": []}), 200
+    finally:
+        logger.info(
+            "WRAP_TIMING rid=%s type=%s id=%s aio_ms=%s p2_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_api_hashes=%s tb_wd_hashes=%s",
+            _rid(), type_, id_,
+            0, stats.ms_fetch_p2, stats.ms_tmdb, stats.ms_tb_api, stats.ms_tb_webdav,
+            stats.tb_api_hashes, stats.tb_webdav_hashes,
+        )
+        logger.info(
+            "WRAP_STATS rid=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s deduped=%s delivered=%s ms=%s",
+            _rid(), type_, id_,
+            0, stats.prov2_in, stats.merged_in,
+            stats.dropped_error, stats.dropped_missing_url, stats.dropped_pollution,
+            stats.dropped_low_seeders, stats.dropped_lang,
+            stats.dropped_low_premium,
+            stats.dropped_rd, stats.dropped_ad, stats.dropped_low_res, stats.dropped_old_age,
+            stats.dropped_blacklist, stats.dropped_fakes_db, stats.dropped_title_mismatch, stats.dropped_dead_url, stats.dropped_uncached, stats.dropped_uncached_tb,
+            stats.deduped, stats.delivered,
+            int((time.time() - t0) * 1000),
+        )
+
 
 @app.get("/stream/<type_>/<id_>.json")
 def stream(type_: str, id_: str):
@@ -2340,11 +2266,61 @@ def stream(type_: str, id_: str):
     is_android = is_android_client()
 
     try:
+        # Android quick path: prefer Viren/P2 only, skip TMDB/TorBox, return fast.
+        # Some Android/TV clients appear to HEAD-check stream URLs; we also wrap playback URLs elsewhere.
+        if is_android and ANDROID_FAST and (not _parse_bool(os.environ.get('ANDROID_FORCE_FULL', 'true'), True)) and PROV2_BASE:
+            streams = []
+            prov2_in = 0
+            ms_p2 = 0
+            try:
+                # IMPORTANT: allow a couple retries (ConnectionReset / ReadTimeout happen often on P2)
+                streams, prov2_in, ms_p2 = get_streams_single(
+                    PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG,
+                    timeout=ANDROID_FAST_TIMEOUT, no_retry=False
+                )
+            except Exception as e:
+                logger.warning(f"P2 fast-path fetch failed: {e}")
+
+            aio_in = 0
+            ms_aio = 0
+
+            # Fallback: if P2 is flaky and returns nothing, try AIO once so Android doesn't show an empty list.
+            if (not streams) and AIO_BASE:
+                try:
+                    streams, aio_in, ms_aio = get_streams_single(
+                        AIO_BASE, AIO_AUTH, type_, id_, AIO_TAG,
+                        timeout=min(ANDROID_FAST_TIMEOUT + 2.0, 10.0), no_retry=False
+                    )
+                except Exception as e:
+                    logger.warning(f"AIO fallback fetch failed: {e}")
+
+            stats.prov2_in = prov2_in
+            stats.aio_in = aio_in
+            stats.ms_fetch_p2 = ms_p2
+            stats.ms_fetch_aio = ms_aio
+
+            out, stats = filter_and_format(
+                type_, id_, streams,
+                aio_in=aio_in, prov2_in=prov2_in,
+                is_android=True, fast_mode=True,
+                deliver_cap=ANDROID_MAX_DELIVER,
+            )
+            cache_key = f"{type_}:{id_}"
+            if out:
+                cache_set(cache_key, out)
+            else:
+                cached = cache_get(cache_key)
+                if cached:
+                    out = cached
+            out = finalize_streams_for_client(out, is_android)
+            return jsonify({'streams': out, 'cacheMaxAge': CACHE_TTL}), 200
+
         streams, aio_in, prov2_in, ms_aio, ms_p2 = get_streams(
-            type_,
-            id_,
-            is_android=is_android,
-            client_timeout_s=(ANDROID_STREAM_TIMEOUT if is_android else DESKTOP_STREAM_TIMEOUT),
+            type_, id_,
+            aio_timeout=(ANDROID_AIO_TIMEOUT if is_android else REQUEST_TIMEOUT),
+            p2_timeout=(ANDROID_P2_TIMEOUT if is_android else REQUEST_TIMEOUT),
+            aio_no_retry=(ANDROID_NO_RETRY if is_android else False),
+            p2_no_retry=(ANDROID_NO_RETRY if is_android else False),
         )
         stats.aio_in = aio_in
         stats.prov2_in = prov2_in
@@ -2358,9 +2334,8 @@ def stream(type_: str, id_: str):
             cached = cache_get(cache_key)
             if cached:
                 out = cached
-        tmp = [android_sanitize_out_stream(s) for s in out]
-        tmp = [s for s in tmp if isinstance(s, dict) and s.get("url")]
-        return jsonify({"streams": (tmp if is_android else out), "cacheMaxAge": int(CACHE_TTL)}), 200
+        out = finalize_streams_for_client(out, is_android)
+        return jsonify({'streams': out, 'cacheMaxAge': CACHE_TTL}), 200
     except Exception as e:
         logger.exception(f"Stream error: {e}")
         cached = cache_get(f"{type_}:{id_}")
