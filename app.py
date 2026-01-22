@@ -1,3 +1,7 @@
+
+# Build identifier for deploy verification
+BUILD_ID = os.getenv('BUILD_TAG') or os.getenv('RENDER_GIT_COMMIT') or os.getenv('GIT_COMMIT') or 'unknown'
+
 from __future__ import annotations
 import base64
 import hashlib
@@ -311,121 +315,6 @@ def sanitize_stream_inplace(s: Dict[str, Any]) -> bool:
     if bh is None or not isinstance(bh, dict):
         s['behaviorHints'] = {}
     return True
-# ---------------------------
-# Android / strict-client schema sanitizer
-# ---------------------------
-_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
-
-def _safe_text(v: Any, max_chars: int | None = None) -> str:
-    if v is None:
-        return ""
-    s = unicodedata.normalize("NFKC", str(v))
-    s = _CTRL_RE.sub("", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    if max_chars is not None and max_chars > 0 and len(s) > max_chars:
-        s = s[: max_chars - 1] + "…"
-    return s
-
-def android_sanitize_out_stream(s: Any) -> Optional[Dict[str, Any]]:
-    """Return a minimal, strict-client-safe stream object or None (drop).
-
-    Why this exists (Google TV Streamer): one malformed stream object can make some Android
-    clients ignore the entire streams list.
-    """
-    if not isinstance(s, dict):
-        return None
-
-    url = s.get("url") or s.get("externalUrl")
-    if not isinstance(url, str):
-        return None
-    url = url.strip()
-    if not url:
-        return None
-    # Avoid extremely long URLs which can trip Android URI handling.
-    if len(url) > 2048:
-        return None
-
-    out: Dict[str, Any] = {"url": url}
-
-    name = _safe_text(s.get("name"), MAX_TITLE_CHARS)
-    if not name:
-        name = "Stream"
-    out["name"] = name
-
-    desc_raw = s.get("description")
-    if desc_raw is not None:
-        desc = _safe_text(desc_raw, MAX_DESC_CHARS)
-        if desc:
-            out["description"] = desc
-
-    ih = s.get("infoHash")
-    if isinstance(ih, str):
-        ih = ih.strip().lower()
-        if re.fullmatch(r"[0-9a-f]{40}", ih):
-            out["infoHash"] = ih
-
-    bh = s.get("behaviorHints")
-    if isinstance(bh, dict):
-        clean_bh: Dict[str, Any] = {}
-        # Allowlist a few known-safe keys. (Drop anything weird / nested.)
-        for k in (
-            "filename",
-            "bingeGroup",
-            "notWebReady",
-            "proxyHeaders",
-            "provider",
-            "cached",
-            "source",
-            "videoSize",
-        ):
-            if k not in bh:
-                continue
-            v = bh.get(k)
-            if v is None:
-                continue
-            if isinstance(v, (bool, int, float)):
-                clean_bh[k] = v
-            elif isinstance(v, str):
-                clean_bh[k] = _safe_text(v, 256)
-            elif isinstance(v, dict) and k == "proxyHeaders":
-                # proxyHeaders must remain a dict of string -> string
-                ph: Dict[str, str] = {}
-                for hk, hv in v.items():
-                    if hk and hv:
-                        ph[_safe_text(hk, 128)] = _safe_text(hv, 512)
-                if ph:
-                    clean_bh[k] = ph
-        if clean_bh:
-            out["behaviorHints"] = clean_bh
-
-    return out
-
-def _finalize_stream_list(streams: Any, *, is_android: bool) -> List[Dict[str, Any]]:
-    if not streams or not isinstance(streams, list):
-        return []
-    if not is_android:
-        # For non-Android clients we keep the richer objects unchanged.
-        # (They are already built as new objects when OUTPUT_NEW_OBJECT is true.)
-        return [s for s in streams if isinstance(s, dict) and isinstance(s.get("url"), str) and s.get("url")]
-
-    out: List[Dict[str, Any]] = []
-    dropped: List[Tuple[int, str]] = []
-    for i, s in enumerate(streams):
-        ss = android_sanitize_out_stream(s)
-        if ss and ss.get("url"):
-            out.append(ss)
-        else:
-            # Capture a tiny, safe hint for logs (avoid logging full URLs).
-            hint = ""
-            if isinstance(s, dict):
-                hint = _safe_text(s.get("name") or s.get("description") or "", 80)
-            dropped.append((i, hint))
-    if dropped:
-        logger.warning(
-            "ANDROID_SANITIZE_DROPPED rid=%s dropped=%d total=%d ex=%s",
-            _rid(), len(dropped), len(streams), dropped[:3],
-        )
-    return out
 
 
 def _load_remote_lines(url: str, timeout: float = 4.0) -> List[str]:
@@ -1063,6 +952,128 @@ fast_session.mount("https://", fast_adapter)
 # Simple in-process rate limiting (no extra deps)
 # ---------------------------
 _rate_buckets: dict[str, deque] = defaultdict(deque)
+
+
+# ---------------------------
+# Android/TV strict-client schema hardening
+# ---------------------------
+def _strip_control_chars(s: str) -> str:
+    # Remove ASCII control characters that can break some Android JSON consumers.
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
+
+
+def android_sanitize_out_stream(stream: Any) -> Optional[Dict[str, Any]]:
+    """Harden a single Stremio stream object for strict Android/TV clients.
+
+    Returns a cleaned dict or None (drop).
+    Rules:
+      - Must be a dict with non-empty string 'url'
+      - 'name' must be string if present; if absent, we synthesize a minimal name
+      - 'description' must be string if present (or removed)
+      - 'behaviorHints' must be dict if present; drop invalid
+      - Remove any None values, strip control chars, cap string lengths.
+    """
+    if not isinstance(stream, dict):
+        return None
+
+    # If a stream object accidentally contains a nested 'streams' key, drop it (schema poison).
+    if "streams" in stream:
+        return None
+
+    url = stream.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return None
+    url = url.strip()
+    # Android parsers can choke on extremely long URLs; cap hard.
+    if len(url) > 4096:
+        return None
+
+    out: Dict[str, Any] = {}
+
+    # url is required
+    out["url"] = url
+
+    # name (optional but strongly recommended for UI)
+    name = stream.get("name")
+    if name is None:
+        # best-effort fallback: keep very small; don't rely on other fields
+        name = "Stream"
+    if not isinstance(name, str):
+        name = str(name)
+    name = _strip_control_chars(name).strip()
+    if not name:
+        name = "Stream"
+    if len(name) > MAX_TITLE_CHARS:
+        name = name[:MAX_TITLE_CHARS].rstrip()
+    out["name"] = name
+
+    # description (optional)
+    desc = stream.get("description")
+    if desc is not None:
+        if not isinstance(desc, str):
+            desc = str(desc)
+        desc = _strip_control_chars(desc).strip()
+        if desc:
+            if len(desc) > MAX_DESC_CHARS:
+                desc = desc[:MAX_DESC_CHARS].rstrip()
+            out["description"] = desc
+
+    # behaviorHints (optional)
+    bh = stream.get("behaviorHints")
+    if bh is not None:
+        if isinstance(bh, dict):
+            # sanitize nested strings + remove None
+            bh_out: Dict[str, Any] = {}
+            for k, v in bh.items():
+                if v is None:
+                    continue
+                if isinstance(v, str):
+                    v2 = _strip_control_chars(v).strip()
+                    if not v2:
+                        continue
+                    # filename can be large; cap.
+                    if k == "filename" and len(v2) > 255:
+                        v2 = v2[:255].rstrip()
+                    bh_out[k] = v2
+                else:
+                    # allow booleans/ints/etc as-is
+                    bh_out[k] = v
+            if bh_out:
+                out["behaviorHints"] = bh_out
+        else:
+            # invalid behaviorHints is poison; drop it rather than poisoning the whole stream
+            pass
+
+    # Copy through a small allowlist of common Stremio keys safely.
+    # (Avoid copying arbitrary nested objects that can break strict parsers.)
+    for k in ("title", "infoHash", "availability", "seeders"):
+        v = stream.get(k)
+        if v is None:
+            continue
+        if isinstance(v, str):
+            v2 = _strip_control_chars(v).strip()
+            if not v2:
+                continue
+            if len(v2) > 512:
+                v2 = v2[:512].rstrip()
+            out[k] = v2
+        elif isinstance(v, (int, float, bool)):
+            out[k] = v
+
+    # Ensure no None values anywhere
+    out = {k: v for k, v in out.items() if v is not None}
+    return out
+
+
+def android_sanitize_stream_list(streams: Any) -> List[Dict[str, Any]]:
+    if not isinstance(streams, list):
+        return []
+    cleaned: List[Dict[str, Any]] = []
+    for s in streams:
+        cs = android_sanitize_out_stream(s)
+        if isinstance(cs, dict) and cs.get("url"):
+            cleaned.append(cs)
+    return cleaned
 
 def _parse_rate_limit(limit: str) -> tuple[int, int]:
     s = (limit or '').strip().lower()
@@ -1896,6 +1907,48 @@ def get_streams(
     return merged, aio_in, p2_in, aio_ms, p2_ms
 
 
+
+# ---------------------------
+# Pipeline stats (required; used by /stream and filter_and_format)
+# ---------------------------
+@dataclass
+class PipeStats:
+    aio_in: int = 0
+    prov2_in: int = 0
+    merged_in: int = 0
+    dropped_error: int = 0
+    dropped_missing_url: int = 0
+    dropped_pollution: int = 0
+    dropped_low_seeders: int = 0
+    dropped_lang: int = 0
+    dropped_low_premium: int = 0
+    dropped_rd: int = 0
+    dropped_ad: int = 0
+    dropped_low_res: int = 0
+    dropped_old_age: int = 0
+    dropped_blacklist: int = 0
+    dropped_fakes_db: int = 0
+    dropped_title_mismatch: int = 0
+    dropped_dead_url: int = 0
+    dropped_uncached: int = 0
+    dropped_uncached_tb: int = 0
+    deduped: int = 0
+    delivered: int = 0
+
+    # Timing/diagnostics (ms)
+    ms_fetch_aio: int = 0
+    ms_fetch_p2: int = 0
+    ms_tmdb: int = 0
+    ms_tb_api: int = 0
+    ms_tb_webdav: int = 0
+    ms_tb_usenet: int = 0
+
+    # Hash counts (diagnostics)
+    tb_api_hashes: int = 0
+    tb_webdav_hashes: int = 0
+    tb_usenet_hashes: int = 0
+
+
 def hash_stats(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
     total = len(pairs)
     with_hash = 0
@@ -2412,7 +2465,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 # ---------------------------
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "ts": int(time.time())}), 200
+    return jsonify({"ok": True, "build": BUILD_ID, "ts": int(time.time())}), 200
 
 @app.get("/manifest.json")
 def manifest():
@@ -2456,13 +2509,16 @@ def stream(type_: str, id_: str):
             cached = cache_get(cache_key)
             if cached:
                 out = cached
-        final_streams = _finalize_stream_list(out, is_android=is_android)
-        return jsonify({"streams": final_streams, "cacheMaxAge": int(CACHE_TTL)}), 200
+        tmp = [android_sanitize_out_stream(s) for s in out]
+        tmp = [s for s in tmp if isinstance(s, dict) and s.get("url")]
+        return jsonify({"streams": (tmp if is_android else out), "cacheMaxAge": int(CACHE_TTL)}), 200
     except Exception as e:
         logger.exception(f"Stream error: {e}")
         cached = cache_get(f"{type_}:{id_}")
-        final_streams = _finalize_stream_list(cached, is_android=is_android) if cached else []
-        return jsonify({"streams": final_streams, "cacheMaxAge": int(CACHE_TTL)}), 200
+        if cached:
+            cached_out = (android_sanitize_stream_list(cached) if is_android else cached)
+            return jsonify({"streams": cached_out, "cacheMaxAge": int(CACHE_TTL)}), 200
+        return jsonify({"streams": [], "cacheMaxAge": int(CACHE_TTL)}), 200
     finally:
         logger.info(
             "WRAP_TIMING rid=%s type=%s id=%s aio_ms=%s p2_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_api_hashes=%s tb_wd_hashes=%s",
@@ -2496,10 +2552,13 @@ def handle_unhandled_exception(e):
         return jsonify(manifest()), 200
     if request.path.startswith('/stream/'):
         # Never fail hard for stream endpoints; empty list is better than a 500.
-        cached = cache_get(request.path.replace('/stream/','',1).replace('.json','',1).replace('/',':',1))
+        cache_key = request.path.replace('/stream/','',1).replace('.json','',1).replace('/',':',1)
+        cached = cache_get(cache_key)
+        is_android = is_android_client()
         if cached:
-            return jsonify({'streams': cached}), 200
-        return jsonify({'streams': []}), 200
+            cached_out = (android_sanitize_stream_list(cached) if is_android else cached)
+            return jsonify({'streams': cached_out, 'cacheMaxAge': int(CACHE_TTL)}), 200
+        return jsonify({'streams': [], 'cacheMaxAge': int(CACHE_TTL)}), 200
     return ("Internal Server Error", 500)
 
 if __name__ == "__main__":
