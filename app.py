@@ -2079,6 +2079,22 @@ def _drop_bad_top_n(
     return kept
 
 
+
+def _res_to_int(res: str) -> int:
+    r = (res or '').lower().strip()
+    if '4k' in r or '2160p' in r or 'uhd' in r:
+        return 2160
+    if '2k' in r or '1440p' in r:
+        return 1440
+    if '1080p' in r or 'fhd' in r:
+        return 1080
+    if '720p' in r or 'hd' in r:
+        return 720
+    if '480p' in r or 'sd' in r:
+        return 480
+    return 0  # Default low
+
+
 def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0, is_android: bool = False, fast_mode: bool = False, deliver_cap: Optional[int] = None) -> Tuple[List[Dict[str, Any]], PipeStats]:
     stats = PipeStats()
     stats.aio_in = aio_in
