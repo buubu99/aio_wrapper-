@@ -112,15 +112,15 @@ REQUEST_TIMEOUT = _safe_float(os.environ.get('REQUEST_TIMEOUT', '30'), 30.0)
 CACHE_TTL = _safe_int(os.environ.get('CACHE_TTL', '600'), 600)
 
 # Client-side time budgets (seconds). These are upper bounds; we return as soon as we have results.
-ANDROID_STREAM_TIMEOUT = _safe_float(os.environ.get('ANDROID_STREAM_TIMEOUT', '15'), 15.0)
-DESKTOP_STREAM_TIMEOUT = _safe_float(os.environ.get('DESKTOP_STREAM_TIMEOUT', '25'), 25.0)
+ANDROID_STREAM_TIMEOUT = _safe_float(os.environ.get('ANDROID_STREAM_TIMEOUT', '20'), 20.0)  # FIXED: increase default
+DESKTOP_STREAM_TIMEOUT = _safe_float(os.environ.get('DESKTOP_STREAM_TIMEOUT', '30'), 30.0)  # FIXED: increase default
 
 # Upstream fetch timeouts (seconds) used inside /stream.
 # We keep P2 tighter because it can hang and trigger Gunicorn worker aborts if retries are enabled.
-ANDROID_AIO_TIMEOUT = _safe_float(os.environ.get('ANDROID_AIO_TIMEOUT', '12'), 12.0)
-ANDROID_P2_TIMEOUT = _safe_float(os.environ.get('ANDROID_P2_TIMEOUT', '6'), 6.0)
-DESKTOP_AIO_TIMEOUT = _safe_float(os.environ.get('DESKTOP_AIO_TIMEOUT', '25'), 25.0)
-DESKTOP_P2_TIMEOUT = _safe_float(os.environ.get('DESKTOP_P2_TIMEOUT', '12'), 12.0)
+ANDROID_AIO_TIMEOUT = _safe_float(os.environ.get('ANDROID_AIO_TIMEOUT', '18'), 18.0)  # FIXED: increase default
+ANDROID_P2_TIMEOUT = _safe_float(os.environ.get('ANDROID_P2_TIMEOUT', '12'), 12.0)  # FIXED: increase default
+DESKTOP_AIO_TIMEOUT = _safe_float(os.environ.get('DESKTOP_AIO_TIMEOUT', '28'), 28.0)  # FIXED: increase default
+DESKTOP_P2_TIMEOUT = _safe_float(os.environ.get('DESKTOP_P2_TIMEOUT', '15'), 15.0)  # FIXED: increase default
 
 # TorBox API call timeout (seconds) used during cache checks.
 TB_API_TIMEOUT = _safe_float(os.environ.get('TB_API_TIMEOUT', '8'), 8.0)
@@ -1916,9 +1916,11 @@ def get_streams(
         # 1) Primary: AIO
         try:
             rem = max(0.05, deadline - time.monotonic())
-            streams, ms = aio_fut.result(timeout=min(aio_timeout + 0.2, rem))
-            aio_streams = streams
-            aio_ms = ms
+            aio_streams = aio_fut.result(timeout=min(aio_timeout + 0.2, rem)) if aio_fut else []  # FIXED: get list only
+            if not isinstance(aio_streams, list):
+                aio_streams = []
+            aio_in = len(aio_streams)  # FIXED: compute count from len
+            aio_ms = int((time.time() - t_aio0) * 1000) if t_aio0 else 0
         except FuturesTimeoutError:
             aio_ms = int((time.time() - t_aio0) * 1000)
             logger.error("AIO fetch timeout")
@@ -1938,9 +1940,11 @@ def get_streams(
                     wait_s = min(p2_timeout + 0.2, rem)
 
                 if wait_s > 0:
-                    streams, ms = p2_fut.result(timeout=wait_s)
-                    prov2_streams = streams
-                    p2_ms = ms
+                    prov2_streams = p2_fut.result(timeout=wait_s) if p2_fut else []  # FIXED: get list only
+                    if not isinstance(prov2_streams, list):
+                        prov2_streams = []
+                    p2_in = len(prov2_streams)  # FIXED: compute count from len
+                    p2_ms = int((time.time() - t_p20) * 1000) if t_p20 else 0
             except FuturesTimeoutError:
                 p2_ms = int((time.time() - t_p20) * 1000)
                 logger.error("P2 fetch timeout")
