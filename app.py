@@ -33,14 +33,32 @@ def _parse_bool(v: str, default: bool = False) -> bool:
     return default
 
 def _normalize_base(raw: str) -> str:
-    raw = (raw or "").strip()
+    raw = (raw or "").strip().rstrip("/")
     # Accept either a base addon URL or a full manifest URL.
-    # If the user pastes something like .../manifest.json/ (or with extra slashes), strip it.
-    raw = raw.rstrip('/')
-    idx = raw.find('/manifest.json')
+    # Tolerate extra slashes, query params, and pasted .../manifest.json.
+    if "?" in raw:
+        raw = raw.split("?", 1)[0].rstrip("/")
+    idx = raw.find("/manifest.json")
     if idx != -1:
         raw = raw[:idx]
-    return raw.rstrip('/')
+    return raw.rstrip("/")
+
+def _safe_int(v, default: int) -> int:
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+def _safe_float(v, default: float) -> float:
+    try:
+        return float(str(v).strip())
+    except Exception:
+        return default
+
+def _safe_csv(v, default: str = "") -> list[str]:
+    s = default if v is None else str(v)
+    return [x.strip() for x in s.split(",") if x.strip()]
+
 
 # ---------------------------
 # Config (keep env names compatible with your existing Render setup)
@@ -59,23 +77,23 @@ PROV2_URL = os.environ.get("PROV2_URL", "")
 PROV2_BASE = _normalize_base(os.environ.get("PROV2_BASE", "") or PROV2_URL)
 PROV2_AUTH = os.environ.get("PROV2_AUTH", "")  # 'user:pass' for Basic auth if needed
 PROV2_TAG = os.environ.get("PROV2_TAG", "P2")
-ANDROID_MAX_DELIVER = int(os.environ.get("ANDROID_MAX_DELIVER", "60"))
+ANDROID_MAX_DELIVER = _safe_int(os.environ.get('ANDROID_MAX_DELIVER', '60'), 60)
 
-INPUT_CAP = int(os.environ.get("INPUT_CAP", "4500"))
-MAX_DELIVER = int(os.environ.get("MAX_DELIVER", "80"))
+INPUT_CAP = _safe_int(os.environ.get('INPUT_CAP', '4500'), 4500)
+MAX_DELIVER = _safe_int(os.environ.get('MAX_DELIVER', '80'), 80)
 # Formatting / UI constraints
 REFORMAT_STREAMS = _parse_bool(os.environ.get("REFORMAT_STREAMS", "true"), True)
 OUTPUT_NEW_OBJECT = _parse_bool(os.environ.get("OUTPUT_NEW_OBJECT", "true"), True)  # build brand-new stream objects (safe schema)
-OUTPUT_LEFT_LINES = int(os.environ.get("OUTPUT_LEFT_LINES", "2"))  # UI: 2 lines on left (quality + provider)
+OUTPUT_LEFT_LINES = _safe_int(os.environ.get('OUTPUT_LEFT_LINES', '2'), 2)  # UI: 2 lines on left (quality + provider)
 FORCE_ASCII_TITLE = _parse_bool(os.environ.get("FORCE_ASCII_TITLE", "true"), True)
-MAX_TITLE_CHARS = int(os.environ.get("MAX_TITLE_CHARS", "110"))
-MAX_DESC_CHARS = int(os.environ.get("MAX_DESC_CHARS", "180"))
+MAX_TITLE_CHARS = _safe_int(os.environ.get('MAX_TITLE_CHARS', '110'), 110)
+MAX_DESC_CHARS = _safe_int(os.environ.get('MAX_DESC_CHARS', '180'), 180)
 # Optional: prettier names (emojis + single-line)
 PRETTY_EMOJIS = _parse_bool(os.environ.get("PRETTY_EMOJIS", "true"), True)
 NAME_SINGLE_LINE = _parse_bool(os.environ.get("NAME_SINGLE_LINE", "true"), True)
 # Optional: title similarity drop (Trakt-like naming; works without Trakt)
 TRAKT_VALIDATE_TITLES = _parse_bool(os.environ.get("TRAKT_VALIDATE_TITLES", "true"), True)
-TRAKT_TITLE_MIN_RATIO = float(os.environ.get("TRAKT_TITLE_MIN_RATIO", "0.65"))
+TRAKT_TITLE_MIN_RATIO = _safe_float(os.environ.get('TRAKT_TITLE_MIN_RATIO', '0.65'), 0.65)
 TRAKT_STRICT_YEAR = _parse_bool(os.environ.get("TRAKT_STRICT_YEAR", "false"), False)
 
 # Validation/testing toggles
@@ -84,48 +102,49 @@ DROP_POLLUTED = _parse_bool(os.environ.get("DROP_POLLUTED", "true"), True)  # op
 # TorBox cache hint (optional; safe if unset)
 TB_API_KEY = os.environ.get("TB_API_KEY", "")
 TB_BASE = "https://api.torbox.app"
-TB_BATCH_SIZE = int(os.environ.get("TB_BATCH_SIZE", "50"))
-TB_MAX_HASHES = int(os.environ.get("TB_MAX_HASHES", "60"))  # limit hashes checked per request for speed
-TB_API_MIN_HASHES = int(os.environ.get("TB_API_MIN_HASHES", "20"))  # skip TorBox API calls if fewer hashes
+TB_BATCH_SIZE = _safe_int(os.environ.get('TB_BATCH_SIZE', '50'), 50)
+TB_MAX_HASHES = _safe_int(os.environ.get('TB_MAX_HASHES', '60'), 60)  # limit hashes checked per request for speed
+TB_API_MIN_HASHES = _safe_int(os.environ.get('TB_API_MIN_HASHES', '20'), 20)  # skip TorBox API calls if fewer hashes
 TB_CACHE_HINTS = _parse_bool(os.environ.get("TB_CACHE_HINTS", "true"), True)  # enable TorBox cache hint lookups
 TB_USENET_CHECK = _parse_bool(os.environ.get("TB_USENET_CHECK", "false"), False)  # optional usenet cache checks (requires identifiers)
-REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "30"))
+REQUEST_TIMEOUT = _safe_float(os.environ.get('REQUEST_TIMEOUT', '30'), 30.0)
 # Stream response cache TTL exposed to Stremio clients (seconds)
-CACHE_TTL = int(os.environ.get("CACHE_TTL", "600"))
+CACHE_TTL = _safe_int(os.environ.get('CACHE_TTL', '600'), 600)
 
 # Client-side time budgets (seconds). These are upper bounds; we return as soon as we have results.
-ANDROID_STREAM_TIMEOUT = float(os.environ.get("ANDROID_STREAM_TIMEOUT", "15"))
-DESKTOP_STREAM_TIMEOUT = float(os.environ.get("DESKTOP_STREAM_TIMEOUT", "25"))
+ANDROID_STREAM_TIMEOUT = _safe_float(os.environ.get('ANDROID_STREAM_TIMEOUT', '15'), 15.0)
+DESKTOP_STREAM_TIMEOUT = _safe_float(os.environ.get('DESKTOP_STREAM_TIMEOUT', '25'), 25.0)
 
 # Upstream fetch timeouts (seconds) used inside /stream.
 # We keep P2 tighter because it can hang and trigger Gunicorn worker aborts if retries are enabled.
-ANDROID_AIO_TIMEOUT = float(os.environ.get("ANDROID_AIO_TIMEOUT", "12"))
-ANDROID_P2_TIMEOUT = float(os.environ.get("ANDROID_P2_TIMEOUT", "6"))
-DESKTOP_AIO_TIMEOUT = float(os.environ.get("DESKTOP_AIO_TIMEOUT", "25"))
-DESKTOP_P2_TIMEOUT = float(os.environ.get("DESKTOP_P2_TIMEOUT", "12"))
+ANDROID_AIO_TIMEOUT = _safe_float(os.environ.get('ANDROID_AIO_TIMEOUT', '12'), 12.0)
+ANDROID_P2_TIMEOUT = _safe_float(os.environ.get('ANDROID_P2_TIMEOUT', '6'), 6.0)
+DESKTOP_AIO_TIMEOUT = _safe_float(os.environ.get('DESKTOP_AIO_TIMEOUT', '25'), 25.0)
+DESKTOP_P2_TIMEOUT = _safe_float(os.environ.get('DESKTOP_P2_TIMEOUT', '12'), 12.0)
 
 # TorBox API call timeout (seconds) used during cache checks.
-TB_API_TIMEOUT = float(os.environ.get("TB_API_TIMEOUT", "8"))
-TMDB_TIMEOUT = float(os.environ.get("TMDB_TIMEOUT", "8"))
+TB_API_TIMEOUT = _safe_float(os.environ.get('TB_API_TIMEOUT', '8'), 8.0)
+TMDB_TIMEOUT = _safe_float(os.environ.get('TMDB_TIMEOUT', '8'), 8.0)
 # TMDB for metadata
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
+BUILD_ID = os.environ.get("BUILD_ID", "1.0")
 # Additional filters
-MIN_SEEDERS = int(os.environ.get("MIN_SEEDERS", "1"))
+MIN_SEEDERS = _safe_int(os.environ.get('MIN_SEEDERS', '1'), 1)
 PREFERRED_LANG = os.environ.get("PREFERRED_LANG", "EN").upper()
 # Premium priorities and verification
-PREMIUM_PRIORITY = os.environ.get("PREMIUM_PRIORITY", "TB,RD,AD,ND").split(",")
-USENET_PRIORITY = os.environ.get("USENET_PRIORITY", "ND,EW,NG").split(",")
+PREMIUM_PRIORITY = _safe_csv(os.environ.get('PREMIUM_PRIORITY', 'TB,RD,AD,ND'))
+USENET_PRIORITY = _safe_csv(os.environ.get('USENET_PRIORITY', 'ND,EW,NG'))
 VERIFY_PREMIUM = _parse_bool(os.environ.get("VERIFY_PREMIUM", "true"), True)
 ASSUME_PREMIUM_ON_FAIL = _parse_bool(os.environ.get("ASSUME_PREMIUM_ON_FAIL", "false"), False)
-POLL_ATTEMPTS = int(os.environ.get('POLL_ATTEMPTS', '2'))
+POLL_ATTEMPTS = _safe_int(os.environ.get('POLL_ATTEMPTS', '2'), 2)
 
 # TorBox WebDAV (optional fast existence checks; gated by USE_TB_WEBDAV)
 USE_TB_WEBDAV = _parse_bool(os.environ.get('USE_TB_WEBDAV', 'true'), True)
 TB_WEBDAV_URL = os.environ.get('TB_WEBDAV_URL', 'https://webdav.torbox.app')
 TB_WEBDAV_USER = os.environ.get('TB_WEBDAV_USER', '')
 TB_WEBDAV_PASS = os.environ.get('TB_WEBDAV_PASS', '')
-TB_WEBDAV_TIMEOUT = float(os.environ.get('TB_WEBDAV_TIMEOUT', '1.0'))
-TB_WEBDAV_WORKERS = int(os.environ.get('TB_WEBDAV_WORKERS', '10'))
+TB_WEBDAV_TIMEOUT = _safe_float(os.environ.get('TB_WEBDAV_TIMEOUT', '1.0'), 1.0)
+TB_WEBDAV_WORKERS = _safe_int(os.environ.get('TB_WEBDAV_WORKERS', '10'), 10)
 TB_WEBDAV_TEMPLATES = [t.strip() for t in os.environ.get('TB_WEBDAV_TEMPLATES', 'downloads/{hash}/').split(',') if t.strip()]
 
 # Optional: drop TorBox streams that WebDAV cannot confirm (fast-ish, but still extra requests)
@@ -134,22 +153,22 @@ TB_WEBDAV_STRICT = _parse_bool(os.environ.get('TB_WEBDAV_STRICT', 'true'), True)
 # Optional: cached/instant validation for RD/AD (heuristics by default; strict workflow is opt-in)
 VERIFY_CACHED_ONLY = _parse_bool(os.environ.get("VERIFY_CACHED_ONLY", "false"), False)
 STRICT_PREMIUM_ONLY = _parse_bool(os.environ.get('STRICT_PREMIUM_ONLY', 'false'), False)  # loose default; strict drops uncached
-MIN_CACHE_CONFIDENCE = float(os.environ.get("MIN_CACHE_CONFIDENCE", "0.8"))
-VALIDATE_CACHE_TIMEOUT = float(os.environ.get("VALIDATE_CACHE_TIMEOUT", "10"))
+MIN_CACHE_CONFIDENCE = _safe_float(os.environ.get('MIN_CACHE_CONFIDENCE', '0.8'), 0.8)
+VALIDATE_CACHE_TIMEOUT = _safe_float(os.environ.get('VALIDATE_CACHE_TIMEOUT', '10'), 10.0)
 
 # Cancelled RD/AD instant checks – removed functions, now heuristics only
 # (No RD_STRICT_CACHE_CHECK, RD_API_KEY, AD_STRICT_CACHE_CHECK, AD_API_KEY)
 
 # Limit strict cache checks per request to avoid excessive API churn
-STRICT_CACHE_MAX = int(os.environ.get("STRICT_CACHE_MAX", "18"))
+STRICT_CACHE_MAX = _safe_int(os.environ.get('STRICT_CACHE_MAX', '18'), 18)
 
 # --- Add-ons / extensions (optional) ---
 DEPRIORITIZE_RD = _parse_bool(os.environ.get("DEPRIORITIZE_RD", "false"), False)
 DROP_RD = _parse_bool(os.environ.get("DROP_RD", "false"), False)
 DROP_AD = _parse_bool(os.environ.get("DROP_AD", "false"), False)
 
-MIN_RES = max(int(os.environ.get("MIN_RES", "1080")), 1080)  # hard floor: never below 1080
-MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", "0"))  # 0 = off
+MIN_RES = max(_safe_int(os.environ.get('MIN_RES', '1080'), 1080), 1080)  # hard floor: never below 1080
+MAX_AGE_DAYS = _safe_int(os.environ.get('MAX_AGE_DAYS', '0'), 0)  # 0 = off
 USE_AGE_HEURISTIC = _parse_bool(os.environ.get("USE_AGE_HEURISTIC", "true"), True)
 
 ADD_CACHE_HINT = _parse_bool(os.environ.get("ADD_CACHE_HINT", "true"), True)
@@ -163,24 +182,26 @@ VERIFY_TB_CACHE_OFF = _parse_bool(os.environ.get("VERIFY_TB_CACHE_OFF", "false")
 # Use short opaque /r/<token> urls instead of base64-encoding the full upstream URL.
 # Fixes Android/Google TV URL-length limits and keeps playback URLs private.
 WRAP_URL_SHORT = _parse_bool(os.environ.get("WRAP_URL_SHORT", "true"), True)
-WRAP_URL_TTL = int(os.environ.get("WRAP_URL_TTL", "3600"))  # seconds
+WRAP_URL_TTL = _safe_int(os.environ.get('WRAP_URL_TTL', '3600'), 3600)  # seconds
 WRAP_HEAD_MODE = (os.environ.get("WRAP_HEAD_MODE", "200_noloc") or "200_noloc").strip().lower()
 WRAPPER_DEDUP = _parse_bool(os.environ.get("WRAPPER_DEDUP", "true"), True)
+WRAP_EMIT_INFOHASH = _parse_bool(os.environ.get('WRAP_EMIT_INFOHASH', '0'), False)
+USENET_EMIT_INFOHASH = _parse_bool(os.environ.get('USENET_EMIT_INFOHASH', '0'), False)
 
 VERIFY_STREAM = _parse_bool(os.environ.get("VERIFY_STREAM", "true"), True)
-VERIFY_STREAM_TIMEOUT = float(os.environ.get("VERIFY_STREAM_TIMEOUT", "4"))
+VERIFY_STREAM_TIMEOUT = _safe_float(os.environ.get('VERIFY_STREAM_TIMEOUT', '4'), 4.0)
 
 # Stronger playback verification (catches upstream /static/500.mp4 placeholders)
 VERIFY_RANGE = _parse_bool(os.environ.get("VERIFY_RANGE", "true"), True)
 VERIFY_DROP_STATIC_500 = _parse_bool(os.environ.get("VERIFY_DROP_STATIC_500", "true"), True)
-VERIFY_MIN_TOTAL_BYTES = int(os.environ.get("VERIFY_MIN_TOTAL_BYTES", "5000000"))  # 5MB floor
-ANDROID_VERIFY_TOP_N = int(os.environ.get("ANDROID_VERIFY_TOP_N", "12"))
-ANDROID_VERIFY_TIMEOUT = float(os.environ.get("ANDROID_VERIFY_TIMEOUT", "2.2"))
+VERIFY_MIN_TOTAL_BYTES = _safe_int(os.environ.get('VERIFY_MIN_TOTAL_BYTES', '5000000'), 5000000)  # 5MB floor
+ANDROID_VERIFY_TOP_N = _safe_int(os.environ.get('ANDROID_VERIFY_TOP_N', '12'), 12)
+ANDROID_VERIFY_TIMEOUT = _safe_float(os.environ.get('ANDROID_VERIFY_TIMEOUT', '2.2'), 2.2)
 
 
 # Force a minimum share of usenet results (if they exist)
-MIN_USENET_KEEP = int(os.environ.get("MIN_USENET_KEEP", "3"))
-MIN_USENET_DELIVER = int(os.environ.get("MIN_USENET_DELIVER", "3"))
+MIN_USENET_KEEP = _safe_int(os.environ.get('MIN_USENET_KEEP', '3'), 3)
+MIN_USENET_DELIVER = _safe_int(os.environ.get('MIN_USENET_DELIVER', '3'), 3)
 
 # Optional local/remote filtering sources
 USE_BLACKLISTS = _parse_bool(os.environ.get("USE_BLACKLISTS", "true"), True)
@@ -198,6 +219,8 @@ RATE_LIMIT = (os.environ.get("RATE_LIMIT", "") or "").strip()
 # ---------------------------
 _blacklist_cache = {"ts": 0.0, "terms": set()}
 _fakes_cache = {"ts": 0.0, "hashes": set()}
+_BLACKLIST_LOCK = threading.Lock()
+_FAKES_LOCK = threading.Lock()
 
 
 def _truncate(s: str, max_chars: int) -> str:
@@ -287,7 +310,7 @@ def _extract_infohash(text: str) -> str | None:
 
 
 
-def is_premium_plan(provider: str, api_key: str = '') -> bool:
+def is_premium_plan(provider: str) -> bool:
     prov = (provider or '').upper().strip()
     if prov in (p.strip().upper() for p in PREMIUM_PRIORITY if p.strip()):
         return True
@@ -339,33 +362,34 @@ def _is_blacklisted(text: str) -> bool:
     # Optional remote list (cache for 1h)
     if BLACKLIST_URL:
         now = time.time()
-        if now - _blacklist_cache['ts'] > 3600:
-            remote = [x.lower() for x in _load_remote_lines(BLACKLIST_URL)]
-            _blacklist_cache['terms'] = set(remote)
-            _blacklist_cache['ts'] = now
-        terms |= set(_blacklist_cache['terms'])
+        with _BLACKLIST_LOCK:
+            if now - _blacklist_cache['ts'] > 3600:
+                remote = [x.lower() for x in _load_remote_lines(BLACKLIST_URL)]
+                _blacklist_cache['terms'] = set(remote)
+                _blacklist_cache['ts'] = now
+            terms |= set(_blacklist_cache['terms'])
     for term in terms:
         if term and term in t:
             return True
     return False
-
 
 def _load_fakes_db() -> set:
     # Cache for 6h
     if not FAKES_DB_URL:
         return set()
     now = time.time()
-    if now - _fakes_cache['ts'] < 21600 and _fakes_cache['hashes']:
-        return set(_fakes_cache['hashes'])
+    with _FAKES_LOCK:
+        if now - _fakes_cache['ts'] < 21600 and _fakes_cache['hashes']:
+            return set(_fakes_cache['hashes'])
     hashes = set()
     for line in _load_remote_lines(FAKES_DB_URL, timeout=6.0):
         h = re.sub(r'[^0-9a-fA-F]', '', line).lower()
         if len(h) == 40:
             hashes.add(h)
-    _fakes_cache['hashes'] = set(hashes)
-    _fakes_cache['ts'] = now
+    with _FAKES_LOCK:
+        _fakes_cache['hashes'] = set(hashes)
+        _fakes_cache['ts'] = now
     return hashes
-
 
 def _parse_content_range_total(cr: Optional[str]) -> Optional[int]:
     # Example: "bytes 0-0/16440"
@@ -398,7 +422,7 @@ def _verify_stream_url(s: Dict[str, Any], timeout: Optional[float] = None, range
 
     try:
         if rm:
-            r = session.get(
+            r = fast_session.get(
                 url,
                 headers={'Range': 'bytes=0-0', 'User-Agent': ''},
                 timeout=t,
@@ -413,9 +437,9 @@ def _verify_stream_url(s: Dict[str, Any], timeout: Optional[float] = None, range
                 return False
             return 200 <= r.status_code < 400
 
-        r = session.head(url, timeout=t, allow_redirects=True, headers={'User-Agent': ''})
+        r = fast_session.head(url, timeout=t, allow_redirects=True, headers={'User-Agent': ''})
         if r.status_code in (405, 403, 401):
-            r = session.get(url, timeout=t, stream=True, allow_redirects=True, headers={'User-Agent': ''})
+            r = fast_session.get(url, timeout=t, stream=True, allow_redirects=True, headers={'User-Agent': ''})
         return 200 <= r.status_code < 400
     except Exception:
         return False
@@ -592,10 +616,8 @@ LANG_MAP = {
 # ---------------------------
 
 # --- Playback URL HEAD workaround (some clients HEAD-check stream URLs) ---
-import base64
 
 WRAP_PLAYBACK_URLS = _parse_bool(os.environ.get("WRAP_PLAYBACK_URLS", "true"), True)
-PLAYBACK_HEAD_WORKAROUND_SUBSTR = os.getenv("PLAYBACK_HEAD_WORKAROUND_SUBSTR", "/api/v1/debrid/playback/")
 USENET_PSEUDO_INFOHASH = os.getenv("USENET_PSEUDO_INFOHASH", "1").strip() not in ("0", "false", "False")
 WRAP_DEBUG = os.getenv("WRAP_DEBUG", "0").strip() in ("1", "true", "True")
 
@@ -667,7 +689,7 @@ def wrap_playback_url(url: str) -> str:
     # Avoid double-wrapping
     try:
         base = _public_base_url().rstrip('/')
-        if u.startswith(base + '/r/') or u.startswith(base + '/r/'):
+        if u.startswith(base + '/r/'):
             return u
     except Exception:
         pass
@@ -677,7 +699,7 @@ def wrap_playback_url(url: str) -> str:
             wrapped = _public_base_url() + 'r/' + tok
         else:
             wrapped = _public_base_url() + 'r/' + _b64u_encode(u)
-        if 'WRAP_DEBUG' in globals() and WRAP_DEBUG:
+        if WRAP_DEBUG:
             logging.getLogger('aio-wrapper').info(f'WRAP_URL -> {wrapped}')
         return wrapped
     return u
@@ -687,7 +709,7 @@ app = Flask(__name__)
 
 
 # --- fallback cache (serves last non-empty streams during upstream flakiness) ---
-FALLBACK_CACHE_TTL = int(os.environ.get("FALLBACK_CACHE_TTL", "600"))  # seconds
+FALLBACK_CACHE_TTL = _safe_int(os.environ.get('FALLBACK_CACHE_TTL', '600'), 600)  # seconds
 _LAST_GOOD_STREAMS = {}  # key -> list[dict]
 _LAST_GOOD_TS = {}       # key -> float epoch
 _CACHE_LOCK = threading.Lock()
@@ -798,6 +820,10 @@ def redirect_stream_url(token: str):
 
     GET always returns 302 Location to the real upstream playback URL.
     """
+    # Basic token validation (avoid abuse / pathological decode)
+    if not token or len(token) > 4096 or re.fullmatch(r"[A-Za-z0-9_-]+", token) is None:
+        return ("", 404)
+
     # Resolve token -> upstream URL
     url = None
     if WRAP_URL_SHORT:
@@ -932,6 +958,7 @@ session = requests.Session()
 # In-process cache history for expensive cache checks (per infohash)
 CACHED_HISTORY: dict[str, bool] = {}
 
+CACHED_HISTORY_LOCK = threading.Lock()
 retry = Retry(total=3, backoff_factor=0.6, status_forcelist=[500, 502, 503, 504], allowed_methods=["GET", "POST"])
 adapter = HTTPAdapter(max_retries=retry)
 session.mount("http://", adapter)
@@ -948,6 +975,7 @@ fast_session.mount("https://", fast_adapter)
 # Simple in-process rate limiting (no extra deps)
 # ---------------------------
 _rate_buckets: dict[str, deque] = defaultdict(deque)
+_RATE_LOCK = threading.Lock()
 
 
 # ---------------------------
@@ -988,6 +1016,10 @@ def android_sanitize_out_stream(stream: Any) -> Optional[Dict[str, Any]]:
 
     # url is required
     out["url"] = url
+    # Strip infoHash unless enabled (strict clients + privacy)
+    if not WRAP_EMIT_INFOHASH and not USENET_EMIT_INFOHASH:
+        # infoHash isn't a required Stremio field and can trigger strict-client schema issues.
+        stream.pop('infoHash', None)
 
     # name (optional but strongly recommended for UI)
     name = stream.get("name")
@@ -1090,25 +1122,16 @@ def _enforce_rate_limit() -> Optional[tuple[Dict[str, Any], int]]:
         return None
     ip = (request.headers.get('X-Forwarded-For', '').split(',')[0].strip() or request.remote_addr or 'unknown')
     now = time.time()
-    q = _rate_buckets[ip]
-    while q and (now - q[0]) > window:
-        q.popleft()
-    if len(q) >= max_req:
-        return ({'streams': []}, 429)
-    q.append(now)
+    with _RATE_LOCK:
+        q = _rate_buckets[ip]
+        while q and (now - q[0]) > window:
+            q.popleft()
+        if len(q) >= max_req:
+            return ({'streams': []}, 429)
+        q.append(now)
     return None
 
-# ---------------------------
-# Parsing helpers (resolution / age)
-# ---------------------------
-def _res_to_int(res: str) -> int:
-    r = (res or '').upper()
-    if r in ('4K', '2160P'):
-        return 2160
-    m = re.search(r'(\d{3,4})P', r)
-    if m:
-        return int(m.group(1))
-    return 0
+
 
 def _extract_age_days(text: str) -> Optional[int]:
     if not text:
@@ -1272,7 +1295,8 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
             unit = m.group(2).upper()
             size = int(val * (1024 ** 3 if unit == "GB" else 1024 ** 2))
     # Seeders
-    seeders = int(re.search(r"(\d+) seeds?", text).group(1)) if re.search(r"(\d+) seeds?", text) else 0
+    m_seeds = re.search(r"(\\d+)\\s*(?:seeds?|seeders?)\\b", text, re.I)
+    seeders = int(m_seeds.group(1)) if m_seeds else 0
     # Infohash
     url = s.get("url", "") or s.get("externalUrl", "")
     infohash = ""
@@ -1318,7 +1342,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     # Raw title for fallback
     title_raw = normalize_display_title(filename or desc or name)
     # Premium level
-    premium_level = 1 if is_premium_plan(provider, TB_API_KEY if provider == "TB" else api_key_for_provider(provider)) else 0  # Adjust api_key_for_provider as needed
+    premium_level = 1 if is_premium_plan(provider) else 0
     return {
         "provider": provider,
         "res": res,
@@ -1347,23 +1371,108 @@ def api_key_for_provider(provider: str) -> str:
 # ---------------------------
 # Expected metadata (real TMDB fetch)
 # ---------------------------
+@lru_cache(maxsize=4000)
+def _tmdb_find_by_imdb(imdb_id: str) -> Dict[str, Any]:
+    if not TMDB_API_KEY or not imdb_id:
+        return {}
+    try:
+        url = f"https://api.themoviedb.org/3/find/{imdb_id}"
+        r = session.get(
+            url,
+            params={"api_key": TMDB_API_KEY, "external_source": "imdb_id", "language": "en-US"},
+            timeout=TMDB_TIMEOUT,
+        )
+        r.raise_for_status()
+        return r.json() if r.content else {}
+    except Exception as e:
+        logger.warning(f"TMDB find failed: {e}")
+        return {}
+
+@lru_cache(maxsize=8000)
+def _tmdb_episode_title(tv_id: int, season: int, episode: int) -> str:
+    if not TMDB_API_KEY or not tv_id or not season or not episode:
+        return ""
+    try:
+        url = f"https://api.themoviedb.org/3/tv/{tv_id}/season/{season}/episode/{episode}"
+        r = session.get(url, params={"api_key": TMDB_API_KEY, "language": "en-US"}, timeout=TMDB_TIMEOUT)
+        r.raise_for_status()
+        data = r.json() if r.content else {}
+        name = data.get("name") or ""
+        return normalize_display_title(name)
+    except Exception:
+        return ""
+
 @lru_cache(maxsize=2000)
 def get_expected_metadata(type_: str, id_: str) -> Dict[str, Any]:
+    """Fetch expected title/year (and episode title when available) from TMDB.
+
+    Supports:
+      - TMDB IDs (numeric)
+      - IMDb IDs (tt123...) via /find/{imdb_id}?external_source=imdb_id
+      - Stremio series IDs like tt...:S:E (episode title fetched via TMDB tv endpoint)
+    """
     if not TMDB_API_KEY:
         return {"title": "", "year": None, "type": type_}
-    id_clean = id_.split(":")[0] if ":" in id_ else id_
-    base = f"https://api.themoviedb.org/3/{'movie' if type_ == 'movie' else 'tv'}/{id_clean}"
-    try:
-        resp = session.get(f"{base}?api_key={TMDB_API_KEY}&language=en-US", timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-        title = data.get("title") or data.get("name", "")
-        release_date = data.get("release_date") or data.get("first_air_date", "")
-        year = int(release_date[:4]) if release_date else None
-        return {"title": title, "year": year, "type": type_}
-    except Exception as e:
-        logger.warning(f"TMDB fetch failed: {e}")
-        return {"title": "", "year": None, "type": type_}
+
+    # Parse base id + optional S/E (Stremio uses imdb:season:episode)
+    season = episode = None
+    base_id = id_
+    if type_ == "series" and ":" in id_:
+        parts = id_.split(":")
+        base_id = parts[0]
+        if len(parts) >= 3:
+            try:
+                season = int(parts[-2])
+                episode = int(parts[-1])
+            except Exception:
+                season = episode = None
+
+    route = "movie" if type_ == "movie" else "tv"
+
+    title = ""
+    year = None
+    tmdb_id = None
+    base_id = (base_id or "").strip()
+
+    if re.fullmatch(r"tt\d{5,12}", base_id):
+        data = _tmdb_find_by_imdb(base_id)
+        key = "movie_results" if route == "movie" else "tv_results"
+        results = data.get(key) if isinstance(data, dict) else None
+        if not results and route == "tv":
+            results = data.get("movie_results") if isinstance(data, dict) else None
+        if isinstance(results, list) and results:
+            hit = results[0] if isinstance(results[0], dict) else {}
+            tmdb_id = hit.get("id")
+            title = hit.get("title") or hit.get("name") or ""
+            date = hit.get("release_date") or hit.get("first_air_date") or ""
+            try:
+                year = int(date[:4]) if date else None
+            except Exception:
+                year = None
+
+    elif base_id.isdigit():
+        tmdb_id = int(base_id)
+
+    if tmdb_id and (not title or year is None):
+        try:
+            url = f"https://api.themoviedb.org/3/{route}/{tmdb_id}"
+            r = session.get(url, params={"api_key": TMDB_API_KEY, "language": "en-US"}, timeout=TMDB_TIMEOUT)
+            r.raise_for_status()
+            data = r.json() if r.content else {}
+            title = data.get("title") or data.get("name") or title
+            date = data.get("release_date") or data.get("first_air_date") or ""
+            year = int(date[:4]) if date else year
+        except Exception as e:
+            logger.warning(f"TMDB details failed: {e}")
+
+    ep_title = ""
+    if route == "tv" and tmdb_id and season and episode:
+        try:
+            ep_title = _tmdb_episode_title(int(tmdb_id), int(season), int(episode))
+        except Exception:
+            ep_title = ""
+
+    return {"title": normalize_display_title(title or ""), "year": year, "type": type_, "tmdb_id": tmdb_id, "episode_title": ep_title}
 
 # ---------------------------
 # Formatting: guaranteed 2-left + 3-right (title + 2 lines)
@@ -1405,7 +1514,7 @@ def format_stream_inplace(
 
     # Name (left): provider + core tech summary
     tech_parts = [res]
-    if 'HDR' in (m.get('flags') or '') or 'hdr' in f"{s.get('name','')} {s.get('description','')}".lower():
+    if 'HDR' in (m.get('flags') or '').upper() or 'hdr' in f"{s.get('name','')} {s.get('description','')}".lower():
         tech_parts.append('HDR')
     if audio:
         tech_parts.append(audio)
@@ -1418,7 +1527,10 @@ def format_stream_inplace(
     base_title = normalize_display_title(base_title)
     year = expected.get('year')
     ep_tag = f" S{season:02d}E{episode:02d}" if season and episode else ""
-    s['title'] = _truncate(f"{base_title}{ep_tag}" + (f" ({year})" if year else ""), MAX_TITLE_CHARS)
+    ep_name = expected.get('episode_title') or ''
+    ep_name = normalize_display_title(ep_name) if ep_name else ''
+    title_core = f"{base_title}{ep_tag}" + (f" • {ep_name}" if ep_name else "")
+    s['title'] = _truncate(f"{title_core}" + (f" ({year})" if year else ""), MAX_TITLE_CHARS)
 
     # Description: 2 clean lines (or single line if NAME_SINGLE_LINE)
     line1_bits = [p for p in [audio, lang, codec, source] if p]
@@ -1428,14 +1540,24 @@ def format_stream_inplace(
     # Ensure machine-visible hints are present for downstream (Stremio UI + other tools)
     bh = s.setdefault('behaviorHints', {})
     ih = (m.get('infohash') or '').strip().lower()
-    if ih and not s.get('infoHash'):
-        s['infoHash'] = ih
-    elif USENET_PSEUDO_INFOHASH and not s.get('infoHash'):
-        uh = (m.get('usenet_hash') or '').strip().lower()
-        pseudo = _pseudo_infohash_usenet(uh) if uh else ''
-        if pseudo:
-            s['infoHash'] = pseudo
-            bh['usenetHash'] = uh
+
+    # Do NOT leak infoHash unless explicitly enabled.
+    prov = (m.get('provider') or '').upper()
+    emit_hash = bool(WRAP_EMIT_INFOHASH) or (prov in (p.strip().upper() for p in USENET_PRIORITY) and bool(USENET_EMIT_INFOHASH))
+
+    if emit_hash:
+        if ih and not s.get('infoHash'):
+            s['infoHash'] = ih
+        elif USENET_PSEUDO_INFOHASH and not s.get('infoHash'):
+            # Optional: generate a stable pseudo-hash for usenet so dedup works across clients
+            uh = (m.get('usenet_hash') or '').strip().lower()
+            pseudo = _pseudo_infohash_usenet(uh) if uh else ''
+            if pseudo:
+                s['infoHash'] = pseudo
+                bh['usenetHash'] = uh
+    else:
+        # Strip any upstream-provided infoHash too (privacy + strict-client safety)
+        s.pop('infoHash', None)
 
 
     bh['provider'] = prov
@@ -1865,10 +1987,10 @@ def get_streams(
             aio_ms = ms
         except FuturesTimeoutError:
             aio_ms = int((time.time() - t_aio0) * 1000)
-            log.error("AIO fetch timeout")
+            logger.error("AIO fetch timeout")
         except Exception as e:
             aio_ms = int((time.time() - t_aio0) * 1000)
-            log.error(f"AIO fetch error: {e}")
+            logger.error(f"AIO fetch error: {e}")
 
         # 2) Secondary: P2 (best-effort)
         if p2_fut is not None and t_p20 is not None:
@@ -1887,10 +2009,10 @@ def get_streams(
                     p2_ms = ms
             except FuturesTimeoutError:
                 p2_ms = int((time.time() - t_p20) * 1000)
-                log.error("P2 fetch timeout")
+                logger.error("P2 fetch timeout")
             except Exception as e:
                 p2_ms = int((time.time() - t_p20) * 1000)
-                log.error(f"P2 fetch error: {e}")
+                logger.error(f"P2 fetch error: {e}")
 
     aio_in = len(aio_streams)
     p2_in = len(prov2_streams)
@@ -1928,6 +2050,7 @@ class PipeStats:
     dropped_dead_url: int = 0
     dropped_uncached: int = 0
     dropped_uncached_tb: int = 0
+    dropped_android_magnets: int = 0
     deduped: int = 0
     delivered: int = 0
 
@@ -2190,7 +2313,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # Candidate window: a little bigger so we can satisfy usenet quotas.
     window = max(deliver_cap_eff, MIN_USENET_KEEP, MIN_USENET_DELIVER, 1)
-    candidates = out_pairs[: window * 4]
+    candidates = out_pairs[: min(len(out_pairs), window * 4, 500)]
 
     # Android/TV: remove streams that resolve to known error placeholders (e.g., /static/500.mp4)
     if is_android:
@@ -2295,8 +2418,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             if provider == 'TB':
                 if h and cached_map:
                     cached_marker = bool(cached_map.get(h, False))
-                elif h and h in CACHED_HISTORY:
-                    cached_marker = bool(CACHED_HISTORY.get(h, False))
+                elif h:
+                    with CACHED_HISTORY_LOCK:
+                        cached_marker = bool(CACHED_HISTORY.get(h, False))
                 elif ASSUME_PREMIUM_ON_FAIL:
                     cached_marker = True
                 else:
@@ -2310,7 +2434,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
             _m['cached'] = cached_marker
             if h and isinstance(cached_marker, bool):
-                CACHED_HISTORY[h] = cached_marker
+                with CACHED_HISTORY_LOCK:
+                    CACHED_HISTORY[h] = cached_marker
 
             if STRICT_PREMIUM_ONLY:
                 if cached_marker is True or cached_marker == 'LIKELY':
@@ -2399,8 +2524,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     kept.append((s, m))
                     if len(kept) >= deliver_cap_eff:
                         break
-            stats.dropped_uncached += magnets
-            logger.info(f"ANDROID_FILTER rid={rid} dropped_magnets={magnets}")
+            stats.dropped_android_magnets += magnets
+            logger.info(f"ANDROID_FILTER rid={_rid()} dropped_magnets={magnets}")
             candidates = kept
 
     # Format (last step)
@@ -2558,5 +2683,5 @@ def handle_unhandled_exception(e):
     return ("Internal Server Error", 500)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
+    port = _safe_int(os.environ.get('PORT', '5000'), 5000)
     app.run(host="0.0.0.0", port=port, debug=LOG_LEVEL == logging.DEBUG, use_reloader=False)
