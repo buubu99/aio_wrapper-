@@ -68,8 +68,8 @@ AIO_URL = os.environ.get("AIO_URL", "")
 # Preserves token-in-path URLs while stripping any trailing /manifest.json.
 AIO_BASE = _normalize_base(os.environ.get("AIO_BASE", "") or AIO_URL)
 # can be base url or .../manifest.json
-AIOSTREAMS_AUTH = os.environ.get("AIOSTREAMS_AUTH", "") # "user:pass"
-
+AIO_AUTH = os.environ.get("AIOSTREAMS_AUTH", "")  # "user:pass"
+AIOSTREAMS_AUTH = AIO_AUTH  # backward-compat alias
 # Optional second provider (another AIOStreams-compatible addon)
 PROV2_URL = os.environ.get("PROV2_URL", "")
 # Robust: accepts either a base addon URL or a full manifest URL.
@@ -185,8 +185,6 @@ WRAP_URL_SHORT = _parse_bool(os.environ.get("WRAP_URL_SHORT", "true"), True)
 WRAP_URL_TTL = _safe_int(os.environ.get('WRAP_URL_TTL', '3600'), 3600)  # seconds
 WRAP_HEAD_MODE = (os.environ.get("WRAP_HEAD_MODE", "200_noloc") or "200_noloc").strip().lower()
 WRAPPER_DEDUP = _parse_bool(os.environ.get("WRAPPER_DEDUP", "true"), True)
-WRAP_EMIT_INFOHASH = _parse_bool(os.environ.get('WRAP_EMIT_INFOHASH', '0'), False)
-USENET_EMIT_INFOHASH = _parse_bool(os.environ.get('USENET_EMIT_INFOHASH', '0'), False)
 
 VERIFY_STREAM = _parse_bool(os.environ.get("VERIFY_STREAM", "true"), True)
 VERIFY_STREAM_TIMEOUT = _safe_float(os.environ.get('VERIFY_STREAM_TIMEOUT', '4'), 4.0)
@@ -648,6 +646,29 @@ def _b64u_decode(token: str) -> str:
     pad = '=' * (-len(token) % 4)
     return base64.urlsafe_b64decode((token + pad).encode("ascii")).decode("utf-8")
 
+
+def _zurl_encode(url: str) -> str:
+    """Compress+base64url encode a URL into a restart-safe token.
+
+    This replaces the old in-memory short-token map (which breaks after redeploy).
+    Token format: 'z' + base64url(zlib.compress(url_utf8))
+    """
+    import zlib
+    raw = url.encode("utf-8")
+    comp = zlib.compress(raw, level=9)
+    return "z" + base64.urlsafe_b64encode(comp).decode("ascii").rstrip("=")
+
+def _zurl_decode(token: str) -> str:
+    """Decode a token produced by _zurl_encode."""
+    import zlib
+    if not token or not token.startswith("z"):
+        raise ValueError("not ztoken")
+    tok = token[1:]
+    pad = "=" * (-len(tok) % 4)
+    comp = base64.urlsafe_b64decode((tok + pad).encode("ascii"))
+    raw = zlib.decompress(comp)
+    return raw.decode("utf-8")
+
 # In-memory short URL map for /r/<token> -> upstream URL
 # Note: With WEB_CONCURRENCY>1, each worker has its own map; keep concurrency=1 for reliability.
 _WRAP_URL_MAP = {}  # token -> (url, expires_epoch)
@@ -680,8 +701,8 @@ def wrap_playback_url(url: str) -> str:
 
     For Android/Google TV Stremio, keep the stream URL short and HEAD-safe.
 
-    - If WRAP_URL_SHORT=true, we store the upstream URL in an in-memory map and emit /r/<token>.
-    - Otherwise, fall back to base64-encoding the full URL (legacy).
+    - If WRAP_URL_SHORT=true, we emit a restart-safe compressed token /r/z... (no in-memory dependency).
+    - Otherwise, we fall back to base64-encoding the full URL (legacy).
     """
     if not url or not WRAP_PLAYBACK_URLS:
         return url
@@ -695,7 +716,8 @@ def wrap_playback_url(url: str) -> str:
         pass
     if u.startswith('http://') or u.startswith('https://'):
         if WRAP_URL_SHORT:
-            tok = _wrap_url_store(u)
+            # Restart-safe short token: compressed URL (no in-memory dependency)
+            tok = _zurl_encode(u)
             wrapped = _public_base_url() + 'r/' + tok
         else:
             wrapped = _public_base_url() + 'r/' + _b64u_encode(u)
@@ -821,15 +843,25 @@ def redirect_stream_url(token: str):
     GET always returns 302 Location to the real upstream playback URL.
     """
     # Basic token validation (avoid abuse / pathological decode)
-    if not token or len(token) > 4096 or re.fullmatch(r"[A-Za-z0-9_-]+", token) is None:
+    if not token or len(token) > 4096 or re.fullmatch(r"[A-Za-z0-9_-]+=*", token) is None:
         return ("", 404)
 
     # Resolve token -> upstream URL
     url = None
+
+    # 1) Backward-compat: old in-memory short tokens
     if WRAP_URL_SHORT:
         url = _wrap_url_load(token)
+
+    # 2) Restart-safe compressed tokens (preferred)
+    if not url and token.startswith("z"):
+        try:
+            url = _zurl_decode(token)
+        except Exception:
+            url = None
+
+    # 3) Legacy: token may be base64 of the full URL
     if not url:
-        # Legacy: token may be base64 of the full URL
         try:
             url = _b64u_decode(token)
         except Exception:
@@ -1016,10 +1048,6 @@ def android_sanitize_out_stream(stream: Any) -> Optional[Dict[str, Any]]:
 
     # url is required
     out["url"] = url
-    # Strip infoHash unless enabled (strict clients + privacy)
-    if not WRAP_EMIT_INFOHASH and not USENET_EMIT_INFOHASH:
-        # infoHash isn't a required Stremio field and can trigger strict-client schema issues.
-        stream.pop('infoHash', None)
 
     # name (optional but strongly recommended for UI)
     name = stream.get("name")
@@ -1371,108 +1399,23 @@ def api_key_for_provider(provider: str) -> str:
 # ---------------------------
 # Expected metadata (real TMDB fetch)
 # ---------------------------
-@lru_cache(maxsize=4000)
-def _tmdb_find_by_imdb(imdb_id: str) -> Dict[str, Any]:
-    if not TMDB_API_KEY or not imdb_id:
-        return {}
-    try:
-        url = f"https://api.themoviedb.org/3/find/{imdb_id}"
-        r = session.get(
-            url,
-            params={"api_key": TMDB_API_KEY, "external_source": "imdb_id", "language": "en-US"},
-            timeout=TMDB_TIMEOUT,
-        )
-        r.raise_for_status()
-        return r.json() if r.content else {}
-    except Exception as e:
-        logger.warning(f"TMDB find failed: {e}")
-        return {}
-
-@lru_cache(maxsize=8000)
-def _tmdb_episode_title(tv_id: int, season: int, episode: int) -> str:
-    if not TMDB_API_KEY or not tv_id or not season or not episode:
-        return ""
-    try:
-        url = f"https://api.themoviedb.org/3/tv/{tv_id}/season/{season}/episode/{episode}"
-        r = session.get(url, params={"api_key": TMDB_API_KEY, "language": "en-US"}, timeout=TMDB_TIMEOUT)
-        r.raise_for_status()
-        data = r.json() if r.content else {}
-        name = data.get("name") or ""
-        return normalize_display_title(name)
-    except Exception:
-        return ""
-
 @lru_cache(maxsize=2000)
 def get_expected_metadata(type_: str, id_: str) -> Dict[str, Any]:
-    """Fetch expected title/year (and episode title when available) from TMDB.
-
-    Supports:
-      - TMDB IDs (numeric)
-      - IMDb IDs (tt123...) via /find/{imdb_id}?external_source=imdb_id
-      - Stremio series IDs like tt...:S:E (episode title fetched via TMDB tv endpoint)
-    """
     if not TMDB_API_KEY:
         return {"title": "", "year": None, "type": type_}
-
-    # Parse base id + optional S/E (Stremio uses imdb:season:episode)
-    season = episode = None
-    base_id = id_
-    if type_ == "series" and ":" in id_:
-        parts = id_.split(":")
-        base_id = parts[0]
-        if len(parts) >= 3:
-            try:
-                season = int(parts[-2])
-                episode = int(parts[-1])
-            except Exception:
-                season = episode = None
-
-    route = "movie" if type_ == "movie" else "tv"
-
-    title = ""
-    year = None
-    tmdb_id = None
-    base_id = (base_id or "").strip()
-
-    if re.fullmatch(r"tt\d{5,12}", base_id):
-        data = _tmdb_find_by_imdb(base_id)
-        key = "movie_results" if route == "movie" else "tv_results"
-        results = data.get(key) if isinstance(data, dict) else None
-        if not results and route == "tv":
-            results = data.get("movie_results") if isinstance(data, dict) else None
-        if isinstance(results, list) and results:
-            hit = results[0] if isinstance(results[0], dict) else {}
-            tmdb_id = hit.get("id")
-            title = hit.get("title") or hit.get("name") or ""
-            date = hit.get("release_date") or hit.get("first_air_date") or ""
-            try:
-                year = int(date[:4]) if date else None
-            except Exception:
-                year = None
-
-    elif base_id.isdigit():
-        tmdb_id = int(base_id)
-
-    if tmdb_id and (not title or year is None):
-        try:
-            url = f"https://api.themoviedb.org/3/{route}/{tmdb_id}"
-            r = session.get(url, params={"api_key": TMDB_API_KEY, "language": "en-US"}, timeout=TMDB_TIMEOUT)
-            r.raise_for_status()
-            data = r.json() if r.content else {}
-            title = data.get("title") or data.get("name") or title
-            date = data.get("release_date") or data.get("first_air_date") or ""
-            year = int(date[:4]) if date else year
-        except Exception as e:
-            logger.warning(f"TMDB details failed: {e}")
-
-    ep_title = ""
-    if route == "tv" and tmdb_id and season and episode:
-        try:
-            ep_title = _tmdb_episode_title(int(tmdb_id), int(season), int(episode))
-        except Exception:
-            ep_title = ""
-
-    return {"title": normalize_display_title(title or ""), "year": year, "type": type_, "tmdb_id": tmdb_id, "episode_title": ep_title}
+    id_clean = id_.split(":")[0] if ":" in id_ else id_
+    base = f"https://api.themoviedb.org/3/{'movie' if type_ == 'movie' else 'tv'}/{id_clean}"
+    try:
+        resp = session.get(f"{base}?api_key={TMDB_API_KEY}&language=en-US", timeout=TMDB_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        title = data.get("title") or data.get("name", "")
+        release_date = data.get("release_date") or data.get("first_air_date", "")
+        year = int(release_date[:4]) if release_date else None
+        return {"title": title, "year": year, "type": type_}
+    except Exception as e:
+        logger.warning(f"TMDB fetch failed: {e}")
+        return {"title": "", "year": None, "type": type_}
 
 # ---------------------------
 # Formatting: guaranteed 2-left + 3-right (title + 2 lines)
@@ -1527,10 +1470,7 @@ def format_stream_inplace(
     base_title = normalize_display_title(base_title)
     year = expected.get('year')
     ep_tag = f" S{season:02d}E{episode:02d}" if season and episode else ""
-    ep_name = expected.get('episode_title') or ''
-    ep_name = normalize_display_title(ep_name) if ep_name else ''
-    title_core = f"{base_title}{ep_tag}" + (f" • {ep_name}" if ep_name else "")
-    s['title'] = _truncate(f"{title_core}" + (f" ({year})" if year else ""), MAX_TITLE_CHARS)
+    s['title'] = _truncate(f"{base_title}{ep_tag}" + (f" ({year})" if year else ""), MAX_TITLE_CHARS)
 
     # Description: 2 clean lines (or single line if NAME_SINGLE_LINE)
     line1_bits = [p for p in [audio, lang, codec, source] if p]
@@ -1540,24 +1480,14 @@ def format_stream_inplace(
     # Ensure machine-visible hints are present for downstream (Stremio UI + other tools)
     bh = s.setdefault('behaviorHints', {})
     ih = (m.get('infohash') or '').strip().lower()
-
-    # Do NOT leak infoHash unless explicitly enabled.
-    prov = (m.get('provider') or '').upper()
-    emit_hash = bool(WRAP_EMIT_INFOHASH) or (prov in (p.strip().upper() for p in USENET_PRIORITY) and bool(USENET_EMIT_INFOHASH))
-
-    if emit_hash:
-        if ih and not s.get('infoHash'):
-            s['infoHash'] = ih
-        elif USENET_PSEUDO_INFOHASH and not s.get('infoHash'):
-            # Optional: generate a stable pseudo-hash for usenet so dedup works across clients
-            uh = (m.get('usenet_hash') or '').strip().lower()
-            pseudo = _pseudo_infohash_usenet(uh) if uh else ''
-            if pseudo:
-                s['infoHash'] = pseudo
-                bh['usenetHash'] = uh
-    else:
-        # Strip any upstream-provided infoHash too (privacy + strict-client safety)
-        s.pop('infoHash', None)
+    if ih and not s.get('infoHash'):
+        s['infoHash'] = ih
+    elif USENET_PSEUDO_INFOHASH and not s.get('infoHash'):
+        uh = (m.get('usenet_hash') or '').strip().lower()
+        pseudo = _pseudo_infohash_usenet(uh) if uh else ''
+        if pseudo:
+            s['infoHash'] = pseudo
+            bh['usenetHash'] = uh
 
 
     bh['provider'] = prov
@@ -1940,6 +1870,10 @@ def get_streams(
     )
     aio_timeout = float(ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT)
     p2_timeout = float(ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT)
+    logger.debug(
+        "DEBUG_CONFIG rid=%s AIO_BASE=%s AIO_AUTH_set=%s PROV2_BASE=%s PROV2_AUTH_set=%s WRAP_URL_SHORT=%s",
+        _rid(), AIO_BASE, bool(AIO_AUTH), PROV2_BASE, bool(PROV2_AUTH), bool(WRAP_URL_SHORT)
+    )
 
     # After AIO completes, don't block long for P2.
     p2_grace = 1.5 if is_android else 4.0
