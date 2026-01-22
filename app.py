@@ -1,7 +1,3 @@
-
-# Build identifier for deploy verification
-BUILD_ID = os.getenv('BUILD_TAG') or os.getenv('RENDER_GIT_COMMIT') or os.getenv('GIT_COMMIT') or 'unknown'
-
 from __future__ import annotations
 import base64
 import hashlib
