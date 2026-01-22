@@ -12,7 +12,7 @@ import difflib
 import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 import requests
@@ -191,10 +191,11 @@ VERIFY_STREAM_TIMEOUT = _safe_float(os.environ.get('VERIFY_STREAM_TIMEOUT', '4')
 
 # Stronger playback verification (catches upstream /static/500.mp4 placeholders)
 VERIFY_RANGE = _parse_bool(os.environ.get("VERIFY_RANGE", "true"), True)
-VERIFY_DROP_STATIC_500 = _parse_bool(os.environ.get("VERIFY_DROP_STATIC_500", "true"), True)
+VERIFY_DROP_STATIC_500 = _parse_bool(os.environ.get('VERIFY_DROP_STATIC_500', 'false'), False)  # FIXED: default off
 VERIFY_MIN_TOTAL_BYTES = _safe_int(os.environ.get('VERIFY_MIN_TOTAL_BYTES', '5000000'), 5000000)  # 5MB floor
-ANDROID_VERIFY_TOP_N = _safe_int(os.environ.get('ANDROID_VERIFY_TOP_N', '12'), 12)
-ANDROID_VERIFY_TIMEOUT = _safe_float(os.environ.get('ANDROID_VERIFY_TIMEOUT', '2.2'), 2.2)
+ANDROID_VERIFY_TOP_N = _safe_int(os.environ.get('ANDROID_VERIFY_TOP_N', '6'), 6)  # FIXED: reduced default
+ANDROID_VERIFY_TIMEOUT = _safe_float(os.environ.get('ANDROID_VERIFY_TIMEOUT', '3.0'), 3.0)  # FIXED: increased default
+ANDROID_VERIFY_OFF = _parse_bool(os.environ.get('ANDROID_VERIFY_OFF', 'false'), False)  # FIXED: disable Android verify
 
 
 # Force a minimum share of usenet results (if they exist)
@@ -416,32 +417,36 @@ def _verify_stream_url(s: Dict[str, Any], timeout: Optional[float] = None, range
         return True
 
     t = VERIFY_STREAM_TIMEOUT if timeout is None else timeout
-    rm = VERIFY_RANGE if range_mode is None else range_mode
+    rm = VERIFY_RANGE if range_mode is None else bool(range_mode)
+
+    headers = {'User-Agent': ''}
+    if rm:
+        # Range 0-0: enough to validate and detect placeholder redirects without downloading MBs
+        headers['Range'] = 'bytes=0-0'
 
     try:
         if rm:
-            r = fast_session.get(
-                url,
-                headers={'Range': 'bytes=0-0', 'User-Agent': ''},
-                timeout=t,
-                allow_redirects=True,
-                stream=True,
-            )
-            final_url = getattr(r, 'url', '') or ''
-            if VERIFY_DROP_STATIC_500 and _looks_like_static_500(final_url):
-                return False
+            r = requests.get(url, timeout=t, stream=True, allow_redirects=True, headers=headers)
+            final_url = (getattr(r, 'url', '') or '')
+            if _looks_like_static_500(final_url):
+                # If upstream returns placeholder /static/500.mp4, drop only when enabled
+                return not VERIFY_DROP_STATIC_500
+
             total = _parse_content_range_total(r.headers.get('Content-Range'))
             if total is not None and total < VERIFY_MIN_TOTAL_BYTES:
                 return False
+
             return 200 <= r.status_code < 400
 
-        r = fast_session.head(url, timeout=t, allow_redirects=True, headers={'User-Agent': ''})
+        r = requests.head(url, timeout=t, allow_redirects=True, headers=headers)
         if r.status_code in (405, 403, 401):
-            r = fast_session.get(url, timeout=t, stream=True, allow_redirects=True, headers={'User-Agent': ''})
+            r = requests.get(url, timeout=t, stream=True, allow_redirects=True, headers=headers)
+        final_url = (getattr(r, 'url', '') or '')
+        if _looks_like_static_500(final_url):
+            return not VERIFY_DROP_STATIC_500
         return 200 <= r.status_code < 400
     except Exception:
         return False
-
 
 def _provider_rank(provider: str) -> int:
     prov = (provider or '').upper().strip()
@@ -1792,12 +1797,19 @@ def build_stream_object_rich(
     if isinstance(v_sub, (list, dict)):
         bh_out["subtitles"] = v_sub
 
-    return {
+    out = {
         "name": name,
         "description": description,
         "url": out_url,
         "behaviorHints": bh_out,
     }
+
+    # FIXED: Add infoHash if available (required for Stremio torrent/debrid on Android)
+    h = (m.get('infohash') or '').lower().strip()
+    if h:
+        out['infoHash'] = h
+
+    return out
 def _auth_headers(auth: str) -> Dict[str, str]:
     headers: Dict[str, str] = {}
     if not auth:
@@ -2058,27 +2070,76 @@ def _drop_bad_top_n(
     candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]],
     top_n: int,
     timeout: float,
+    stats: Optional['PipeStats'] = None,
 ) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
-    """Drop obviously broken playback placeholders (e.g., redirects to /static/500.mp4) among top candidates."""
+    """Drop obviously broken playback placeholders among the top candidates.
+
+    Android can be strict; verifying sequentially can exceed gunicorn timeouts.
+    This verifies in parallel batches while preserving the original behavior:
+      - Drop candidates verified as bad until we collect `top_n` verified-good.
+      - Once we have `top_n` verified-good, stop verifying and return remaining candidates unverified.
+    """
     if top_n <= 0 or not candidates:
         return candidates
+
+    # Optional safety valve for debugging
+    if ANDROID_VERIFY_OFF:
+        return candidates
+
     kept: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     i = 0
-    while i < len(candidates):
-        s, m = candidates[i]
-        if len(kept) < top_n:
+    t0 = time.time()
+
+    batch_size = max(1, min(top_n, 12))
+
+    while len(kept) < top_n and i < len(candidates):
+        batch = candidates[i:i + batch_size]
+        n = len(batch)
+
+        def _worker(s: Dict[str, Any], idx: int) -> bool:
             try:
                 ok = _verify_stream_url(s, timeout=timeout, range_mode=True)
-                if not ok:
-                    i += 1
-                    continue
-            except Exception:
-                pass
-        kept.append((s, m))
-        i += 1
+                logger.debug("VERIFY rid=%s idx=%s ok=%s url_head=%s", _rid(), idx, ok, (s.get('url', '') or '')[:80])
+                return bool(ok)
+            except Exception as e:
+                logger.debug("VERIFY_ERR rid=%s idx=%s err=%s", _rid(), idx, e)
+                return False
+
+        results: List[bool] = [False] * n
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            fut_map = {ex.submit(_worker, s, i + j): j for j, (s, _m) in enumerate(batch)}
+            for fut in as_completed(fut_map):
+                j = fut_map[fut]
+                try:
+                    results[j] = bool(fut.result())
+                except Exception:
+                    results[j] = False
+
+        processed = 0
+        for j, ((s, m), ok) in enumerate(zip(batch, results)):
+            processed = j + 1
+            if ok:
+                kept.append((s, m))
+            else:
+                if stats is not None:
+                    stats.dropped_dead_url += 1
+
+            if len(kept) >= top_n:
+                # stop verifying; append remainder unverified
+                i = i + processed
+                kept.extend(candidates[i:])
+                ms = int((time.time() - t0) * 1000)
+                logger.info("VERIFY_PARALLEL rid=%s top_n=%s verified=%s kept=%s ms=%s",
+                            _rid(), top_n, i, len(kept), ms)
+                return kept
+
+        i += processed
+
+    kept.extend(candidates[i:])
+    ms = int((time.time() - t0) * 1000)
+    logger.info("VERIFY_PARALLEL rid=%s top_n=%s verified=%s kept=%s ms=%s",
+                _rid(), top_n, i, len(kept), ms)
     return kept
-
-
 
 def _res_to_int(res: str) -> int:
     r = (res or '').lower().strip()
