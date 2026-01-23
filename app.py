@@ -760,23 +760,16 @@ def wrap_playback_url(url: str) -> str:
 
     if u.startswith('http://') or u.startswith('https://'):
         if WRAP_URL_SHORT:
-            # Prefer truly short tokens for strict clients. We still *accept* long tokens in the redirector,
-            # but refuse to emit them because they can break Android/TV clients.
-            restart_safe = _is_true(os.environ.get('WRAP_URL_RESTART_SAFE', 'false'))
-            tok = _zurl_encode(u) if restart_safe else _wrap_url_store(u)
-            if len(tok or "") > 64:
-                if logger.isEnabledFor(logging.WARNING):
-                    logger.warning(
-                        "WRAP_TOKEN_TOO_LONG short=True restart_safe=%s tok_len=%d -> forcing short token",
-                        restart_safe, len(tok or "")
-                    )
-                tok = _wrap_url_store(u)
+            # Strict clients (Android/TV, some web/iphone builds) need short URLs.
+            # Always emit a short token; we can still *accept* long tokens in the redirector.
+            tok = _wrap_url_store(u)
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("WRAP_EMIT short=True restart_safe=%s tok_len=%d", restart_safe, len(tok or ""))
+                logger.debug("WRAP_EMIT short=True tok_len=%d", len(tok or ""))
         else:
-            tok = _b64u_encode(u)
+            restart_safe = _is_true(os.environ.get('WRAP_URL_RESTART_SAFE', 'false'))
+            tok = _zurl_encode(u) if restart_safe else _b64u_encode(u)
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("WRAP_EMIT short=False tok_len=%d", len(tok or ""))
+                logger.debug("WRAP_EMIT short=False restart_safe=%s tok_len=%d", restart_safe, len(tok or ""))
 
         wrapped = _public_base_url().rstrip('/') + '/r/' + tok
         if WRAP_DEBUG:
@@ -1867,6 +1860,17 @@ def build_stream_object_rich(
     if isinstance(v_sub, (list, dict)):
         bh_out["subtitles"] = v_sub
 
+    # Helpful hints for debugging/stats (safe under behaviorHints).
+    # These are ignored by strict clients, but make logs and troubleshooting much easier.
+    bh_out["provider"] = str((m or {}).get("provider") or raw_bh.get("provider") or "UNK").upper()
+    bh_out["source"] = str((m or {}).get("source") or raw_bh.get("source") or "UNK")
+    if isinstance(raw_bh.get("cached"), (bool, str)):
+        bh_out["cached"] = raw_bh.get("cached")
+    elif isinstance((m or {}).get("cached"), (bool, str)):
+        bh_out["cached"] = (m or {}).get("cached")
+    elif cached_hint == "LIKELY":
+        bh_out["cached"] = "LIKELY"
+
     out = {
         "name": name,
         "description": description,
@@ -2061,6 +2065,17 @@ def get_streams(
     aio_in = len(aio_streams)
     p2_in = len(prov2_streams)
 
+    # Pre-cap each provider feed to keep CPU bounded on huge payloads.
+    # This preserves balance between AIO and P2 while still allowing a later global re-rank.
+    PRECAP_PER_PROVIDER = _safe_int(os.environ.get('PRECAP_PER_PROVIDER', '125'), 125)
+    if PRECAP_PER_PROVIDER > 0:
+        if len(aio_streams) > PRECAP_PER_PROVIDER:
+            logger.info("PRECAP_AIO rid=%s before=%d after=%d", _rid(), len(aio_streams), PRECAP_PER_PROVIDER)
+            aio_streams = aio_streams[:PRECAP_PER_PROVIDER]
+        if len(prov2_streams) > PRECAP_PER_PROVIDER:
+            logger.info("PRECAP_P2 rid=%s before=%d after=%d", _rid(), len(prov2_streams), PRECAP_PER_PROVIDER)
+            prov2_streams = prov2_streams[:PRECAP_PER_PROVIDER]
+
     if aio_streams:
         merged.extend(aio_streams)
     if prov2_streams:
@@ -2139,14 +2154,34 @@ def hash_stats(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
 def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
     """Stable dedup key.
 
-    - Prefer infohash when present (universal across providers).
-    - Fallback to normalized label when infohash is missing.
+    - Prefer infohash when present (universal across providers). Keep resolution to preserve distinct encodes.
+    - If no infohash, fallback to URL (hashed) + size when available.
+    - Last resort: normalized label.
     """
-    infohash = (meta.get('infohash') or '').lower().strip()
+    infohash = (
+        (meta.get('infohash') if isinstance(meta, dict) else None)
+        or (meta.get('infoHash') if isinstance(meta, dict) else None)
+        or (stream.get('infoHash') if isinstance(stream, dict) else None)
+        or (stream.get('infohash') if isinstance(stream, dict) else None)
+        or ''
+    )
+    infohash = (infohash or '').lower().strip()
     res = (meta.get('res') or 'SD').upper()
 
     if infohash:
-        return f"{infohash}:{res}"
+        return f"h:{infohash}:{res}"
+
+    raw_url = (stream.get('url') or stream.get('externalUrl') or '')
+    raw_url = (raw_url or '').strip()
+    size = meta.get('size') or meta.get('bytes') or meta.get('videoSize') or 0
+    try:
+        size_i = int(size or 0)
+    except Exception:
+        size_i = 0
+
+    if raw_url:
+        uhash = hashlib.sha1(raw_url.encode('utf-8')).hexdigest()[:16]
+        return f"u:{uhash}:{size_i}:{res}"
 
     bh = stream.get('behaviorHints') or {}
     try:
@@ -2156,7 +2191,7 @@ def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
     except Exception:
         normalized_label = ''
 
-    return f"nohash:{normalized_label}:{res}"
+    return f"nohash:{normalized_label}:{size_i}:{res}"
 
 
 
@@ -2287,8 +2322,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     bad_hashes = _load_fakes_db() if USE_FAKES_DB else set()
 
     # Early cap & cheap pre-dedup: large merged inputs can dominate CPU time (drops/dedup/sort).
-    EARLY_CAP = _safe_int(os.environ.get("EARLY_CAP", "200"), 200)
-    MAX_CANDIDATES = _safe_int(os.environ.get("MAX_CANDIDATES", "200"), 200)
+    EARLY_CAP = _safe_int(os.environ.get("EARLY_CAP", "250"), 250)
+    MAX_CANDIDATES = _safe_int(os.environ.get("MAX_CANDIDATES", "250"), 250)
 
     def _quick_provider(_s: Dict[str, Any]) -> str:
         bh = (_s.get("behaviorHints") or {})
@@ -2735,6 +2770,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # Format (last step)
     delivered: List[Dict[str, Any]] = []
+    delivered_dbg: List[Dict[str, Any]] = []  # debug-only (not returned)
     for s, m in candidates[:deliver_cap_eff]:
         h = (m.get("infohash") or "").lower().strip()
         cached_marker = m.get("cached")
@@ -2749,6 +2785,17 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         out_url = raw_url
         if WRAP_PLAYBACK_URLS and isinstance(raw_url, str) and raw_url:
             out_url = wrap_playback_url(raw_url)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            delivered_dbg.append({
+                "name": s.get("name", ""),
+                "provider": (m.get("provider") or "UNK"),
+                "res": (m.get("res") or "SD"),
+                "seeders": int(m.get("seeders") or 0),
+                "cached": cached_marker if cached_marker is not None else (cached_hint or ""),
+                "has_hash": bool(h or s.get("infoHash") or s.get("infohash")),
+                "url_len": len(out_url or ""),
+            })
 
         if OUTPUT_NEW_OBJECT:
             delivered.append(
@@ -2780,10 +2827,19 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             s["url"] = out_url
             delivered.append(s)
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(f"DELIVERED_TOP5 rid={_rid()} count={len(delivered)}")
-        for i, _s in enumerate(delivered[:5]):
-            _bh = _s.get('behaviorHints') or {}
-            logger.debug(f"  #{i} name='{_s.get('name')}' provider={_bh.get('provider','na')} cached={_bh.get('cached','na')} hash={'yes' if _s.get('infoHash') else 'no'} source={_bh.get('source','na')}")
+        logger.debug("DELIVERED_TOP5 rid=%s count=%d", _rid(), len(delivered))
+        for i, d in enumerate(delivered_dbg[:5]):
+            logger.debug(
+                "  #%d res=%s seeders=%s prov=%s cached=%s hash=%s url_len=%s name=%r",
+                i,
+                d.get("res"),
+                d.get("seeders"),
+                d.get("provider"),
+                d.get("cached"),
+                "yes" if d.get("has_hash") else "no",
+                d.get("url_len"),
+                d.get("name"),
+            )
 
     stats.delivered = len(delivered)
     return delivered, stats
