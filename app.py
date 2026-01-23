@@ -2319,20 +2319,28 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     except Exception as _e:
         logger.debug(f"HASH_STATS_ERR rid={_rid()} err={_e}")
 
-    # Sorting: enforce premium streams first, then resolution/seeders.
-    # This makes the first MAX_DELIVER feel like a true "premium" view.
+    # Sorting: quality-first global sort (res/seeders first; provider/cached as tie-breakers).
+    # Prevents high-quality results from lower-ranked providers from being buried.
 
+    # NEW: Quality-first sort to prevent good premium links (e.g., high-res RD/AD) from being buried.
+    # Order: res desc > seeders desc > provider rank asc > cached-ness asc.
     def sort_key(pair: Tuple[Dict[str, Any], Dict[str, Any]]):
-        s, m = pair
+        _s, m = pair
+        m = m or {}
         prov = (m.get('provider', 'ZZ') or 'ZZ').upper()
-        prov_idx = _provider_rank(prov)
+        prov_idx = _provider_rank(prov)  # lower is better
         cached = m.get('cached')
-        cached_val = 0 if cached is True else 1 if cached == 'LIKELY' else 2
+        cached_val = 0 if cached is True else 1 if cached == 'LIKELY' else 2  # lower is better
         res = _res_to_int(m.get('res') or 'SD')
         seeders = int(m.get('seeders') or 0)
-        return (prov_idx, cached_val, -res, -seeders)
+        return (-res, -seeders, prov_idx, cached_val)
 
     out_pairs.sort(key=sort_key)
+    logger.debug(
+        "POST_SORT_TOP5 rid=%s %s",
+        rid,
+        [(m.get('res'), int(m.get('seeders') or 0), (m.get('provider') or 'NA'), m.get('cached')) for _, m in out_pairs[:5]]
+    )
 
     # Candidate window: a little bigger so we can satisfy usenet quotas.
     window = max(deliver_cap_eff, MIN_USENET_KEEP, MIN_USENET_DELIVER, 1)
