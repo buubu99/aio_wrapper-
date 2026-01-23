@@ -442,13 +442,22 @@ def _verify_stream_url(s: Dict[str, Any], timeout: Optional[float] = None, range
             total = _parse_content_range_total(r.headers.get('Content-Range'))
             if total is not None and total < VERIFY_MIN_TOTAL_BYTES:
                 return False
-            return 200 <= r.status_code < 400
+            # Status & content-type sanity (drop obvious non-video placeholders).
+            if r.status_code not in (200, 206):
+                return False
+            ct = (r.headers.get('Content-Type','') or '').lower()
+            if ct and not (ct.startswith('video/') or ('octet-stream' in ct) or ('mpegurl' in ct) or ('dash' in ct)):
+                return False
+            return True
 
         r = fast_session.head(url, timeout=t, allow_redirects=True, headers={'User-Agent': ''})
         if r.status_code in (405, 403, 401):
             r = fast_session.get(url, timeout=t, stream=True, allow_redirects=True, headers={'User-Agent': ''})
         final_url = getattr(r, 'url', '') or ''
         if _looks_like_static_500(final_url) or _looks_like_static_500(r.headers.get('Location','') or ''):
+            return False
+        ct = (r.headers.get('Content-Type','') or '').lower()
+        if ct and not (ct.startswith('video/') or ('octet-stream' in ct) or ('mpegurl' in ct) or ('dash' in ct)):
             return False
         return 200 <= r.status_code < 400
     except Exception:
@@ -1045,7 +1054,7 @@ session = requests.Session()
 CACHED_HISTORY: dict[str, bool] = {}
 
 CACHED_HISTORY_LOCK = threading.Lock()
-retry = Retry(total=5, connect=5, read=3, backoff_factor=0.8, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET", "POST"])
+retry = Retry(total=5, connect=5, read=3, redirect=3, backoff_factor=1.0, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET", "POST"])
 adapter = HTTPAdapter(max_retries=retry)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
@@ -2069,11 +2078,50 @@ def get_streams(
     # This preserves balance between AIO and P2 while still allowing a later global re-rank.
     PRECAP_PER_PROVIDER = _safe_int(os.environ.get('PRECAP_PER_PROVIDER', '125'), 125)
     if PRECAP_PER_PROVIDER > 0:
+        # Pre-cap sorting: keep best candidates before slicing (helps preserve TB/2160p streams).
+        def _precap_sort_key(_s: Dict[str, Any]) -> Tuple[int, int, int]:
+            if not isinstance(_s, dict):
+                return (0, 0, 0)
+            bh = (_s.get("behaviorHints") or {})
+            prov_raw = (_s.get("provider") or bh.get("provider") or bh.get("source") or "")
+            prov = str(prov_raw or "").upper().strip()
+            # If provider is missing, try a cheap token sniff from text.
+            if not prov:
+                txt = f"{_s.get('name','')} {_s.get('description','')} {bh.get('filename','')} {bh.get('source','')}".upper()
+                if re.search(r"(?<![A-Z0-9])TORBOX(?![A-Z0-9])|(?<![A-Z0-9])TB(?![A-Z0-9])", txt):
+                    prov = "TB"
+                elif re.search(r"(?<![A-Z0-9])REAL[- ]?DEBRID(?![A-Z0-9])|(?<![A-Z0-9])RD(?![A-Z0-9])", txt):
+                    prov = "RD"
+                elif re.search(r"(?<![A-Z0-9])ALL[- ]?DEBRID(?![A-Z0-9])|(?<![A-Z0-9])AD(?![A-Z0-9])", txt):
+                    prov = "AD"
+                elif re.search(r"(?<![A-Z0-9])NZBDAV(?![A-Z0-9])|(?<![A-Z0-9])ND(?![A-Z0-9])", txt):
+                    prov = "ND"
+                else:
+                    prov = "UNK"
+            # Resolution (cheap sniff)
+            txt2 = f"{_s.get('name','')} {_s.get('description','')} {bh.get('filename','')}".upper()
+            if "2160" in txt2 or "4K" in txt2:
+                res_i = 2160
+            elif "1080" in txt2:
+                res_i = 1080
+            elif "720" in txt2:
+                res_i = 720
+            else:
+                res_i = 0
+            try:
+                seed_i = int(_s.get("seeders") or _s.get("seeds") or 0)
+            except Exception:
+                seed_i = 0
+            # Higher is better: premium score, then resolution, then seeders.
+            prem = 999 - _provider_rank(prov)
+            return (prem, res_i, seed_i)
         if len(aio_streams) > PRECAP_PER_PROVIDER:
             logger.info("PRECAP_AIO rid=%s before=%d after=%d", _rid(), len(aio_streams), PRECAP_PER_PROVIDER)
+            aio_streams.sort(key=_precap_sort_key, reverse=True)
             aio_streams = aio_streams[:PRECAP_PER_PROVIDER]
         if len(prov2_streams) > PRECAP_PER_PROVIDER:
             logger.info("PRECAP_P2 rid=%s before=%d after=%d", _rid(), len(prov2_streams), PRECAP_PER_PROVIDER)
+            prov2_streams.sort(key=_precap_sort_key, reverse=True)
             prov2_streams = prov2_streams[:PRECAP_PER_PROVIDER]
 
     if aio_streams:
@@ -2191,7 +2239,9 @@ def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
     except Exception:
         normalized_label = ''
 
-    return f"nohash:{normalized_label}:{size_i}:{res}"
+    size_bucket = int(size_i / (500 * 1024 * 1024)) if size_i else -1
+    normalized_label = (normalized_label or '')[:80]
+    return f"nohash:{normalized_label}:{size_bucket}:{res}"
 
 
 
@@ -2401,6 +2451,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             logger.info("EARLY_CAP rid=%s capped=%d original=%d", rid, len(streams), orig_n)
         else:
             streams = pre
+            logger.info("NO_EARLY_CAP rid=%s original=%d cap=%d", rid, orig_n, EARLY_CAP)
 
 
     cleaned: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
@@ -2881,11 +2932,12 @@ def stream(type_: str, id_: str):
             is_android=is_android,
             client_timeout_s=(ANDROID_STREAM_TIMEOUT if is_android else DESKTOP_STREAM_TIMEOUT),
         )
+        # NOTE: filter_and_format returns a fresh PipeStats; set fetch timings after it returns.
+        out, stats = filter_and_format(type_, id_, streams, aio_in=aio_in, prov2_in=prov2_in, is_android=is_android)
         stats.aio_in = aio_in
         stats.prov2_in = prov2_in
         stats.ms_fetch_aio = ms_aio
         stats.ms_fetch_p2 = ms_p2
-        out, stats = filter_and_format(type_, id_, streams, aio_in=aio_in, prov2_in=prov2_in, is_android=is_android)
         cache_key = f"{type_}:{id_}"
         if out:
             cache_set(cache_key, out)
