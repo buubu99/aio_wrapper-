@@ -32,6 +32,14 @@ def _parse_bool(v: str, default: bool = False) -> bool:
         return False
     return default
 
+def _is_true(v: str, default: bool = False) -> bool:
+    """Compat helper: boolean env parsing.
+
+    Earlier snippets referenced _is_true(); keep it as an alias to _parse_bool.
+    """
+    return _parse_bool(v, default)
+
+
 def _normalize_base(raw: str) -> str:
     raw = (raw or "").strip().rstrip("/")
     # Accept either a base addon URL or a full manifest URL.
@@ -703,8 +711,8 @@ def _wrap_url_store(url: str) -> str:
                         return tok
                 _WRAP_URL_HASH_TO_TOKEN.pop(h, None)
 
-        # 12 bytes -> 16 chars base64url (no padding); stays well under Android URL limits
-        token = base64.urlsafe_b64encode(uuid.uuid4().bytes[:12]).decode("ascii").rstrip("=")
+        # 16 hex chars; stays well under Android URL limits
+        token = uuid.uuid4().hex[:16]  # 16 hex chars (Android-safe)
         _WRAP_URL_MAP[token] = (url, exp)
         if WRAPPER_DEDUP:
             _WRAP_URL_HASH_TO_TOKEN[h] = token
@@ -2279,8 +2287,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     bad_hashes = _load_fakes_db() if USE_FAKES_DB else set()
 
     # Early cap & cheap pre-dedup: large merged inputs can dominate CPU time (drops/dedup/sort).
-    EARLY_CAP = _safe_int(os.environ.get("EARLY_CAP", "300"), 300)
-    MAX_CANDIDATES = _safe_int(os.environ.get("MAX_CANDIDATES", "300"), 300)
+    EARLY_CAP = _safe_int(os.environ.get("EARLY_CAP", "200"), 200)
+    MAX_CANDIDATES = _safe_int(os.environ.get("MAX_CANDIDATES", "200"), 200)
 
     def _quick_provider(_s: Dict[str, Any]) -> str:
         bh = (_s.get("behaviorHints") or {})
