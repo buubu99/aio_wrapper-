@@ -12,7 +12,7 @@ import difflib
 import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, wait as FuturesWait, FIRST_COMPLETED
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 import requests
@@ -66,6 +66,14 @@ def _safe_float(v, default: float) -> float:
 def _safe_csv(v, default: str = "") -> list[str]:
     s = default if v is None else str(v)
     return [x.strip() for x in s.split(",") if x.strip()]
+
+
+# ---------------------------
+# Shared executor (so we can return early without waiting for per-request threads to finish)
+# ---------------------------
+FETCH_EXECUTOR_WORKERS = _safe_int(os.environ.get("FETCH_EXECUTOR_WORKERS", "8"), 8)
+_FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=max(2, int(FETCH_EXECUTOR_WORKERS)))
+
 
 
 # ---------------------------
@@ -129,6 +137,11 @@ ANDROID_AIO_TIMEOUT = _safe_float(os.environ.get('ANDROID_AIO_TIMEOUT', '18'), 1
 ANDROID_P2_TIMEOUT = _safe_float(os.environ.get('ANDROID_P2_TIMEOUT', '12'), 12.0)  # FIXED: increase default
 DESKTOP_AIO_TIMEOUT = _safe_float(os.environ.get('DESKTOP_AIO_TIMEOUT', '28'), 28.0)  # FIXED: increase default
 DESKTOP_P2_TIMEOUT = _safe_float(os.environ.get('DESKTOP_P2_TIMEOUT', '15'), 15.0)  # FIXED: increase default
+
+# Soft fetch budget (seconds): how long /stream will wait for upstreams before returning partial + cached.
+ANDROID_SOFT_BUDGET = _safe_float(os.environ.get('ANDROID_SOFT_BUDGET', '4.5'), 4.5)
+DESKTOP_SOFT_BUDGET = _safe_float(os.environ.get('DESKTOP_SOFT_BUDGET', '6.0'), 6.0)
+
 
 # TorBox API call timeout (seconds) used during cache checks.
 TB_API_TIMEOUT = _safe_float(os.environ.get('TB_API_TIMEOUT', '8'), 8.0)
@@ -230,6 +243,39 @@ _BLACKLIST_LOCK = threading.Lock()
 _FAKES_LOCK = threading.Lock()
 
 
+
+# --- infohash normalization ---
+_INFOHASH_HEX_RE = re.compile(r"(?i)\b[0-9a-f]{40}\b")
+_INFOHASH_B32_RE = re.compile(r"(?i)\b[a-z2-7]{32}\b")
+
+def norm_infohash(raw: Any) -> str:
+    """Normalize many infohash/id forms into lowercase 40-hex when possible."""
+    if raw is None:
+        return ""
+    s = str(raw).strip().lower()
+    if not s:
+        return ""
+    # Common prefixes / encodings (we only need the underlying hash).
+    for p in ("urn:btih:", "btih:", "ih:", "infohash:", "hash:"):
+        if s.startswith(p):
+            s = s[len(p):]
+            break
+    # URL-encoded variants (best-effort).
+    s = s.replace("urn%3abtih%3a", "").replace("btih%3a", "").replace("ih%3a", "")
+
+    m = _INFOHASH_HEX_RE.search(s)
+    if m:
+        return m.group(0).lower()
+
+    # Base32 infohash (32 chars) -> hex (40 chars).
+    m2 = _INFOHASH_B32_RE.fullmatch(s)
+    if m2:
+        try:
+            return base64.b32decode(s.upper()).hex().lower()
+        except Exception:
+            return s
+
+    return s
 def _truncate(s: str, max_chars: int) -> str:
     if s is None:
         return ""
@@ -500,16 +546,20 @@ def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
                 cached = set()
                 for x in d:
                     if isinstance(x, str):
-                        cached.add(x)
+                        nx = norm_infohash(x)
+                        if nx:
+                            cached.add(nx)
                     elif isinstance(x, dict):
                         hx = x.get('hash') or x.get('info_hash')
                         if isinstance(hx, str):
-                            cached.add(hx.lower().strip())
+                            nx = norm_infohash(hx)
+                            if nx:
+                                cached.add(nx)
             else:
                 cached = set()
-            cached_norm = {str(x).lower().strip() for x in cached if x}
+            cached_norm = {norm_infohash(x) for x in cached if x}
             for h in batch:
-                hh = (h or '').lower().strip()
+                hh = norm_infohash(h)
                 out[hh] = hh in cached_norm
         except Exception:
             continue
@@ -1955,10 +2005,11 @@ def get_streams(
     is_android: bool = False,
     client_timeout_s: float | None = None,
 ) -> Tuple[List[Dict[str, Any]], int, int, int, int]:
-    """Fetch provider streams in parallel (best-effort) and return merged results.
+    """Fetch provider streams with an early-return budget and cache fallback.
 
-    Key behavior: after AIO returns, we only wait a *small grace period* for P2.
-    This prevents slow P2 reads from causing client timeouts / Gunicorn aborts.
+    Goal: keep /stream responsive even when AIOStreams is slow.
+    We wait up to a *soft budget* (DESKTOP_SOFT_BUDGET / ANDROID_SOFT_BUDGET) and then
+    return P2 + (cached AIO if available). AIO continues in the background and refreshes cache.
     """
     aio_streams: List[Dict[str, Any]] = []
     prov2_streams: List[Dict[str, Any]] = []
@@ -1972,6 +2023,8 @@ def get_streams(
     )
     aio_timeout = float(ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT)
     p2_timeout = float(ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT)
+    soft_budget = float(ANDROID_SOFT_BUDGET if is_android else DESKTOP_SOFT_BUDGET)
+
     logger.debug(
         "DEBUG_CONFIG rid=%s AIO_BASE=%s AIO_AUTH_set=%s PROV2_BASE=%s PROV2_AUTH_set=%s WRAP_URL_SHORT=%s",
         _rid(), AIO_BASE, bool(AIO_AUTH), PROV2_BASE, bool(PROV2_AUTH), bool(WRAP_URL_SHORT)
@@ -1980,101 +2033,155 @@ def get_streams(
     # After AIO completes, don't block long for P2.
     p2_grace = 1.5 if is_android else 4.0
 
-    # Fire both fetches at once. Always use the no-retry session so read timeouts don't balloon.
     aio_in = 0
     p2_in = 0
     merged: List[Dict[str, Any]] = []
 
+    # Hard deadline (client budget)
     deadline = time.monotonic() + max(0.1, total_timeout)
+    # Soft deadline (response target)
+    soft_deadline = min(deadline, time.monotonic() + max(0.05, soft_budget))
 
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    # Cache key for *raw* AIO results (used when AIO is slow).
+    aio_cache_key = f"aio:{type_}:{id_}"
+
+    # Submit both fetches on the shared executor so we can return early.
+    aio_fut = None
+    t_aio0 = None
+    if AIO_BASE:
         t_aio0 = time.time()
-        aio_fut = ex.submit(
-            _fetch_streams_from_base,
+        aio_fut = _FETCH_EXECUTOR.submit(
+            get_streams_single,
             AIO_BASE,
             AIO_AUTH,
             type_,
             id_,
             "AIO",
-            timeout=aio_timeout,
-            no_retry=True,
+            aio_timeout,
+            True,
         )
 
-        p2_fut = None
-        t_p20 = None
-        if PROV2_BASE:
-            t_p20 = time.time()
-            p2_fut = ex.submit(
-                _fetch_streams_from_base,
-                PROV2_BASE,
-                PROV2_AUTH,
-                type_,
-                id_,
-                "P2",
-                timeout=p2_timeout,
-                no_retry=True,
+        # Refresh raw-AIO cache when it eventually completes.
+        def _aio_cache_cb(fut):
+            try:
+                streams, _cnt, _ms = fut.result()
+                if isinstance(streams, list) and streams:
+                    cache_set(aio_cache_key, streams)
+            except Exception:
+                pass
+
+        try:
+            aio_fut.add_done_callback(_aio_cache_cb)
+        except Exception:
+            pass
+
+    p2_fut = None
+    t_p20 = None
+    if PROV2_BASE:
+        t_p20 = time.time()
+        p2_fut = _FETCH_EXECUTOR.submit(
+            get_streams_single,
+            PROV2_BASE,
+            PROV2_AUTH,
+            type_,
+            id_,
+            "P2",
+            p2_timeout,
+            True,
+        )
+
+    pending = set([f for f in (aio_fut, p2_fut) if f is not None])
+
+    def _take_aio_now():
+        nonlocal aio_streams, aio_in, aio_ms
+        if aio_fut is None:
+            return
+        try:
+            aio_streams, aio_in, aio_ms = aio_fut.result(timeout=0)
+            if not isinstance(aio_streams, list):
+                aio_streams, aio_in, aio_ms = [], 0, 0
+            else:
+                aio_in = len(aio_streams)
+                aio_ms = int(aio_ms or 0)
+        except Exception:
+            pass
+
+    def _take_p2_now():
+        nonlocal prov2_streams, p2_in, p2_ms
+        if p2_fut is None:
+            return
+        try:
+            prov2_streams, p2_in, p2_ms = p2_fut.result(timeout=0)
+            if not isinstance(prov2_streams, list):
+                prov2_streams, p2_in, p2_ms = [], 0, 0
+            else:
+                p2_in = len(prov2_streams)
+                p2_ms = int(p2_ms or 0)
+        except Exception:
+            pass
+
+    # Wait until first provider completes, bounded by soft deadline.
+    try:
+        rem = max(0.0, soft_deadline - time.monotonic())
+        if pending and rem > 0:
+            done, pending = FuturesWait(pending, timeout=rem, return_when=FIRST_COMPLETED)
+            if aio_fut in done:
+                _take_aio_now()
+            if p2_fut in done:
+                _take_p2_now()
+    except Exception:
+        pass
+
+    # If we got AIO, optionally wait a short grace for P2 (still bounded by soft deadline).
+    if aio_streams and p2_fut is not None and not prov2_streams:
+        try:
+            rem = max(0.0, soft_deadline - time.monotonic())
+            wait_s = min(p2_grace, rem)
+            if wait_s > 0:
+                prov2_streams, p2_in, p2_ms = p2_fut.result(timeout=wait_s)
+                if not isinstance(prov2_streams, list):
+                    prov2_streams, p2_in, p2_ms = [], 0, 0
+                else:
+                    p2_in = len(prov2_streams)
+                    p2_ms = int(p2_ms or 0)
+        except Exception:
+            pass
+
+    # If we got P2 first, do NOT wait for AIO; attach cached AIO if available (or take AIO instantly if already done).
+    if prov2_streams and not aio_streams:
+        _take_aio_now()
+        if not aio_streams:
+            cached = cache_get(aio_cache_key)
+            if isinstance(cached, list) and cached:
+                aio_streams = cached
+                aio_in = len(aio_streams)
+            waited_ms = int((time.time() - t_aio0) * 1000) if t_aio0 else 0
+            aio_ms = waited_ms
+            logger.info(
+                "AIO_EARLY_FALLBACK rid=%s waited_ms=%s cached=%s cached_len=%s",
+                _rid(), waited_ms, bool(aio_streams), len(aio_streams) if aio_streams else 0
             )
 
-        # 1) Primary: AIO
-        try:
-            rem = max(0.05, deadline - time.monotonic())
-            aio_streams = aio_fut.result(timeout=min(aio_timeout + 0.2, rem)) if aio_fut else []  # FIXED: get list only
-            if not isinstance(aio_streams, list):
-                aio_streams = []
-            aio_in = len(aio_streams)  # FIXED: compute count from len
-            aio_ms = int((time.time() - t_aio0) * 1000) if t_aio0 else 0
-        except FuturesTimeoutError:
+    # If neither produced in time, take anything already done; otherwise use cached AIO if present.
+    if not aio_streams:
+        _take_aio_now()
+    if not prov2_streams:
+        _take_p2_now()
+
+    if not aio_streams:
+        cached = cache_get(aio_cache_key)
+        if isinstance(cached, list) and cached:
+            aio_streams = cached
+            aio_in = len(aio_streams)
+        if t_aio0 and aio_ms == 0:
             aio_ms = int((time.time() - t_aio0) * 1000)
-            logger.error("AIO fetch timeout")
-            # Grace window: if AIO finishes shortly after the timeout, salvage it instead of dropping to 0.
-            if aio_fut is not None:
-                # Only wait if we still have time budget remaining.
-                max_grace = 0.9 if is_android else 1.5
-                grace = min(max_grace, max(0.0, deadline - time.monotonic()))
-                if grace > 0:
-                    time.sleep(grace)
-                if aio_fut.done():
-                    try:
-                        late = aio_fut.result(timeout=0)
-                        if isinstance(late, list):
-                            aio_streams = late
-                            aio_in = len(aio_streams)
-                            aio_ms = int((time.time() - t_aio0) * 1000)
-                            logger.info("AIO late success after timeout (salvaged) rid=%s aio_in=%s aio_ms=%s", _rid(), aio_in, aio_ms)
-                    except Exception as e:
-                        logger.error("AIO late fetch error: %s", e)
-        except Exception as e:
-            aio_ms = int((time.time() - t_aio0) * 1000)
-            logger.error(f"AIO fetch error: {e}")
 
-        # 2) Secondary: P2 (best-effort)
-        if p2_fut is not None and t_p20 is not None:
-            try:
-                rem = max(0.0, deadline - time.monotonic())
-                if aio_streams:
-                    # AIO gave us something; only wait a short grace period for P2.
-                    wait_s = min(p2_grace, rem)
-                else:
-                    # If AIO failed/empty, give P2 more room (still bounded by deadline).
-                    wait_s = min(p2_timeout + 0.2, rem)
+    if t_p20 and p2_ms == 0 and (p2_fut is not None) and not prov2_streams:
+        p2_ms = int((time.time() - t_p20) * 1000)
 
-                if wait_s > 0:
-                    prov2_streams = p2_fut.result(timeout=wait_s) if p2_fut else []  # FIXED: get list only
-                    if not isinstance(prov2_streams, list):
-                        prov2_streams = []
-                    p2_in = len(prov2_streams)  # FIXED: compute count from len
-                    p2_ms = int((time.time() - t_p20) * 1000) if t_p20 else 0
-            except FuturesTimeoutError:
-                p2_ms = int((time.time() - t_p20) * 1000)
-                logger.error("P2 fetch timeout")
-            except Exception as e:
-                p2_ms = int((time.time() - t_p20) * 1000)
-                logger.error(f"P2 fetch error: {e}")
+    # Pre-caps and merge happen below.
 
-    aio_in = len(aio_streams)
-    p2_in = len(prov2_streams)
-
-    # Pre-cap each provider feed to keep CPU bounded on huge payloads.
+# Pre-cap each provider feed to keep CPU bounded on huge payloads.
     # This preserves balance between AIO and P2 while still allowing a later global re-rank.
     PRECAP_PER_PROVIDER = _safe_int(os.environ.get('PRECAP_PER_PROVIDER', '125'), 125)
     if PRECAP_PER_PROVIDER > 0:
@@ -2683,8 +2790,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     break
                 if (_m.get('provider') or '').upper() != 'TB':
                     continue
-                h = (_m.get('infohash') or '').lower().strip()
-                if h and h not in seen_h:
+                h = norm_infohash(_m.get('infohash'))
+                if h and re.fullmatch(r"[0-9a-f]{40}", h) and h not in seen_h:
                     seen_h.add(h)
                     hashes.append(h)
             if len(hashes) >= TB_API_MIN_HASHES:
@@ -2699,9 +2806,12 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         kept = []
         dropped_uncached = 0
         dropped_uncached_tb = 0
+        tb_flip = 0
+        tb_total = 0
         for _s, _m in candidates:
             provider = (_m.get('provider') or '').upper()
-            h = (_m.get('infohash') or '').lower().strip()
+            h = norm_infohash(_m.get('infohash'))
+            orig_tb_cached = (_m.get('cached') is True)
             bh = _s.get('behaviorHints') or {}
             text = (str(_s.get('name') or '') + ' ' + str(_s.get('description') or '') + ' ' + str(bh.get('filename') or '') + ' ' + str(bh.get('bingeGroup') or '')).lower()
 
@@ -2724,6 +2834,10 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 cached_marker = None
 
             _m['cached'] = cached_marker
+            if provider == 'TB' and h:
+                tb_total += 1
+                if cached_marker is True and not orig_tb_cached:
+                    tb_flip += 1
             if h and isinstance(cached_marker, bool):
                 with CACHED_HISTORY_LOCK:
                     CACHED_HISTORY[h] = cached_marker
@@ -2738,6 +2852,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             else:
                 kept.append((_s, _m))
 
+        if tb_total:
+            logger.info("TB_FLIPS rid=%s flipped=%s/%s tb_api_hashes=%s", _rid(), tb_flip, tb_total, int(stats.tb_api_hashes or 0))
         candidates = kept
         stats.dropped_uncached += dropped_uncached
         stats.dropped_uncached_tb += dropped_uncached_tb
