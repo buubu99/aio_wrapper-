@@ -429,7 +429,7 @@ def _verify_stream_url(s: Dict[str, Any], timeout: Optional[float] = None, range
                 stream=True,
             )
             final_url = getattr(r, 'url', '') or ''
-            if VERIFY_DROP_STATIC_500 and _looks_like_static_500(final_url):
+            if _looks_like_static_500(final_url) or _looks_like_static_500(r.headers.get('Location','') or ''):
                 return False
             total = _parse_content_range_total(r.headers.get('Content-Range'))
             if total is not None and total < VERIFY_MIN_TOTAL_BYTES:
@@ -439,6 +439,9 @@ def _verify_stream_url(s: Dict[str, Any], timeout: Optional[float] = None, range
         r = fast_session.head(url, timeout=t, allow_redirects=True, headers={'User-Agent': ''})
         if r.status_code in (405, 403, 401):
             r = fast_session.get(url, timeout=t, stream=True, allow_redirects=True, headers={'User-Agent': ''})
+        final_url = getattr(r, 'url', '') or ''
+        if _looks_like_static_500(final_url) or _looks_like_static_500(r.headers.get('Location','') or ''):
+            return False
         return 200 <= r.status_code < 400
     except Exception:
         return False
@@ -673,19 +676,45 @@ def _zurl_decode(token: str) -> str:
 # In-memory short URL map for /r/<token> -> upstream URL
 # Note: With WEB_CONCURRENCY>1, each worker has its own map; keep concurrency=1 for reliability.
 _WRAP_URL_MAP = {}  # token -> (url, expires_epoch)
+_WRAP_URL_HASH_TO_TOKEN = {}  # sha256(url) -> token (best-effort dedup)
 _WRAP_URL_LOCK = threading.Lock()
 
 def _wrap_url_store(url: str) -> str:
-    """Store a playback URL and return an opaque short token."""
-    import os, time, base64
-    # 9 random bytes -> 12 chars base64url (no padding)
-    token = base64.urlsafe_b64encode(os.urandom(9)).decode('ascii').rstrip('=')
+    """Store a playback URL and return an opaque short token.
+
+    This is an in-memory map per-process. If you rely on these tokens, keep GUNICORN_CONCURRENCY=1.
+    """
+    import time, base64, hashlib, uuid
+
     exp = time.time() + max(60, int(WRAP_URL_TTL or 3600))
+    h = hashlib.sha256(url.encode("utf-8")).hexdigest()
+
     with _WRAP_URL_LOCK:
+        if WRAPPER_DEDUP:
+            tok = _WRAP_URL_HASH_TO_TOKEN.get(h)
+            if tok:
+                val = _WRAP_URL_MAP.get(tok)
+                if val:
+                    old_url, old_exp = val
+                    if old_url == url and (not old_exp or time.time() <= old_exp):
+                        _WRAP_URL_MAP[tok] = (url, exp)  # refresh TTL
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug("REUSED_TOKEN len=%d", len(tok))
+                        return tok
+                _WRAP_URL_HASH_TO_TOKEN.pop(h, None)
+
+        # 12 bytes -> 16 chars base64url (no padding); stays well under Android URL limits
+        token = base64.urlsafe_b64encode(uuid.uuid4().bytes[:12]).decode("ascii").rstrip("=")
         _WRAP_URL_MAP[token] = (url, exp)
+        if WRAPPER_DEDUP:
+            _WRAP_URL_HASH_TO_TOKEN[h] = token
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("NEW_TOKEN len=%d", len(token))
     return token
 
+
 def _wrap_url_load(token: str) -> Optional[str]:
+    import hashlib
     now = time.time()
     with _WRAP_URL_LOCK:
         val = _WRAP_URL_MAP.get(token)
@@ -694,38 +723,61 @@ def _wrap_url_load(token: str) -> Optional[str]:
         url, exp = val
         if exp and now > exp:
             _WRAP_URL_MAP.pop(token, None)
+            if WRAPPER_DEDUP:
+                try:
+                    h = hashlib.sha256(url.encode("utf-8")).hexdigest()
+                    if _WRAP_URL_HASH_TO_TOKEN.get(h) == token:
+                        _WRAP_URL_HASH_TO_TOKEN.pop(h, None)
+                except Exception:
+                    pass
             return None
         return url
 
 def wrap_playback_url(url: str) -> str:
     """Wrap outbound http(s) URLs behind our HEAD-friendly redirector.
 
-    For Android/Google TV Stremio, keep the stream URL short and HEAD-safe.
-
-    - If WRAP_URL_SHORT=true, we emit a restart-safe compressed token /r/z... (no in-memory dependency).
-    - Otherwise, we fall back to base64-encoding the full URL (legacy).
+    For Android/Google TV Stremio, keep WRAP_URL_SHORT=true so emitted URLs stay short.
     """
     if not url or not WRAP_PLAYBACK_URLS:
         return url
     u = str(url)
-    # Avoid double-wrapping
+
+    # Avoid double-wrapping (if stream already points at our redirector)
     try:
         base = _public_base_url().rstrip('/')
         if u.startswith(base + '/r/'):
             return u
     except Exception:
         pass
+
     if u.startswith('http://') or u.startswith('https://'):
         if WRAP_URL_SHORT:
-            # Restart-safe short token: compressed URL (no in-memory dependency)
-            tok = _zurl_encode(u)
-            wrapped = _public_base_url() + 'r/' + tok
+            # Prefer truly short tokens for strict clients. We still *accept* long tokens in the redirector,
+            # but refuse to emit them because they can break Android/TV clients.
+            restart_safe = _is_true(os.environ.get('WRAP_URL_RESTART_SAFE', 'false'))
+            tok = _zurl_encode(u) if restart_safe else _wrap_url_store(u)
+            if len(tok or "") > 64:
+                if logger.isEnabledFor(logging.WARNING):
+                    logger.warning(
+                        "WRAP_TOKEN_TOO_LONG short=True restart_safe=%s tok_len=%d -> forcing short token",
+                        restart_safe, len(tok or "")
+                    )
+                tok = _wrap_url_store(u)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("WRAP_EMIT short=True restart_safe=%s tok_len=%d", restart_safe, len(tok or ""))
         else:
-            wrapped = _public_base_url() + 'r/' + _b64u_encode(u)
+            tok = _b64u_encode(u)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("WRAP_EMIT short=False tok_len=%d", len(tok or ""))
+
+        wrapped = _public_base_url().rstrip('/') + '/r/' + tok
         if WRAP_DEBUG:
             logging.getLogger('aio-wrapper').info(f'WRAP_URL -> {wrapped}')
         return wrapped
+
     return u
+
+
 
 
 app = Flask(__name__)
@@ -992,7 +1044,7 @@ session = requests.Session()
 CACHED_HISTORY: dict[str, bool] = {}
 
 CACHED_HISTORY_LOCK = threading.Lock()
-retry = Retry(total=3, backoff_factor=0.6, status_forcelist=[500, 502, 503, 504], allowed_methods=["GET", "POST"])
+retry = Retry(total=5, connect=5, read=3, backoff_factor=0.8, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET", "POST"])
 adapter = HTTPAdapter(max_retries=retry)
 session.mount("http://", adapter)
 session.mount("https://", adapter)
@@ -1285,7 +1337,21 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
         elif re.search(r"\bnzgeek\b", text):
             provider = "NG"
 
-    # Resolution
+        # Extra heuristic for emoji-tagged formatter names like "🟢TB⚡ ..."
+    if provider == "UNK":
+        up = text.upper()
+        if "🟢TB" in up or " TB⚡" in up or re.search(r"(?<![A-Z0-9])TB(?![A-Z0-9])", up):
+            provider = "TB"
+        elif "🟢RD" in up or re.search(r"(?<![A-Z0-9])RD(?![A-Z0-9])", up):
+            provider = "RD"
+        elif "🟢AD" in up or re.search(r"(?<![A-Z0-9])AD(?![A-Z0-9])", up):
+            provider = "AD"
+        elif "🟢DL" in up or re.search(r"(?<![A-Z0-9])DL(?![A-Z0-9])", up):
+            provider = "DL"
+        elif "USENET" in up or "NZB" in up or "NZBDAV" in up:
+            provider = "ND"
+
+# Resolution
     m = _RES_RE.search(text)
     res = (m.group(1).upper() if m else "SD")
     if res == "4K":
@@ -1939,6 +2005,23 @@ def get_streams(
         except FuturesTimeoutError:
             aio_ms = int((time.time() - t_aio0) * 1000)
             logger.error("AIO fetch timeout")
+            # Grace window: if AIO finishes shortly after the timeout, salvage it instead of dropping to 0.
+            if aio_fut is not None:
+                # Only wait if we still have time budget remaining.
+                max_grace = 0.9 if is_android else 1.5
+                grace = min(max_grace, max(0.0, deadline - time.monotonic()))
+                if grace > 0:
+                    time.sleep(grace)
+                if aio_fut.done():
+                    try:
+                        late = aio_fut.result(timeout=0)
+                        if isinstance(late, list):
+                            aio_streams = late
+                            aio_in = len(aio_streams)
+                            aio_ms = int((time.time() - t_aio0) * 1000)
+                            logger.info("AIO late success after timeout (salvaged) rid=%s aio_in=%s aio_ms=%s", _rid(), aio_in, aio_ms)
+                    except Exception as e:
+                        logger.error("AIO late fetch error: %s", e)
         except Exception as e:
             aio_ms = int((time.time() - t_aio0) * 1000)
             logger.error(f"AIO fetch error: {e}")
@@ -2195,6 +2278,88 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     bad_hashes = _load_fakes_db() if USE_FAKES_DB else set()
 
+    # Early cap & cheap pre-dedup: large merged inputs can dominate CPU time (drops/dedup/sort).
+    EARLY_CAP = _safe_int(os.environ.get("EARLY_CAP", "300"), 300)
+    MAX_CANDIDATES = _safe_int(os.environ.get("MAX_CANDIDATES", "300"), 300)
+
+    def _quick_provider(_s: Dict[str, Any]) -> str:
+        bh = (_s.get("behaviorHints") or {})
+        txt = f"{_s.get('name','')} {_s.get('description','')} {bh.get('filename','')} {bh.get('source','')} {bh.get('provider','')}".upper()
+        # Prefer explicit markers first
+        if re.search(r"(?<![A-Z0-9])TORBOX(?![A-Z0-9])", txt) or re.search(r"(?<![A-Z0-9])TB(?![A-Z0-9])", txt):
+            return "TB"
+        if re.search(r"(?<![A-Z0-9])REAL[- ]?DEBRID(?![A-Z0-9])", txt) or re.search(r"(?<![A-Z0-9])RD(?![A-Z0-9])", txt):
+            return "RD"
+        if re.search(r"(?<![A-Z0-9])ALL[- ]?DEBRID(?![A-Z0-9])", txt) or re.search(r"(?<![A-Z0-9])AD(?![A-Z0-9])", txt):
+            return "AD"
+        if re.search(r"(?<![A-Z0-9])DEBRID[- ]?LINK(?![A-Z0-9])", txt) or re.search(r"(?<![A-Z0-9])DL(?![A-Z0-9])", txt):
+            return "DL"
+        # Usenet-ish
+        if "USENET" in txt or "NZB" in txt or "NZBDAV" in txt or re.search(r"(?<![A-Z0-9])ND(?![A-Z0-9])", txt):
+            return "ND"
+        return "UNK"
+
+    def _quick_res_int(_s: Dict[str, Any]) -> int:
+        txt = f"{_s.get('name','')} {(_s.get('behaviorHints') or {}).get('filename','')}".upper()
+        if "2160" in txt or "4K" in txt:
+            return 2160
+        if "1080" in txt:
+            return 1080
+        if "720" in txt:
+            return 720
+        if "480" in txt:
+            return 480
+        return 0
+
+    def _quick_seeders(_s: Dict[str, Any]) -> int:
+        bh = (_s.get("behaviorHints") or {})
+        v = bh.get("seeders") if isinstance(bh, dict) else None
+        if v is None:
+            v = _s.get("seeders")
+        try:
+            return int(v or 0)
+        except Exception:
+            return 0
+
+    if EARLY_CAP > 0 and len(streams) > EARLY_CAP:
+        orig_n = len(streams)
+
+        # Cheap pre-dedup by infoHash/url before we do any heavy parsing.
+        seen_pre: set[str] = set()
+        pre: List[Dict[str, Any]] = []
+        for _s in streams:
+            if not isinstance(_s, dict):
+                continue
+            bh = (_s.get("behaviorHints") or {})
+            key = (
+                _s.get("infoHash")
+                or _s.get("infohash")
+                or (bh.get("infoHash") if isinstance(bh, dict) else None)
+                or _s.get("url")
+                or _s.get("externalUrl")
+                or (bh.get("url") if isinstance(bh, dict) else None)
+            )
+            if isinstance(key, str) and key:
+                if key in seen_pre:
+                    continue
+                seen_pre.add(key)
+            pre.append(_s)
+
+        if len(pre) != orig_n:
+            logger.info("PRE_DEDUP rid=%s before=%d after=%d", rid, orig_n, len(pre))
+
+        if len(pre) > EARLY_CAP:
+            pre.sort(key=lambda _s: (
+                (999 - _provider_rank(_quick_provider(_s))),
+                _quick_res_int(_s),
+                _quick_seeders(_s),
+            ), reverse=True)
+            streams = pre[:EARLY_CAP]
+            logger.info("EARLY_CAP rid=%s capped=%d original=%d", rid, len(streams), orig_n)
+        else:
+            streams = pre
+
+
     cleaned: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     for s in streams:
         if not isinstance(s, dict):
@@ -2319,45 +2484,40 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     except Exception as _e:
         logger.debug(f"HASH_STATS_ERR rid={_rid()} err={_e}")
 
-    # Sorting: quality-first global sort (res/seeders first; provider/cached as tie-breakers).
-    # Prevents high-quality results from lower-ranked providers from being buried.
+    # Sorting: enforce premium streams first, then resolution/seeders.
+    # This makes the first MAX_DELIVER feel like a true "premium" view.
 
-    # NEW: Quality-first sort to prevent good premium links (e.g., high-res RD/AD) from being buried.
-    # Order: res desc > seeders desc > provider rank asc > cached-ness asc.
     def sort_key(pair: Tuple[Dict[str, Any], Dict[str, Any]]):
-        _s, m = pair
-        m = m or {}
+        s, m = pair
         prov = (m.get('provider', 'ZZ') or 'ZZ').upper()
-        prov_idx = _provider_rank(prov)  # lower is better
+        prov_idx = _provider_rank(prov)
         cached = m.get('cached')
-        cached_val = 0 if cached is True else 1 if cached == 'LIKELY' else 2  # lower is better
+        cached_val = 0 if cached is True else 1 if cached == 'LIKELY' else 2
         res = _res_to_int(m.get('res') or 'SD')
         seeders = int(m.get('seeders') or 0)
-        return (-res, -seeders, prov_idx, cached_val)
+        return (prov_idx, cached_val, -res, -seeders)
 
     out_pairs.sort(key=sort_key)
-    logger.debug(
-        "POST_SORT_TOP5 rid=%s %s",
-        rid,
-        [(m.get('res'), int(m.get('seeders') or 0), (m.get('provider') or 'NA'), m.get('cached')) for _, m in out_pairs[:5]]
-    )
 
     # Candidate window: a little bigger so we can satisfy usenet quotas.
     window = max(deliver_cap_eff, MIN_USENET_KEEP, MIN_USENET_DELIVER, 1)
-    candidates = out_pairs[: min(len(out_pairs), window * 4, 500)]
+    candidates = out_pairs[: min(len(out_pairs), window * 4, MAX_CANDIDATES)]
 
     # Android/TV: remove streams that resolve to known error placeholders (e.g., /static/500.mp4)
     if is_android and not ANDROID_VERIFY_OFF:
-        try:
-            candidates = _drop_bad_top_n(
-                candidates,
-                ANDROID_VERIFY_TOP_N,
-                ANDROID_VERIFY_TIMEOUT,
-                stats=stats,
-                rid=rid,
-            )
-        except Exception as e:
-            logger.debug("ANDROID_VERIFY_SKIPPED rid=%s err=%s", rid, e)
+        if VERIFY_STREAM:
+            try:
+                candidates = _drop_bad_top_n(
+                    candidates,
+                    ANDROID_VERIFY_TOP_N,
+                    ANDROID_VERIFY_TIMEOUT,
+                    stats=stats,
+                    rid=rid,
+                )
+            except Exception as e:
+                logger.debug("ANDROID_VERIFY_SKIPPED rid=%s err=%s", rid, e)
+        else:
+            logger.info("VERIFY_SKIP rid=%s reason=VERIFY_STREAM=false", rid)
 
     # WebDAV strict (optional): drop TB items that WebDAV cannot confirm.
     # This can be used even without TB_API_KEY / TB_CACHE_HINTS.
@@ -2599,7 +2759,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         else:
             # Legacy behavior (kept as a safety switch)
             bh = s.setdefault("behaviorHints", {})
-            bh.setdefault("provider", (m.get("provider") or "UNK").upper())
+            # Always write provider/source for debugging & consistent stats
+            bh["provider"] = str(m.get("provider") or bh.get("provider") or "UNK").upper()
+            bh["source"] = str(m.get("source") or bh.get("source") or "UNK")
             if m.get("infohash"):
                 if isinstance(cached_marker, bool):
                     bh.setdefault("cached", cached_marker)
