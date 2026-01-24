@@ -11,7 +11,7 @@ import uuid
 import difflib
 import threading
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # ---------------------------
 # Pipeline stats (required)
@@ -38,6 +38,8 @@ class PipeStats:
     dropped_uncached: int = 0
     dropped_uncached_tb: int = 0
     dropped_android_magnets: int = 0
+    dropped_iphone_magnets: int = 0
+    client_platform: str = ""
     deduped: int = 0
     delivered: int = 0
 
@@ -49,10 +51,24 @@ class PipeStats:
     ms_tb_webdav: int = 0
     ms_tb_usenet: int = 0
 
+    # Per-filter timings (ms)
+    ms_title_mismatch: int = 0
+    ms_uncached_check: int = 0
+
     # Hash counts (diagnostics)
     tb_api_hashes: int = 0
     tb_webdav_hashes: int = 0
     tb_usenet_hashes: int = 0
+
+    # Debug/summary objects (kept small; used for logs and optional debug responses)
+    fetch_aio: Dict[str, Any] = field(default_factory=dict)
+    fetch_p2: Dict[str, Any] = field(default_factory=dict)
+    counts_in: Dict[str, Any] = field(default_factory=dict)
+    counts_out: Dict[str, Any] = field(default_factory=dict)
+
+    # Captured issues for weekly review
+    error_reasons: List[str] = field(default_factory=list)
+    flag_issues: List[str] = field(default_factory=list)
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from functools import lru_cache
@@ -127,6 +143,18 @@ PROV2_URL = os.environ.get("PROV2_URL", "")
 PROV2_BASE = _normalize_base(os.environ.get("PROV2_BASE", "") or PROV2_URL)
 PROV2_AUTH = os.environ.get("PROV2_AUTH", "")  # 'user:pass' for Basic auth if needed
 PROV2_TAG = os.environ.get("PROV2_TAG", "P2")
+AIO_TAG = os.environ.get("AIO_TAG", "AIO")
+WRAP_LOG_COUNTS = _parse_bool(os.environ.get("WRAP_LOG_COUNTS", "1"))
+WRAP_EMBED_DEBUG = _parse_bool(os.environ.get("WRAP_EMBED_DEBUG", "0"))
+
+# Weekly review flag thresholds (env-tunable)
+FLAG_HIGH_DROP_PCT = _safe_float(os.environ.get("FLAG_HIGH_DROP_PCT", "50"), 50.0)
+FLAG_SLOW_AIO_MS = _safe_int(os.environ.get("FLAG_SLOW_AIO_MS", "7000"), 7000)
+FLAG_SLOW_P2_MS = _safe_int(os.environ.get("FLAG_SLOW_P2_MS", "7000"), 7000)
+FLAG_SLOW_TB_API_MS = _safe_int(os.environ.get("FLAG_SLOW_TB_API_MS", "3000"), 3000)
+FLAG_SLOW_TITLE_MS = _safe_int(os.environ.get("FLAG_SLOW_TITLE_MS", "800"), 800)
+FLAG_SLOW_UNCACHED_MS = _safe_int(os.environ.get("FLAG_SLOW_UNCACHED_MS", "800"), 800)
+ENABLE_STATS_ENDPOINT = _parse_bool(os.environ.get("ENABLE_STATS_ENDPOINT", "true"), True)
 ANDROID_MAX_DELIVER = _safe_int(os.environ.get('ANDROID_MAX_DELIVER', '60'), 60)
 
 INPUT_CAP = _safe_int(os.environ.get('INPUT_CAP', '4500'), 4500)
@@ -1124,6 +1152,33 @@ def is_android_client() -> bool:
         or ("stremio" in ua_l and "tv" in ua_l)
     )
 
+
+def is_iphone_client() -> bool:
+    """Best-effort detection of iPhone/iOS-ish clients.
+
+    Used to apply the same strict behavior as Android on mobile platforms
+    (notably dropping magnet: URLs).
+    """
+    ua = request.headers.get("User-Agent", "") if has_request_context() else ""
+    ua_l = (ua or "").strip().lower()
+    if not ua_l:
+        return False
+    # Common iOS identifiers (avoid false positives on "like Mac OS X" alone)
+    return ("iphone" in ua_l) or ("ipad" in ua_l) or ("ipod" in ua_l) or ("ios" in ua_l) or ("cfnetwork" in ua_l)
+
+def client_platform(is_android: bool, is_iphone: bool) -> str:
+    if is_iphone:
+        return "iphone"
+    if is_android or is_iphone:
+        return "android"
+    # Safari / desktop apps
+    ua = request.headers.get("User-Agent", "") if has_request_context() else ""
+    ua_l = (ua or "").strip().lower()
+    if "windows" in ua_l or "mac os" in ua_l or "x11" in ua_l or "linux" in ua_l:
+        return "desktop"
+    return "unknown"
+
+
 # ---------------------------
 # HTTP session (retries)
 # ---------------------------
@@ -2009,8 +2064,11 @@ def _fetch_streams_from_base(base: str, auth: str, type_: str, id_: str, tag: st
         # Lightweight tagging for debug (does not expose tokens)
         for s in streams:
             if isinstance(s, dict):
-                s.setdefault('behaviorHints', {})
-                s['behaviorHints'].setdefault('source', tag)
+                bh = s.setdefault('behaviorHints', {})
+                # Preserve supplier tag separately from content 'source' (which later becomes WEB/BLURAY/etc)
+                bh.setdefault('wrap_src', tag)
+                bh.setdefault('source_tag', tag)
+                bh.setdefault('source', tag)
         return streams
     except json.JSONDecodeError as e:
         logger.error(f'{tag} JSON error: {e}; head={resp.text[:200] if "resp" in locals() else ""}')
@@ -2018,6 +2076,53 @@ def _fetch_streams_from_base(base: str, auth: str, type_: str, id_: str, tag: st
     except Exception as e:
         logger.error(f'{tag} fetch error: {e}')
         return []
+
+
+def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float = REQUEST_TIMEOUT, no_retry: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Fetch provider streams and return (streams, meta).
+
+    meta keys (safe for logs/debug):
+      - tag, ok, status, bytes, count, ms, err
+    """
+    meta: dict[str, Any] = {"tag": str(tag), "ok": False, "status": 0, "bytes": 0, "count": 0, "ms": 0, "err": ""}
+    t0 = time.time()
+    if not base:
+        meta["err"] = "no_base"
+        return [], meta
+    url = f"{base}/stream/{type_}/{id_}.json"
+    headers = _auth_headers(auth)
+    try:
+        sess = fast_session if no_retry else session
+        resp = sess.get(url, headers=headers, timeout=timeout)
+        meta["status"] = int(getattr(resp, "status_code", 0) or 0)
+        meta["bytes"] = int(len(getattr(resp, "content", b"") or b""))
+        if meta["status"] != 200:
+            meta["err"] = f"http_{meta['status']}"
+            return [], meta
+        data = resp.json() if resp.content else {}
+        streams = (data.get("streams") or [])[:INPUT_CAP]
+        # Lightweight tagging for debug (does not expose tokens)
+        for s in streams:
+            if isinstance(s, dict):
+                bh = s.setdefault("behaviorHints", {})
+                bh.setdefault("wrap_src", tag)
+                bh.setdefault("source_tag", tag)
+                bh.setdefault("source", tag)
+        meta["count"] = int(len(streams))
+        meta["ok"] = True
+        return streams, meta
+    except requests.Timeout:
+        meta["err"] = "timeout"
+        return [], meta
+    except json.JSONDecodeError:
+        meta["err"] = "json"
+        return [], meta
+    except Exception as e:
+        meta["err"] = type(e).__name__
+        return [], meta
+    finally:
+        meta["ms"] = int((time.time() - t0) * 1000)
+
 
 
 # ---------- FASTLANE (Patch 3): shared fetch executor + AIO cache ----------
@@ -2070,15 +2175,14 @@ def _aio_cache_key(type_: str, id_: str, extras) -> str:
     except Exception:
         return f"{type_}:{id_}:{str(extras)}"
 
-def get_streams_single(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float, no_retry: bool = False) -> tuple[list[dict[str, Any]], int, int]:
-    """Fetch a single provider and return (streams, count, ms)."""
-    t0 = time.time()
-    streams = _fetch_streams_from_base(base, auth, type_, id_, tag, timeout=timeout, no_retry=no_retry)
-    ms = int((time.time() - t0) * 1000)
-    return streams, len(streams), ms
+def get_streams_single(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float = REQUEST_TIMEOUT, no_retry: bool = False) -> tuple[list[dict[str, Any]], int, int, dict[str, Any]]:
+    """Fetch a single provider and return (streams, count, ms, meta)."""
+    streams, meta = _fetch_streams_from_base_with_meta(base, auth, type_, id_, tag, timeout=timeout, no_retry=no_retry)
+    ms = int(meta.get("ms") or 0)
+    return streams, int(len(streams)), ms, meta
 
 def try_fastlane(*, prov2_fut, aio_fut, aio_key: str, prov2_url: str, aio_url: str, type_: str, id_: str, is_android: bool, client_timeout_s: float, deadline: float):
-    """Prov2-only early return. Returns (out, aio_in, prov2_in, aio_ms, p2_ms, prefiltered, stats) or None."""
+    """Prov2-only early return. Returns (out, aio_in, prov2_in, aio_ms, p2_ms, prefiltered, stats, fetch_meta) or None."""
     if not FASTLANE_ENABLED or not prov2_fut or not prov2_url:
         return None
     # Cap how long we wait for Prov2 before deciding. We never block on AIO here.
@@ -2086,7 +2190,7 @@ def try_fastlane(*, prov2_fut, aio_fut, aio_key: str, prov2_url: str, aio_url: s
         prov2_timeout = (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT)
         remaining = max(0.05, float(deadline) - time.monotonic())
         wait_s = min(float(prov2_timeout), remaining)
-        p2_streams, prov2_in, p2_ms = prov2_fut.result(timeout=wait_s)
+        p2_streams, prov2_in, p2_ms, p2_meta = prov2_fut.result(timeout=wait_s)
     except FuturesTimeoutError:
         return None
     except Exception:
@@ -2094,7 +2198,7 @@ def try_fastlane(*, prov2_fut, aio_fut, aio_key: str, prov2_url: str, aio_url: s
 
     # Run the normal pipeline on Prov2-only to see if it's already "good enough".
     try:
-        out, stats = filter_and_format(type_, id_, p2_streams, aio_in=0, prov2_in=prov2_in, is_android=is_android)
+        out, stats = filter_and_format(type_, id_, p2_streams, aio_in=0, prov2_in=prov2_in, is_android=is_android, is_iphone=False)
     except Exception:
         return None
 
@@ -2119,7 +2223,7 @@ def try_fastlane(*, prov2_fut, aio_fut, aio_key: str, prov2_url: str, aio_url: s
     if aio_fut and AIO_CACHE_TTL_S > 0:
         def _update_cache_cb(fut):
             try:
-                s, cnt, _ms = fut.result()
+                s, cnt, _ms, _meta = fut.result()
                 if s:
                     _aio_cache_set(aio_key, s, cnt)
             except Exception:
@@ -2138,11 +2242,7 @@ def try_fastlane(*, prov2_fut, aio_fut, aio_key: str, prov2_url: str, aio_url: s
         _rid(), type_, id_, len(out), prov2_in, cached_tb, usenet, int(p2_ms or 0),
         bool(aio_url), bool(prov2_url),
     )
-    return out, 0, prov2_in, 0, int(p2_ms or 0), True, stats
-
-    streams = _fetch_streams_from_base(base, auth, type_, id_, tag, timeout=timeout, no_retry=no_retry)
-    ms = int((time.time() - t0) * 1000)
-    return streams, len(streams), ms
+    return out, 0, prov2_in, 0, int(p2_ms or 0), True, stats, {'aio': {}, 'p2': (p2_meta if 'p2_meta' in locals() and isinstance(p2_meta, dict) else {})}
 
 def get_streams(type_: str, id_: str, *, is_android: bool = False, client_timeout_s: float | None = None):
     """
@@ -2180,6 +2280,9 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, client_timeou
     aio_ms = 0
     p2_ms = 0
 
+    aio_meta: dict[str, Any] = {}
+    p2_meta: dict[str, Any] = {}
+
     aio_key = _aio_cache_key(type_, id_, extras)
     cached = _aio_cache_get(aio_key)
 
@@ -2187,7 +2290,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, client_timeou
     p2_fut = None
 
     if AIO_BASE:
-        aio_fut = FETCH_EXECUTOR.submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, id_, "AIO", (ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT))
+        aio_fut = FETCH_EXECUTOR.submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, id_, AIO_TAG, (ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT))
     if PROV2_BASE:
         p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT))
     # Fastlane: Prov2-only early return if it's already good enough (does not wait on AIO).
@@ -2213,10 +2316,10 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, client_timeou
             return
         remaining = max(0.05, deadline - time.monotonic())
         try:
-            p2_streams, prov2_in, p2_ms = p2_fut.result(timeout=remaining)
+            p2_streams, prov2_in, p2_ms, p2_meta = p2_fut.result(timeout=remaining)
         except FuturesTimeoutError:
             # leave empty; may still finish later
-            p2_streams, prov2_in, p2_ms = [], 0, int((time.monotonic() - t0) * 1000)
+            p2_streams, prov2_in, p2_ms, p2_meta = [], 0, int((time.monotonic() - t0) * 1000), {'tag': PROV2_TAG, 'ok': False, 'err': 'timeout'}
 
     mode = AIO_CACHE_MODE
 
@@ -2228,7 +2331,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, client_timeou
         if aio_fut:
             def _update_cache_cb(fut):
                 try:
-                    s, cnt, _ms = fut.result()
+                    s, cnt, _ms, _meta = fut.result()
                     if s:
                         _aio_cache_set(aio_key, s, cnt)
                 except Exception:
@@ -2244,7 +2347,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, client_timeou
             soft = max(0.05, deadline - time.monotonic())
 
         try:
-            aio_streams, aio_in, aio_ms = aio_fut.result(timeout=min(soft, max(0.05, deadline - time.monotonic())))
+            aio_streams, aio_in, aio_ms, aio_meta = aio_fut.result(timeout=min(soft, max(0.05, deadline - time.monotonic())))
         except FuturesTimeoutError:
             if cached is not None:
                 aio_streams, aio_in = cached
@@ -2255,7 +2358,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, client_timeou
             # refresh cache when AIO finishes
             def _update_cache_cb(fut):
                 try:
-                    s, cnt, _ms = fut.result()
+                    s, cnt, _ms, _meta = fut.result()
                     if s:
                         _aio_cache_set(aio_key, s, cnt)
                 except Exception:
@@ -2269,9 +2372,9 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, client_timeou
         if aio_fut:
             remaining = max(0.05, deadline - time.monotonic())
             try:
-                aio_streams, aio_in, aio_ms = aio_fut.result(timeout=remaining)
+                aio_streams, aio_in, aio_ms, aio_meta = aio_fut.result(timeout=remaining)
             except FuturesTimeoutError:
-                aio_streams, aio_in, aio_ms = [], 0, int((time.monotonic() - t0) * 1000)
+                aio_streams, aio_in, aio_ms, aio_meta = [], 0, int((time.monotonic() - t0) * 1000), {'tag': AIO_TAG, 'ok': False, 'err': 'timeout'}
 
         _harvest_p2()
 
@@ -2279,7 +2382,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, client_timeou
             _aio_cache_set(aio_key, aio_streams, aio_in)
 
     merged = aio_streams + p2_streams
-    return merged, aio_in, prov2_in, aio_ms, p2_ms, False, None
+    return merged, aio_in, prov2_in, aio_ms, p2_ms, False, None, {'aio': aio_meta, 'p2': p2_meta}
 
 def hash_stats(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
     total = len(pairs)
@@ -2445,7 +2548,131 @@ def _res_to_int(res: str) -> int:
     return 0  # Default low
 
 
-def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0, is_android: bool = False, fast_mode: bool = False, deliver_cap: Optional[int] = None) -> Tuple[List[Dict[str, Any]], PipeStats]:
+
+# ---------------------------
+# Counts / summary helpers (Patch 6)
+# ---------------------------
+_DEBRID_PROVIDERS = {"TB", "RD", "AD", "PM", "DL"}
+_USENET_PROVIDERS = {"ND", "NZB", "EW", "NG", "USENET"}
+
+_RES_ORDER = ["2160P", "1440P", "1080P", "720P", "480P", "SD"]
+
+def _stack_for_provider(p: str) -> str:
+    p = (p or "UNK").upper()
+    if p in _DEBRID_PROVIDERS:
+        return "debrid"
+    if p in _USENET_PROVIDERS or p in USENET_PRIORITY:
+        return "usenet"
+    return "unk"
+
+def _res_bucket(res: str) -> str:
+    r = (res or "").upper()
+    if r in ("4K", "2160", "2160P"):
+        return "2160P"
+    if r in ("1440", "1440P"):
+        return "1440P"
+    if r in ("1080", "1080P"):
+        return "1080P"
+    if r in ("720", "720P"):
+        return "720P"
+    if r in ("480", "480P"):
+        return "480P"
+    if r in ("SD", ""):
+        return "SD"
+    # last resort: keep short
+    return r[:8]
+
+def _size_bucket(size_bytes: int) -> str:
+    try:
+        b = int(size_bytes or 0)
+    except Exception:
+        b = 0
+    if b <= 0:
+        return "unk"
+    gb = b / (1024 ** 3)
+    if gb < 0.5:
+        return "<0.5GB"
+    if gb < 1:
+        return "0.5-1GB"
+    if gb < 2:
+        return "1-2GB"
+    if gb < 4:
+        return "2-4GB"
+    if gb < 8:
+        return "4-8GB"
+    return "8GB+"
+
+def _bump(d: Dict[str, int], k: str, n: int = 1):
+    d[k] = int(d.get(k, 0)) + int(n)
+
+def _summarize_streams_for_counts(streams: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Compact summary for logs/debug: counts by supplier/provider/stack/res/hash/cached/size."""
+    out: Dict[str, Any] = {
+        "total": 0,
+        "by_supplier": {},
+        "by_provider": {},
+        "by_stack": {},
+        "by_res": {},
+        "by_size": {},
+        "hash": {"yes": 0, "no": 0},
+        "cached": {"true": 0, "likely": 0, "false": 0, "unk": 0},
+    }
+    if not streams:
+        return out
+    for s in streams:
+        if not isinstance(s, dict):
+            continue
+        out["total"] += 1
+        bh = s.get("behaviorHints") or {}
+        supplier = (bh.get("wrap_src") or bh.get("source_tag") or bh.get("source") or "UNK")
+        supplier = str(supplier).upper()
+        try:
+            m = classify(s)
+        except Exception:
+            m = {}
+        prov = str(m.get("provider") or "UNK").upper()
+        stack = _stack_for_provider(prov)
+        res = _res_bucket(m.get("res") or "")
+        size_b = int(m.get("size") or 0)
+        size_k = _size_bucket(size_b)
+        infohash = (m.get("infohash") or "").strip()
+        cached = bh.get("cached", None)
+
+        _bump(out["by_supplier"], supplier)
+        _bump(out["by_provider"], prov)
+        _bump(out["by_stack"], stack)
+        _bump(out["by_res"], res)
+        _bump(out["by_size"], size_k)
+
+        if infohash:
+            out["hash"]["yes"] += 1
+        else:
+            out["hash"]["no"] += 1
+
+        if cached is True:
+            out["cached"]["true"] += 1
+        elif cached is False:
+            out["cached"]["false"] += 1
+        elif isinstance(cached, str) and cached.upper() == "LIKELY":
+            out["cached"]["likely"] += 1
+        else:
+            out["cached"]["unk"] += 1
+
+    # Stable ordering for res keys (purely for readability in debug/JSON)
+    try:
+        out["by_res"] = {k: out["by_res"].get(k, 0) for k in _RES_ORDER if k in out["by_res"]} | {k: v for k, v in out["by_res"].items() if k not in _RES_ORDER}
+    except Exception:
+        pass
+    return out
+
+def _compact_fetch_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(meta, dict):
+        return {}
+    # Only keep the safe/compact keys
+    keep = ("tag", "ok", "status", "bytes", "count", "ms", "err")
+    return {k: meta.get(k) for k in keep if k in meta and meta.get(k) not in (None, "", {})}
+
+def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0, is_android: bool = False, is_iphone: bool = False, fast_mode: bool = False, deliver_cap: Optional[int] = None) -> Tuple[List[Dict[str, Any]], PipeStats]:
     stats = PipeStats()
     rid = _rid()
     stats.aio_in = aio_in
@@ -2571,7 +2798,17 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             stats.dropped_error += 1
             continue
 
-        m = classify(s)
+        try:
+            m = classify(s)
+        except Exception as e:
+            stats.dropped_error += 1
+            if len(stats.error_reasons) < 8:
+                stats.error_reasons.append(f"classify:{type(e).__name__}")
+            logger.warning(
+                "EXEC_ISSUE rid=%s stage=classify type=%s id=%s err=%s",
+                rid, type_, id_, (str(e)[:200] if e else "unknown"),
+            )
+            continue
 
         # Optional hard drops first
         if DROP_RD and m.get("provider") == "RD":
@@ -2650,6 +2887,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # Optional: title/year validation gate (local similarity; useful to drop obvious mismatches)
     # Uses parsed title from classify() when available (streams often have empty s['title']).
     if (not fast_mode) and (not VALIDATE_OFF) and (TRAKT_VALIDATE_TITLES or TRAKT_STRICT_YEAR):
+        t_title0 = time.time()
         expected_title = (expected.get('title') or '').lower().strip()
         expected_year = expected.get('year')
         filtered_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
@@ -2672,6 +2910,11 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             filtered_pairs.append((s, m))
 
         out_pairs = filtered_pairs
+
+        try:
+            stats.ms_title_mismatch += int((time.time() - t_title0) * 1000)
+        except Exception:
+            pass
 
 
     # Global hash visibility (per request)
@@ -2807,6 +3050,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 logger.info(f"TB_API_SKIP rid={_rid()} hashes={len(hashes)} <{TB_API_MIN_HASHES}")
 
         # Attach cached markers to meta; in loose mode we do NOT hard-drop.
+        t_unc0 = time.time()
         kept = []
         dropped_uncached = 0
         dropped_uncached_tb = 0
@@ -2861,6 +3105,11 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         candidates = kept
         stats.dropped_uncached += dropped_uncached
         stats.dropped_uncached_tb += dropped_uncached_tb
+
+        try:
+            stats.ms_uncached_check += int((time.time() - t_unc0) * 1000)
+        except Exception:
+            pass
 
 
     # Clarity log: tells you if TB checks actually ran and how many hashes were checked.
@@ -2935,8 +3184,13 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     kept.append((s, m))
                     if len(kept) >= deliver_cap_eff:
                         break
-            stats.dropped_android_magnets += magnets
-            logger.info(f"ANDROID_FILTER rid={_rid()} dropped_magnets={magnets}")
+            if is_iphone:
+                stats.dropped_iphone_magnets += magnets
+                platform = "iphone"
+            else:
+                stats.dropped_android_magnets += magnets
+                platform = "android"
+            logger.info("MOBILE_FILTER rid=%s platform=%s dropped_magnets=%s", _rid(), platform, magnets)
             candidates = kept
 
     # Format (last step)
@@ -3013,6 +3267,24 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             )
 
     stats.delivered = len(delivered)
+
+    # Flag potential issues (per-request; visible in logs and ?debug=1)
+    try:
+        if int(stats.merged_in or 0) > 0:
+            total_drops = max(0, int(stats.merged_in) - int(stats.delivered or 0))
+            drop_pct = (total_drops / float(stats.merged_in)) * 100.0
+            if drop_pct >= float(FLAG_HIGH_DROP_PCT):
+                stats.flag_issues.append(f"high_drops:{drop_pct:.1f}%")
+    except Exception:
+        pass
+    try:
+        if int(stats.ms_title_mismatch or 0) >= int(FLAG_SLOW_TITLE_MS):
+            stats.flag_issues.append(f"slow_title:{int(stats.ms_title_mismatch)}ms")
+        if int(stats.ms_uncached_check or 0) >= int(FLAG_SLOW_UNCACHED_MS):
+            stats.flag_issues.append(f"slow_uncached:{int(stats.ms_uncached_check)}ms")
+    except Exception:
+        pass
+
     return delivered, stats
 
 # ---------------------------
@@ -3022,6 +3294,68 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 def health():
     return jsonify({"ok": True, "build": BUILD_ID, "ts": int(time.time())}), 200
 
+
+# ---------------------------
+# Global rolling stats (/stats)
+# ---------------------------
+_GLOBAL_STATS_LOCK = threading.Lock()
+_GLOBAL_STATS: Dict[str, Any] = {
+    "since_ts": int(time.time()),
+    "requests": 0,
+    "errors": 0,
+    "served_cache": 0,
+    "served_empty": 0,
+    "by_platform": {},
+    "delivered_sum": 0,
+    "ms_sum": 0,
+}
+_RECENT_REQUESTS = deque(maxlen=75)
+
+def _gs_bump(d: Dict[str, Any], k: str, n: int = 1) -> None:
+    try:
+        d[k] = int(d.get(k, 0)) + int(n)
+    except Exception:
+        d[k] = int(n)
+
+def _update_global_stats(*, platform: str, delivered: int, ms_total: int, served_cache: bool, is_error: bool, flags: List[str]) -> None:
+    try:
+        with _GLOBAL_STATS_LOCK:
+            _GLOBAL_STATS["requests"] = int(_GLOBAL_STATS.get("requests", 0)) + 1
+            if is_error:
+                _GLOBAL_STATS["errors"] = int(_GLOBAL_STATS.get("errors", 0)) + 1
+            if served_cache:
+                _GLOBAL_STATS["served_cache"] = int(_GLOBAL_STATS.get("served_cache", 0)) + 1
+            if int(delivered or 0) <= 0:
+                _GLOBAL_STATS["served_empty"] = int(_GLOBAL_STATS.get("served_empty", 0)) + 1
+            _gs_bump(_GLOBAL_STATS.setdefault("by_platform", {}), (platform or "unknown"))
+            _GLOBAL_STATS["delivered_sum"] = int(_GLOBAL_STATS.get("delivered_sum", 0)) + int(delivered or 0)
+            _GLOBAL_STATS["ms_sum"] = int(_GLOBAL_STATS.get("ms_sum", 0)) + int(ms_total or 0)
+
+            _RECENT_REQUESTS.appendleft({
+                "ts": int(time.time()),
+                "rid": _rid(),
+                "platform": platform or "unknown",
+                "delivered": int(delivered or 0),
+                "ms": int(ms_total or 0),
+                "cache": bool(served_cache),
+                "flags": (list(flags)[:6] if isinstance(flags, list) else []),
+            })
+    except Exception:
+        pass
+
+@app.get("/stats")
+def stats_endpoint():
+    if not ENABLE_STATS_ENDPOINT:
+        return jsonify({"ok": False, "disabled": True}), 404
+    with _GLOBAL_STATS_LOCK:
+        snap = dict(_GLOBAL_STATS)
+        snap["recent"] = list(_RECENT_REQUESTS)
+        # convenience derived fields
+        req = int(snap.get("requests", 0) or 0)
+        snap["avg_delivered"] = (float(snap.get("delivered_sum", 0)) / req) if req else 0.0
+        snap["avg_ms"] = (float(snap.get("ms_sum", 0)) / req) if req else 0.0
+    return jsonify(snap), 200
+
 @app.get("/manifest.json")
 def manifest():
     # Show minimal config flags in the manifest name (no secrets).
@@ -3029,8 +3363,8 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.11",
-            "name": f"AIO Wrapper (Rich Output, 2 Lines Left) 9.0 [{cfg}]",
+            "version": "1.0.12",
+            "name": f"AIO Wrapper (Rich Output, 2 Lines Left) 9.1 [{cfg}]",
             "description": "Merges 2 providers and outputs a brand-new, strict-client-safe stream schema with rich AIOStreams-style emoji formatting (2-line left column).",
             "resources": ["stream"],
             "types": ["movie", "series"],
@@ -3043,63 +3377,248 @@ def manifest():
 def stream(type_: str, id_: str):
     if not _is_valid_stream_id(type_, id_):
         return jsonify({"streams": []}), 400
+
     t0 = time.time()
     stats = PipeStats()
+
     is_android = is_android_client()
+    is_iphone = is_iphone_client()
+    platform = client_platform(is_android, is_iphone)
+    stats.client_platform = platform
+
+    cache_key = f"{type_}:{id_}"
+    served_from_cache = False
+    is_error = False
+
+    # debug toggle
+    dbg_q = request.args.get("debug") or request.args.get("dbg") or ""
+    want_dbg = WRAP_EMBED_DEBUG or (isinstance(dbg_q, str) and dbg_q.strip() not in ("", "0", "false", "False"))
 
     try:
-        streams, aio_in, prov2_in, ms_aio, ms_p2, prefiltered, pre_stats = get_streams(
+        streams, aio_in, prov2_in, ms_aio, ms_p2, prefiltered, pre_stats, fetch_meta = get_streams(
             type_,
             id_,
             is_android=is_android,
-            client_timeout_s=(ANDROID_STREAM_TIMEOUT if is_android else DESKTOP_STREAM_TIMEOUT),
+            client_timeout_s=(ANDROID_STREAM_TIMEOUT if (is_android or is_iphone) else DESKTOP_STREAM_TIMEOUT),
         )
+
         if prefiltered:
             out = streams
             stats = pre_stats if isinstance(pre_stats, PipeStats) else PipeStats()
         else:
-            # NOTE: filter_and_format returns a fresh PipeStats; set fetch timings after it returns.
-            out, stats = filter_and_format(type_, id_, streams, aio_in=aio_in, prov2_in=prov2_in, is_android=is_android)
-        stats.aio_in = aio_in
-        stats.prov2_in = prov2_in
-        stats.ms_fetch_aio = ms_aio
-        stats.ms_fetch_p2 = ms_p2
-        cache_key = f"{type_}:{id_}"
+            out, stats = filter_and_format(
+                type_,
+                id_,
+                streams,
+                aio_in=aio_in,
+                prov2_in=prov2_in,
+                is_android=is_android,
+                is_iphone=is_iphone,
+            )
+
+        # Ensure platform info survives prefiltered stats
+        stats.client_platform = platform
+
+        # Attach fetch timings
+        stats.aio_in = int(aio_in or 0)
+        stats.prov2_in = int(prov2_in or 0)
+        stats.ms_fetch_aio = int(ms_aio or 0)
+        stats.ms_fetch_p2 = int(ms_p2 or 0)
+
+        # Patch 6: counts + fetch meta (safe; used for logs/debug)
+        try:
+            stats.fetch_aio = _compact_fetch_meta((fetch_meta or {}).get("aio") or {})
+            stats.fetch_p2 = _compact_fetch_meta((fetch_meta or {}).get("p2") or {})
+        except Exception:
+            stats.fetch_aio, stats.fetch_p2 = {}, {}
+        try:
+            stats.counts_in = _summarize_streams_for_counts(streams)
+            stats.counts_out = _summarize_streams_for_counts(out)
+        except Exception:
+            stats.counts_in, stats.counts_out = {}, {}
+
+        # Provider anomalies (useful when env changes)
+        try:
+            if AIO_BASE and int(stats.aio_in or 0) == 0:
+                stats.flag_issues.append("aio_empty")
+            if PROV2_BASE and int(stats.prov2_in or 0) == 0:
+                stats.flag_issues.append("p2_empty")
+        except Exception:
+            pass
+
+        # Fallback cache: only used when upstream returns empty (or errors later)
         if out:
             cache_set(cache_key, out)
         else:
             cached = cache_get(cache_key)
             if cached:
                 out = cached
-        tmp = [android_sanitize_out_stream(s) for s in out]
-        tmp = [s for s in tmp if isinstance(s, dict) and s.get("url")]
-        return jsonify({"streams": (tmp if is_android else out), "cacheMaxAge": int(CACHE_TTL)}), 200
+                served_from_cache = True
+                stats.flag_issues.append("served_cache")
+            else:
+                stats.flag_issues.append("empty_out")
+
+        # Mobile output sanitization
+        if is_android or is_iphone:
+            tmp = [android_sanitize_out_stream(s) for s in out]
+            tmp = [s for s in tmp if isinstance(s, dict) and s.get("url")]
+            out_for_client = tmp
+        else:
+            out_for_client = out
+
+        payload: Dict[str, Any] = {"streams": out_for_client, "cacheMaxAge": int(CACHE_TTL)}
+
+        if want_dbg:
+            payload["debug"] = {
+                "rid": _rid(),
+                "platform": platform,
+                "cache": ("hit" if served_from_cache else "miss"),
+                "served_cache": bool(served_from_cache),
+                "fetch": {"aio": stats.fetch_aio, "p2": stats.fetch_p2},
+                "in": stats.counts_in,
+                "out": stats.counts_out,
+                "timing_ms": {
+                    "aio": int(stats.ms_fetch_aio or 0),
+                    "p2": int(stats.ms_fetch_p2 or 0),
+                    "tmdb": int(stats.ms_tmdb or 0),
+                    "tb_api": int(stats.ms_tb_api or 0),
+                    "tb_webdav": int(stats.ms_tb_webdav or 0),
+                    "title": int(stats.ms_title_mismatch or 0),
+                    "uncached": int(stats.ms_uncached_check or 0),
+                },
+                "delivered": int(stats.delivered or 0),
+                "drops": {
+                    "error": int(stats.dropped_error or 0),
+                    "missing_url": int(stats.dropped_missing_url or 0),
+                    "pollution": int(stats.dropped_pollution or 0),
+                    "title_mismatch": int(stats.dropped_title_mismatch or 0),
+                    "dead_url": int(stats.dropped_dead_url or 0),
+                    "uncached": int(stats.dropped_uncached or 0),
+                    "uncached_tb": int(stats.dropped_uncached_tb or 0),
+                    "android_magnets": int(stats.dropped_android_magnets or 0),
+                    "iphone_magnets": int(stats.dropped_iphone_magnets or 0),
+                },
+                "errors": list(stats.error_reasons)[:8],
+                "flags": list(stats.flag_issues)[:12],
+            }
+
+        return jsonify(payload), 200
+
     except Exception as e:
-        logger.exception(f"Stream error: {e}")
-        cached = cache_get(f"{type_}:{id_}")
+        is_error = True
+        logger.exception("STREAM_EXCEPTION rid=%s type=%s id=%s err=%s", _rid(), type_, id_, e)
+        try:
+            if len(stats.error_reasons) < 8:
+                stats.error_reasons.append(f"stream:{type(e).__name__}")
+        except Exception:
+            pass
+
+        cached = cache_get(cache_key)
         if cached:
-            cached_out = (android_sanitize_stream_list(cached) if is_android else cached)
-            return jsonify({"streams": cached_out, "cacheMaxAge": int(CACHE_TTL)}), 200
-        return jsonify({"streams": [], "cacheMaxAge": int(CACHE_TTL)}), 200
+            out = cached
+            served_from_cache = True
+        else:
+            out = []
+
+        if is_android or is_iphone:
+            tmp = [android_sanitize_out_stream(s) for s in out]
+            tmp = [s for s in tmp if isinstance(s, dict) and s.get("url")]
+            out_for_client = tmp
+        else:
+            out_for_client = out
+
+        payload: Dict[str, Any] = {"streams": out_for_client, "cacheMaxAge": int(CACHE_TTL)}
+        if want_dbg:
+            try:
+                csum = _summarize_streams_for_counts(out_for_client)
+            except Exception:
+                csum = {}
+            payload["debug"] = {
+                "rid": _rid(),
+                "platform": platform,
+                "cache": ("hit" if served_from_cache else "miss"),
+                "served_cache": bool(served_from_cache),
+                "fetch": {"aio": {}, "p2": {}},
+                "in": csum,
+                "out": csum,
+                "delivered": int(len(out_for_client) if out_for_client is not None else 0),
+                "errors": list(stats.error_reasons)[:8],
+                "flags": list(stats.flag_issues)[:12],
+            }
+        return jsonify(payload), 200
+
     finally:
+        # Slow-phase flags (add late so ms_fetch_* is filled)
+        try:
+            if int(stats.ms_fetch_aio or 0) >= int(FLAG_SLOW_AIO_MS):
+                stats.flag_issues.append(f"slow_aio:{int(stats.ms_fetch_aio)}ms")
+            if int(stats.ms_fetch_p2 or 0) >= int(FLAG_SLOW_P2_MS):
+                stats.flag_issues.append(f"slow_p2:{int(stats.ms_fetch_p2)}ms")
+            if int(stats.ms_tb_api or 0) >= int(FLAG_SLOW_TB_API_MS):
+                stats.flag_issues.append(f"slow_tb_api:{int(stats.ms_tb_api)}ms")
+        except Exception:
+            pass
+
+        # De-dupe flags/errors (keep them short)
+        try:
+            stats.flag_issues = list(dict.fromkeys([str(x) for x in (stats.flag_issues or [])]))[:16]
+        except Exception:
+            pass
+        try:
+            stats.error_reasons = list(dict.fromkeys([str(x) for x in (stats.error_reasons or [])]))[:16]
+        except Exception:
+            pass
+
+        ms_total = int((time.time() - t0) * 1000)
+
+        # Global stats update
+        _update_global_stats(
+            platform=stats.client_platform or platform,
+            delivered=int(stats.delivered or 0),
+            ms_total=ms_total,
+            served_cache=bool(served_from_cache),
+            is_error=bool(is_error),
+            flags=list(stats.flag_issues) if isinstance(stats.flag_issues, list) else [],
+        )
+
         logger.info(
-            "WRAP_TIMING rid=%s type=%s id=%s aio_ms=%s p2_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_api_hashes=%s tb_wd_hashes=%s",
-            _rid(), type_, id_,
-            stats.ms_fetch_aio, stats.ms_fetch_p2, stats.ms_tmdb, stats.ms_tb_api, stats.ms_tb_webdav,
-            stats.tb_api_hashes, stats.tb_webdav_hashes,
+            "WRAP_TIMING rid=%s type=%s id=%s client=%s aio_ms=%s p2_ms=%s tmdb_ms=%s title_ms=%s uncached_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_api_hashes=%s tb_wd_hashes=%s",
+            _rid(), type_, id_, (stats.client_platform or platform),
+            int(stats.ms_fetch_aio or 0), int(stats.ms_fetch_p2 or 0), int(stats.ms_tmdb or 0),
+            int(stats.ms_title_mismatch or 0), int(stats.ms_uncached_check or 0),
+            int(stats.ms_tb_api or 0), int(stats.ms_tb_webdav or 0),
+            int(stats.tb_api_hashes or 0), int(stats.tb_webdav_hashes or 0),
         )
         logger.info(
-            "WRAP_STATS rid=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s deduped=%s delivered=%s ms=%s",
-            _rid(), type_, id_,
-            stats.aio_in, stats.prov2_in, stats.merged_in,
-            stats.dropped_error, stats.dropped_missing_url, stats.dropped_pollution,
-            stats.dropped_low_seeders, stats.dropped_lang,
-            stats.dropped_low_premium,
-            stats.dropped_rd, stats.dropped_ad, stats.dropped_low_res, stats.dropped_old_age,
-            stats.dropped_blacklist, stats.dropped_fakes_db, stats.dropped_title_mismatch, stats.dropped_dead_url, stats.dropped_uncached, stats.dropped_uncached_tb,
-            stats.deduped, stats.delivered,
-            int((time.time() - t0) * 1000),
+            "WRAP_STATS rid=%s type=%s id=%s client=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s android_magnets=%s iphone_magnets=%s deduped=%s delivered=%s served_cache=%s flags=%s errors=%s ms=%s",
+            _rid(), type_, id_, (stats.client_platform or platform),
+            int(stats.aio_in or 0), int(stats.prov2_in or 0), int(stats.merged_in or 0),
+            int(stats.dropped_error or 0), int(stats.dropped_missing_url or 0), int(stats.dropped_pollution or 0),
+            int(stats.dropped_low_seeders or 0), int(stats.dropped_lang or 0),
+            int(stats.dropped_low_premium or 0),
+            int(stats.dropped_rd or 0), int(stats.dropped_ad or 0), int(stats.dropped_low_res or 0), int(stats.dropped_old_age or 0),
+            int(stats.dropped_blacklist or 0), int(stats.dropped_fakes_db or 0), int(stats.dropped_title_mismatch or 0), int(stats.dropped_dead_url or 0),
+            int(stats.dropped_uncached or 0), int(stats.dropped_uncached_tb or 0),
+            int(stats.dropped_android_magnets or 0), int(stats.dropped_iphone_magnets or 0),
+            int(stats.deduped or 0), int(stats.delivered or 0),
+            1 if served_from_cache else 0,
+            ",".join(list(stats.flag_issues)[:8]) if isinstance(stats.flag_issues, list) else "",
+            ",".join(list(stats.error_reasons)[:6]) if isinstance(stats.error_reasons, list) else "",
+            ms_total,
         )
+
+        if WRAP_LOG_COUNTS:
+            try:
+                logger.info(
+                    "WRAP_COUNTS rid=%s type=%s id=%s fetch_aio=%s fetch_p2=%s in=%s out=%s",
+                    _rid(), type_, id_,
+                    json.dumps(stats.fetch_aio, separators=(",", ":"), sort_keys=True),
+                    json.dumps(stats.fetch_p2, separators=(",", ":"), sort_keys=True),
+                    json.dumps(stats.counts_in, separators=(",", ":"), sort_keys=True),
+                    json.dumps(stats.counts_out, separators=(",", ":"), sort_keys=True),
+                )
+            except Exception:
+                pass
 
 
 @app.errorhandler(Exception)
@@ -3110,17 +3629,56 @@ def handle_unhandled_exception(e):
 
     # Last-resort safety net so Stremio doesn't get HTML 500s (which break jq/tests).
     logger.exception("UNHANDLED %s %s: %s", request.method, request.path, e)
-    if request.path.endswith('/manifest.json'):
-        return jsonify(manifest()), 200
-    if request.path.startswith('/stream/'):
+
+    if request.path.endswith("/manifest.json"):
+        return manifest()
+
+    if request.path.startswith("/stream/"):
         # Never fail hard for stream endpoints; empty list is better than a 500.
-        cache_key = request.path.replace('/stream/','',1).replace('.json','',1).replace('/',':',1)
-        cached = cache_get(cache_key)
+        try:
+            parts = request.path.split("/")
+            type_ = parts[2] if len(parts) > 2 else ""
+            id_part = parts[3] if len(parts) > 3 else ""
+            stremio_id = id_part[:-5] if id_part.endswith(".json") else id_part
+            cache_key = f"{type_}:{stremio_id}" if type_ and stremio_id else ""
+        except Exception:
+            cache_key = ""
+
+        cached = cache_get(cache_key) if cache_key else None
+
         is_android = is_android_client()
-        if cached:
-            cached_out = (android_sanitize_stream_list(cached) if is_android else cached)
-            return jsonify({'streams': cached_out, 'cacheMaxAge': int(CACHE_TTL)}), 200
-        return jsonify({'streams': [], 'cacheMaxAge': int(CACHE_TTL)}), 200
+        is_iphone = is_iphone_client()
+        platform = client_platform(is_android, is_iphone)
+
+        out = cached or []
+        if is_android or is_iphone:
+            tmp = [android_sanitize_out_stream(s) for s in out]
+            tmp = [s for s in tmp if isinstance(s, dict) and s.get("url")]
+            out_for_client = tmp
+        else:
+            out_for_client = out
+
+        dbg_q = request.args.get("debug") or request.args.get("dbg") or ""
+        want_dbg = WRAP_EMBED_DEBUG or (isinstance(dbg_q, str) and dbg_q.strip() not in ("", "0", "false", "False"))
+
+        payload: Dict[str, Any] = {"streams": out_for_client, "cacheMaxAge": int(CACHE_TTL)}
+        if want_dbg:
+            try:
+                csum = _summarize_streams_for_counts(out_for_client)
+            except Exception:
+                csum = {}
+            payload["debug"] = {
+                "rid": _rid(),
+                "platform": platform,
+                "cache": ("hit" if bool(cached) else "miss"),
+                "served_cache": bool(cached),
+                "in": csum,
+                "out": csum,
+                "delivered": int(len(out_for_client) if out_for_client is not None else 0),
+                "error": type(e).__name__,
+            }
+        return jsonify(payload), 200
+
     return ("Internal Server Error", 500)
 
 if __name__ == "__main__":
