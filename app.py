@@ -12,7 +12,7 @@ import difflib
 import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, wait as FuturesWait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 import requests
@@ -69,14 +69,6 @@ def _safe_csv(v, default: str = "") -> list[str]:
 
 
 # ---------------------------
-# Shared executor (so we can return early without waiting for per-request threads to finish)
-# ---------------------------
-FETCH_EXECUTOR_WORKERS = _safe_int(os.environ.get("FETCH_EXECUTOR_WORKERS", "8"), 8)
-_FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=max(2, int(FETCH_EXECUTOR_WORKERS)))
-
-
-
-# ---------------------------
 # Config (keep env names compatible with your existing Render setup)
 # ---------------------------
 AIO_URL = os.environ.get("AIO_URL", "")
@@ -130,6 +122,7 @@ CACHE_TTL = _safe_int(os.environ.get('CACHE_TTL', '600'), 600)
 # Client-side time budgets (seconds). These are upper bounds; we return as soon as we have results.
 ANDROID_STREAM_TIMEOUT = _safe_float(os.environ.get('ANDROID_STREAM_TIMEOUT', '20'), 20.0)  # FIXED: increase default
 DESKTOP_STREAM_TIMEOUT = _safe_float(os.environ.get('DESKTOP_STREAM_TIMEOUT', '30'), 30.0)  # FIXED: increase default
+EMPTY_UA_IS_ANDROID = _parse_bool(os.environ.get('EMPTY_UA_IS_ANDROID', 'false'), False)  # treat blank UA as Android
 
 # Upstream fetch timeouts (seconds) used inside /stream.
 # We keep P2 tighter because it can hang and trigger Gunicorn worker aborts if retries are enabled.
@@ -137,11 +130,6 @@ ANDROID_AIO_TIMEOUT = _safe_float(os.environ.get('ANDROID_AIO_TIMEOUT', '18'), 1
 ANDROID_P2_TIMEOUT = _safe_float(os.environ.get('ANDROID_P2_TIMEOUT', '12'), 12.0)  # FIXED: increase default
 DESKTOP_AIO_TIMEOUT = _safe_float(os.environ.get('DESKTOP_AIO_TIMEOUT', '28'), 28.0)  # FIXED: increase default
 DESKTOP_P2_TIMEOUT = _safe_float(os.environ.get('DESKTOP_P2_TIMEOUT', '15'), 15.0)  # FIXED: increase default
-
-# Soft fetch budget (seconds): how long /stream will wait for upstreams before returning partial + cached.
-ANDROID_SOFT_BUDGET = _safe_float(os.environ.get('ANDROID_SOFT_BUDGET', '4.5'), 4.5)
-DESKTOP_SOFT_BUDGET = _safe_float(os.environ.get('DESKTOP_SOFT_BUDGET', '6.0'), 6.0)
-
 
 # TorBox API call timeout (seconds) used during cache checks.
 TB_API_TIMEOUT = _safe_float(os.environ.get('TB_API_TIMEOUT', '8'), 8.0)
@@ -1074,26 +1062,25 @@ def _rid() -> str:
     return g.request_id if has_request_context() and hasattr(g, "request_id") else "GLOBAL"
 
 def is_android_client() -> bool:
-    """Best-effort detection of Android/Google TV Stremio clients.
+    """Best-effort detection of Android/TV-ish clients for tighter time budgets.
 
-    IMPORTANT: Some Android TV / Google TV Stremio builds send an empty User-Agent
-    (it shows up as '-' in some access logs). Treat empty UA as Android/TV so
-    we apply Android/TV-friendly time budgets and avoid client-side timeouts.
+    Important: blank User-Agent is *not* treated as Android unless EMPTY_UA_IS_ANDROID=true.
+    (Your curl tests often use an empty UA; we don't want that to trigger Android limits.)
     """
     ua = request.headers.get("User-Agent", "") if has_request_context() else ""
     ua_l = (ua or "").strip().lower()
 
-    # Key fix: Google TV clients may omit UA entirely.
     if not ua_l:
-        return True
+        return bool(EMPTY_UA_IS_ANDROID)
 
     return (
-        ('android' in ua_l)
-        or ('okhttp' in ua_l)
-        or ('exoplayer' in ua_l)
-        or ('stremio' in ua_l and 'tv' in ua_l)
+        ("android" in ua_l)
+        or ("dalvik" in ua_l)
+        or ("okhttp" in ua_l)
+        or ("exoplayer" in ua_l)
+        or ("google tv" in ua_l)
+        or ("stremio" in ua_l and "tv" in ua_l)
     )
-
 
 # ---------------------------
 # HTTP session (retries)
@@ -2005,282 +1992,61 @@ def get_streams(
     is_android: bool = False,
     client_timeout_s: float | None = None,
 ) -> Tuple[List[Dict[str, Any]], int, int, int, int]:
-    """Fetch provider streams with an early-return budget and cache fallback.
+    """Fetch provider streams in *true parallel* and return merged results.
 
-    Goal: keep /stream responsive even when AIOStreams is slow.
-    We wait up to a *soft budget* (DESKTOP_SOFT_BUDGET / ANDROID_SOFT_BUDGET) and then
-    return P2 + (cached AIO if available). AIO continues in the background and refreshes cache.
+    Returns: (streams, aio_in, prov2_in, aio_ms, p2_ms)
+
+    Key behaviors (by design):
+    - Per-provider timings are measured *inside* the worker threads, so they stay truthful even if we
+      join futures later.
+    - No early-return / fast-lane logic here. We wait for each provider up to its own HTTP timeout.
+      (This avoids returning empty results while upstream requests are still running.)
     """
-    aio_streams: List[Dict[str, Any]] = []
-    prov2_streams: List[Dict[str, Any]] = []
-    aio_ms = 0
-    p2_ms = 0
+    # Compute per-provider HTTP timeouts (seconds).
+    aio_timeout = ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT
+    p2_timeout = ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT
 
-    total_timeout = float(
-        client_timeout_s
-        if client_timeout_s is not None
-        else (ANDROID_STREAM_TIMEOUT if is_android else DESKTOP_STREAM_TIMEOUT)
-    )
-    aio_timeout = float(ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT)
-    p2_timeout = float(ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT)
-    soft_budget = float(ANDROID_SOFT_BUDGET if is_android else DESKTOP_SOFT_BUDGET)
-
-    logger.debug(
-        "DEBUG_CONFIG rid=%s AIO_BASE=%s AIO_AUTH_set=%s PROV2_BASE=%s PROV2_AUTH_set=%s WRAP_URL_SHORT=%s",
-        _rid(), AIO_BASE, bool(AIO_AUTH), PROV2_BASE, bool(PROV2_AUTH), bool(WRAP_URL_SHORT)
-    )
-
-    # After AIO completes, don't block long for P2.
-    p2_grace = 1.5 if is_android else 4.0
-
-    aio_in = 0
-    p2_in = 0
-    merged: List[Dict[str, Any]] = []
-
-    # Hard deadline (client budget)
-    deadline = time.monotonic() + max(0.1, total_timeout)
-    # Soft deadline (response target)
-    soft_deadline = min(deadline, time.monotonic() + max(0.05, soft_budget))
-
-    # Cache key for *raw* AIO results (used when AIO is slow).
-    aio_cache_key = f"aio:{type_}:{id_}"
-
-    # Submit both fetches on the shared executor so we can return early.
-    aio_fut = None
-    t_aio0 = None
-    if AIO_BASE:
-        t_aio0 = time.time()
-        aio_fut = _FETCH_EXECUTOR.submit(
-            get_streams_single,
-            AIO_BASE,
-            AIO_AUTH,
-            type_,
-            id_,
-            "AIO",
-            aio_timeout,
-            True,
-        )
-
-        # Refresh raw-AIO cache when it eventually completes.
-        def _aio_cache_cb(fut):
-            try:
-                streams, _cnt, _ms = fut.result()
-                if isinstance(streams, list) and streams:
-                    cache_set(aio_cache_key, streams)
-            except Exception:
-                pass
-
+    # Respect caller-provided client budget if present (avoid blocking longer than the client will wait).
+    if client_timeout_s:
         try:
-            aio_fut.add_done_callback(_aio_cache_cb)
+            budget = max(1.0, float(client_timeout_s))
+            aio_timeout = min(aio_timeout, budget)
+            p2_timeout = min(p2_timeout, budget)
         except Exception:
             pass
 
-    p2_fut = None
-    t_p20 = None
+    logger.info(f"AIO fetch URL: {AIO_BASE}/stream/{type_}/{id_}.json")
     if PROV2_BASE:
-        t_p20 = time.time()
-        p2_fut = _FETCH_EXECUTOR.submit(
-            get_streams_single,
-            PROV2_BASE,
-            PROV2_AUTH,
-            type_,
-            id_,
-            "P2",
-            p2_timeout,
-            True,
+        logger.info(f"P2 fetch URL: {PROV2_BASE}/stream/{type_}/{id_}.json")
+
+    aio_streams: List[Dict[str, Any]] = []
+    p2_streams: List[Dict[str, Any]] = []
+    aio_in = prov2_in = 0
+    aio_ms = p2_ms = 0
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        aio_fut = ex.submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, id_, "AIO", aio_timeout, True)
+        p2_fut = (
+            ex.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG, p2_timeout, True)
+            if PROV2_BASE
+            else None
         )
 
-    pending = set([f for f in (aio_fut, p2_fut) if f is not None])
-
-    def _take_aio_now():
-        nonlocal aio_streams, aio_in, aio_ms
-        if aio_fut is None:
-            return
         try:
-            aio_streams, aio_in, aio_ms = aio_fut.result(timeout=0)
-            if not isinstance(aio_streams, list):
-                aio_streams, aio_in, aio_ms = [], 0, 0
-            else:
-                aio_in = len(aio_streams)
-                aio_ms = int(aio_ms or 0)
-        except Exception:
-            pass
+            aio_streams, aio_in, aio_ms = aio_fut.result()
+        except Exception as e:
+            logger.warning(f"AIO error: {e}")
+            aio_streams, aio_in, aio_ms = [], 0, 0
 
-    def _take_p2_now():
-        nonlocal prov2_streams, p2_in, p2_ms
-        if p2_fut is None:
-            return
-        try:
-            prov2_streams, p2_in, p2_ms = p2_fut.result(timeout=0)
-            if not isinstance(prov2_streams, list):
-                prov2_streams, p2_in, p2_ms = [], 0, 0
-            else:
-                p2_in = len(prov2_streams)
-                p2_ms = int(p2_ms or 0)
-        except Exception:
-            pass
-
-    # Wait until first provider completes, bounded by soft deadline.
-    try:
-        rem = max(0.0, soft_deadline - time.monotonic())
-        if pending and rem > 0:
-            done, pending = FuturesWait(pending, timeout=rem, return_when=FIRST_COMPLETED)
-            if aio_fut in done:
-                _take_aio_now()
-            if p2_fut in done:
-                _take_p2_now()
-    except Exception:
-        pass
-
-    # If we got AIO, optionally wait a short grace for P2 (still bounded by soft deadline).
-    if aio_streams and p2_fut is not None and not prov2_streams:
-        try:
-            rem = max(0.0, soft_deadline - time.monotonic())
-            wait_s = min(p2_grace, rem)
-            if wait_s > 0:
-                prov2_streams, p2_in, p2_ms = p2_fut.result(timeout=wait_s)
-                if not isinstance(prov2_streams, list):
-                    prov2_streams, p2_in, p2_ms = [], 0, 0
-                else:
-                    p2_in = len(prov2_streams)
-                    p2_ms = int(p2_ms or 0)
-        except Exception:
-            pass
-
-    # If we got P2 first, do NOT wait for AIO; attach cached AIO if available (or take AIO instantly if already done).
-    if prov2_streams and not aio_streams:
-        _take_aio_now()
-        if not aio_streams:
-            cached = cache_get(aio_cache_key)
-            if isinstance(cached, list) and cached:
-                aio_streams = cached
-                aio_in = len(aio_streams)
-            waited_ms = int((time.time() - t_aio0) * 1000) if t_aio0 else 0
-            aio_ms = waited_ms
-            logger.info(
-                "AIO_EARLY_FALLBACK rid=%s waited_ms=%s cached=%s cached_len=%s",
-                _rid(), waited_ms, bool(aio_streams), len(aio_streams) if aio_streams else 0
-            )
-
-    # If neither produced in time, take anything already done; otherwise use cached AIO if present.
-    if not aio_streams:
-        _take_aio_now()
-    if not prov2_streams:
-        _take_p2_now()
-
-    if not aio_streams:
-        cached = cache_get(aio_cache_key)
-        if isinstance(cached, list) and cached:
-            aio_streams = cached
-            aio_in = len(aio_streams)
-        if t_aio0 and aio_ms == 0:
-            aio_ms = int((time.time() - t_aio0) * 1000)
-
-    if t_p20 and p2_ms == 0 and (p2_fut is not None) and not prov2_streams:
-        p2_ms = int((time.time() - t_p20) * 1000)
-
-    # Pre-caps and merge happen below.
-
-# Pre-cap each provider feed to keep CPU bounded on huge payloads.
-    # This preserves balance between AIO and P2 while still allowing a later global re-rank.
-    PRECAP_PER_PROVIDER = _safe_int(os.environ.get('PRECAP_PER_PROVIDER', '125'), 125)
-    if PRECAP_PER_PROVIDER > 0:
-        # Pre-cap sorting: keep best candidates before slicing (helps preserve TB/2160p streams).
-        def _precap_sort_key(_s: Dict[str, Any]) -> Tuple[int, int, int]:
-            if not isinstance(_s, dict):
-                return (0, 0, 0)
-            bh = (_s.get("behaviorHints") or {})
-            prov_raw = (_s.get("provider") or bh.get("provider") or bh.get("source") or "")
-            prov = str(prov_raw or "").upper().strip()
-            # If provider is missing, try a cheap token sniff from text.
-            if not prov:
-                txt = f"{_s.get('name','')} {_s.get('description','')} {bh.get('filename','')} {bh.get('source','')}".upper()
-                if re.search(r"(?<![A-Z0-9])TORBOX(?![A-Z0-9])|(?<![A-Z0-9])TB(?![A-Z0-9])", txt):
-                    prov = "TB"
-                elif re.search(r"(?<![A-Z0-9])REAL[- ]?DEBRID(?![A-Z0-9])|(?<![A-Z0-9])RD(?![A-Z0-9])", txt):
-                    prov = "RD"
-                elif re.search(r"(?<![A-Z0-9])ALL[- ]?DEBRID(?![A-Z0-9])|(?<![A-Z0-9])AD(?![A-Z0-9])", txt):
-                    prov = "AD"
-                elif re.search(r"(?<![A-Z0-9])NZBDAV(?![A-Z0-9])|(?<![A-Z0-9])ND(?![A-Z0-9])", txt):
-                    prov = "ND"
-                else:
-                    prov = "UNK"
-            # Resolution (cheap sniff)
-            txt2 = f"{_s.get('name','')} {_s.get('description','')} {bh.get('filename','')}".upper()
-            if "2160" in txt2 or "4K" in txt2:
-                res_i = 2160
-            elif "1080" in txt2:
-                res_i = 1080
-            elif "720" in txt2:
-                res_i = 720
-            else:
-                res_i = 0
+        if p2_fut is not None:
             try:
-                seed_i = int(_s.get("seeders") or _s.get("seeds") or 0)
-            except Exception:
-                seed_i = 0
-            # Higher is better: premium score, then resolution, then seeders.
-            prem = 999 - _provider_rank(prov)
-            return (prem, res_i, seed_i)
-        if len(aio_streams) > PRECAP_PER_PROVIDER:
-            logger.info("PRECAP_AIO rid=%s before=%d after=%d", _rid(), len(aio_streams), PRECAP_PER_PROVIDER)
-            aio_streams.sort(key=_precap_sort_key, reverse=True)
-            aio_streams = aio_streams[:PRECAP_PER_PROVIDER]
-        if len(prov2_streams) > PRECAP_PER_PROVIDER:
-            logger.info("PRECAP_P2 rid=%s before=%d after=%d", _rid(), len(prov2_streams), PRECAP_PER_PROVIDER)
-            prov2_streams.sort(key=_precap_sort_key, reverse=True)
-            prov2_streams = prov2_streams[:PRECAP_PER_PROVIDER]
+                p2_streams, prov2_in, p2_ms = p2_fut.result()
+            except Exception as e:
+                logger.warning(f"P2 error: {e}")
+                p2_streams, prov2_in, p2_ms = [], 0, 0
 
-    if aio_streams:
-        merged.extend(aio_streams)
-    if prov2_streams:
-        merged.extend(prov2_streams)
-
-    return merged, aio_in, p2_in, aio_ms, p2_ms
-
-
-
-# ---------------------------
-# Pipeline stats (required; used by /stream and filter_and_format)
-# ---------------------------
-@dataclass
-class PipeStats:
-    aio_in: int = 0
-    prov2_in: int = 0
-    merged_in: int = 0
-    dropped_error: int = 0
-    dropped_missing_url: int = 0
-    dropped_pollution: int = 0
-    dropped_low_seeders: int = 0
-    dropped_lang: int = 0
-    dropped_low_premium: int = 0
-    dropped_rd: int = 0
-    dropped_ad: int = 0
-    dropped_low_res: int = 0
-    dropped_old_age: int = 0
-    dropped_blacklist: int = 0
-    dropped_fakes_db: int = 0
-    dropped_title_mismatch: int = 0
-    dropped_dead_url: int = 0
-    dropped_uncached: int = 0
-    dropped_uncached_tb: int = 0
-    dropped_android_magnets: int = 0
-    deduped: int = 0
-    delivered: int = 0
-
-    # Timing/diagnostics (ms)
-    ms_fetch_aio: int = 0
-    ms_fetch_p2: int = 0
-    ms_tmdb: int = 0
-    ms_tb_api: int = 0
-    ms_tb_webdav: int = 0
-    ms_tb_usenet: int = 0
-
-    # Hash counts (diagnostics)
-    tb_api_hashes: int = 0
-    tb_webdav_hashes: int = 0
-    tb_usenet_hashes: int = 0
-
+    merged = aio_streams + p2_streams
+    return merged, aio_in, prov2_in, aio_ms, p2_ms
 
 def hash_stats(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
     total = len(pairs)
@@ -2796,7 +2562,12 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     hashes.append(h)
             if len(hashes) >= TB_API_MIN_HASHES:
                 t0 = time.time()
-                cached_map = tb_get_cached(hashes)
+                cached_map_raw = tb_get_cached(hashes)
+                cached_map = {}
+                for _k, _v in (cached_map_raw or {}).items():
+                    _nk = norm_infohash(_k)
+                    if _nk:
+                        cached_map[_nk] = bool(_v)
                 stats.ms_tb_api = int((time.time() - t0) * 1000)
                 stats.tb_api_hashes = len(hashes)
             else:
