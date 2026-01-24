@@ -2073,6 +2073,9 @@ def _aio_cache_key(type_: str, id_: str, extras) -> str:
 def get_streams_single(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float, no_retry: bool = False) -> tuple[list[dict[str, Any]], int, int]:
     """Fetch a single provider and return (streams, count, ms)."""
     t0 = time.time()
+    streams = _fetch_streams_from_base(base, auth, type_, id_, tag, timeout=timeout, no_retry=no_retry)
+    ms = int((time.time() - t0) * 1000)
+    return streams, len(streams), ms
 
 def try_fastlane(*, prov2_fut, aio_fut, aio_key: str, prov2_url: str, aio_url: str, type_: str, id_: str, is_android: bool, client_timeout_s: float, deadline: float):
     """Prov2-only early return. Returns (out, aio_in, prov2_in, aio_ms, p2_ms, prefiltered, stats) or None."""
@@ -2184,9 +2187,9 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, client_timeou
     p2_fut = None
 
     if AIO_BASE:
-        aio_fut = FETCH_EXECUTOR.submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, id_, extras, float(client_timeout_s))
+        aio_fut = FETCH_EXECUTOR.submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, id_, "AIO", (ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT))
     if PROV2_BASE:
-        p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, id_, extras, float(client_timeout_s))
+        p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT))
     # Fastlane: Prov2-only early return if it's already good enough (does not wait on AIO).
     fl = try_fastlane(
         prov2_fut=p2_fut,
@@ -3021,11 +3024,13 @@ def health():
 
 @app.get("/manifest.json")
 def manifest():
+    # Show minimal config flags in the manifest name (no secrets).
+    cfg = f"aio={1 if bool(AIO_BASE) else 0} p2={1 if bool(PROV2_BASE) else 0} fl={1 if bool(FASTLANE_ENABLED) else 0}"
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
             "version": "1.0.11",
-            "name": "AIO Wrapper (Rich Output, 2 Lines Left) 9.0",
+            "name": f"AIO Wrapper (Rich Output, 2 Lines Left) 9.0 [{cfg}]",
             "description": "Merges 2 providers and outputs a brand-new, strict-client-safe stream schema with rich AIOStreams-style emoji formatting (2-line left column).",
             "resources": ["stream"],
             "types": ["movie", "series"],
