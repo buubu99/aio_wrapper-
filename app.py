@@ -12,6 +12,48 @@ import difflib
 import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass
+
+# ---------------------------
+# Pipeline stats (required)
+# ---------------------------
+@dataclass
+class PipeStats:
+    aio_in: int = 0
+    prov2_in: int = 0
+    merged_in: int = 0
+    dropped_error: int = 0
+    dropped_missing_url: int = 0
+    dropped_pollution: int = 0
+    dropped_low_seeders: int = 0
+    dropped_lang: int = 0
+    dropped_low_premium: int = 0
+    dropped_rd: int = 0
+    dropped_ad: int = 0
+    dropped_low_res: int = 0
+    dropped_old_age: int = 0
+    dropped_blacklist: int = 0
+    dropped_fakes_db: int = 0
+    dropped_title_mismatch: int = 0
+    dropped_dead_url: int = 0
+    dropped_uncached: int = 0
+    dropped_uncached_tb: int = 0
+    dropped_android_magnets: int = 0
+    deduped: int = 0
+    delivered: int = 0
+
+    # Timing/diagnostics (ms)
+    ms_fetch_aio: int = 0
+    ms_fetch_p2: int = 0
+    ms_tmdb: int = 0
+    ms_tb_api: int = 0
+    ms_tb_webdav: int = 0
+    ms_tb_usenet: int = 0
+
+    # Hash counts (diagnostics)
+    tb_api_hashes: int = 0
+    tb_webdav_hashes: int = 0
+    tb_usenet_hashes: int = 0
+
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
@@ -54,13 +96,6 @@ def _normalize_base(raw: str) -> str:
 def _safe_int(v, default: int) -> int:
     try:
         return int(str(v).strip())
-    except Exception:
-        return default
-
-
-def _safe_float(v, default: float) -> float:
-    try:
-        return float(v)
     except Exception:
         return default
 
@@ -129,6 +164,7 @@ CACHE_TTL = _safe_int(os.environ.get('CACHE_TTL', '600'), 600)
 # Client-side time budgets (seconds). These are upper bounds; we return as soon as we have results.
 ANDROID_STREAM_TIMEOUT = _safe_float(os.environ.get('ANDROID_STREAM_TIMEOUT', '20'), 20.0)  # FIXED: increase default
 DESKTOP_STREAM_TIMEOUT = _safe_float(os.environ.get('DESKTOP_STREAM_TIMEOUT', '30'), 30.0)  # FIXED: increase default
+EMPTY_UA_IS_ANDROID = _parse_bool(os.environ.get('EMPTY_UA_IS_ANDROID', 'false'), False)  # treat blank UA as Android
 
 # Upstream fetch timeouts (seconds) used inside /stream.
 # We keep P2 tighter because it can hang and trigger Gunicorn worker aborts if retries are enabled.
@@ -136,19 +172,6 @@ ANDROID_AIO_TIMEOUT = _safe_float(os.environ.get('ANDROID_AIO_TIMEOUT', '18'), 1
 ANDROID_P2_TIMEOUT = _safe_float(os.environ.get('ANDROID_P2_TIMEOUT', '12'), 12.0)  # FIXED: increase default
 DESKTOP_AIO_TIMEOUT = _safe_float(os.environ.get('DESKTOP_AIO_TIMEOUT', '28'), 28.0)  # FIXED: increase default
 DESKTOP_P2_TIMEOUT = _safe_float(os.environ.get('DESKTOP_P2_TIMEOUT', '15'), 15.0)  # FIXED: increase default
-
-
-# Fastlane (patch 3): if AIO fetch doesn't complete within this many seconds, respond using P2 + cached AIO.
-# Set to 0 to disable.
-AIO_FASTLANE_SOFT_TIMEOUT = _safe_float(os.environ.get('AIO_FASTLANE_SOFT_TIMEOUT', '0'), 0.0)
-AIO_FASTLANE_CACHE_TTL = _safe_int(os.environ.get('AIO_FASTLANE_CACHE_TTL', '300'), 300)
-AIO_FASTLANE_CACHE_CAP = _safe_int(os.environ.get('AIO_FASTLANE_CACHE_CAP', '200'), 200)
-AIO_FASTLANE_MISS_GRACE_S = _safe_float(os.environ.get('AIO_FASTLANE_MISS_GRACE_S', '2.0'), 2.0)
-FASTLANE_P2_GRACE_MS = _safe_int(os.environ.get('FASTLANE_P2_GRACE_MS', '200'), 200)
-
-# Shared executor for upstream fetches (lets fastlane return without waiting for background fetch completion)
-FETCH_WORKERS = _safe_int(os.environ.get('FETCH_WORKERS', '4'), 4)
-
 
 # TorBox API call timeout (seconds) used during cache checks.
 TB_API_TIMEOUT = _safe_float(os.environ.get('TB_API_TIMEOUT', '8'), 8.0)
@@ -250,6 +273,39 @@ _BLACKLIST_LOCK = threading.Lock()
 _FAKES_LOCK = threading.Lock()
 
 
+
+# --- infohash normalization ---
+_INFOHASH_HEX_RE = re.compile(r"(?i)\b[0-9a-f]{40}\b")
+_INFOHASH_B32_RE = re.compile(r"(?i)\b[a-z2-7]{32}\b")
+
+def norm_infohash(raw: Any) -> str:
+    """Normalize many infohash/id forms into lowercase 40-hex when possible."""
+    if raw is None:
+        return ""
+    s = str(raw).strip().lower()
+    if not s:
+        return ""
+    # Common prefixes / encodings (we only need the underlying hash).
+    for p in ("urn:btih:", "btih:", "ih:", "infohash:", "hash:"):
+        if s.startswith(p):
+            s = s[len(p):]
+            break
+    # URL-encoded variants (best-effort).
+    s = s.replace("urn%3abtih%3a", "").replace("btih%3a", "").replace("ih%3a", "")
+
+    m = _INFOHASH_HEX_RE.search(s)
+    if m:
+        return m.group(0).lower()
+
+    # Base32 infohash (32 chars) -> hex (40 chars).
+    m2 = _INFOHASH_B32_RE.fullmatch(s)
+    if m2:
+        try:
+            return base64.b32decode(s.upper()).hex().lower()
+        except Exception:
+            return s
+
+    return s
 def _truncate(s: str, max_chars: int) -> str:
     if s is None:
         return ""
@@ -520,16 +576,20 @@ def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
                 cached = set()
                 for x in d:
                     if isinstance(x, str):
-                        cached.add(x)
+                        nx = norm_infohash(x)
+                        if nx:
+                            cached.add(nx)
                     elif isinstance(x, dict):
                         hx = x.get('hash') or x.get('info_hash')
                         if isinstance(hx, str):
-                            cached.add(hx.lower().strip())
+                            nx = norm_infohash(hx)
+                            if nx:
+                                cached.add(nx)
             else:
                 cached = set()
-            cached_norm = {str(x).lower().strip() for x in cached if x}
+            cached_norm = {norm_infohash(x) for x in cached if x}
             for h in batch:
-                hh = (h or '').lower().strip()
+                hh = norm_infohash(h)
                 out[hh] = hh in cached_norm
         except Exception:
             continue
@@ -1044,26 +1104,25 @@ def _rid() -> str:
     return g.request_id if has_request_context() and hasattr(g, "request_id") else "GLOBAL"
 
 def is_android_client() -> bool:
-    """Best-effort detection of Android/Google TV Stremio clients.
+    """Best-effort detection of Android/TV-ish clients for tighter time budgets.
 
-    IMPORTANT: Some Android TV / Google TV Stremio builds send an empty User-Agent
-    (it shows up as '-' in some access logs). Treat empty UA as Android/TV so
-    we apply Android/TV-friendly time budgets and avoid client-side timeouts.
+    Important: blank User-Agent is *not* treated as Android unless EMPTY_UA_IS_ANDROID=true.
+    (Your curl tests often use an empty UA; we don't want that to trigger Android limits.)
     """
     ua = request.headers.get("User-Agent", "") if has_request_context() else ""
     ua_l = (ua or "").strip().lower()
 
-    # Key fix: Google TV clients may omit UA entirely.
     if not ua_l:
-        return True
+        return bool(EMPTY_UA_IS_ANDROID)
 
     return (
-        ('android' in ua_l)
-        or ('okhttp' in ua_l)
-        or ('exoplayer' in ua_l)
-        or ('stremio' in ua_l and 'tv' in ua_l)
+        ("android" in ua_l)
+        or ("dalvik" in ua_l)
+        or ("okhttp" in ua_l)
+        or ("exoplayer" in ua_l)
+        or ("google tv" in ua_l)
+        or ("stremio" in ua_l and "tv" in ua_l)
     )
-
 
 # ---------------------------
 # HTTP session (retries)
@@ -1085,47 +1144,6 @@ fast_retry = Retry(total=0)
 fast_adapter = HTTPAdapter(max_retries=fast_retry)
 fast_session.mount("http://", fast_adapter)
 fast_session.mount("https://", fast_adapter)
-
-
-# ---------------------------
-# Fastlane AIO cache (in-process, per Render instance)
-# ---------------------------
-_AIO_FASTLANE_CACHE = {}  # key -> (ts_epoch, streams_list)
-_AIO_FASTLANE_LOCK = threading.Lock()
-
-def _aio_cache_key(type_, id_):
-    return f"{type_}:{id_}"
-
-def _aio_cache_get(type_, id_):
-    if AIO_FASTLANE_CACHE_TTL <= 0:
-        return None, None
-    k = _aio_cache_key(type_, id_)
-    now = time.time()
-    with _AIO_FASTLANE_LOCK:
-        v = _AIO_FASTLANE_CACHE.get(k)
-        if not v:
-            return None, None
-        ts, streams = v
-        age = now - ts
-        if age > AIO_FASTLANE_CACHE_TTL:
-            _AIO_FASTLANE_CACHE.pop(k, None)
-            return None, None
-        return streams, age
-
-def _aio_cache_set(type_, id_, streams):
-    if AIO_FASTLANE_CACHE_TTL <= 0:
-        return
-    if not streams:
-        return
-    k = _aio_cache_key(type_, id_)
-    if AIO_FASTLANE_CACHE_CAP > 0:
-        streams = streams[:AIO_FASTLANE_CACHE_CAP]
-    with _AIO_FASTLANE_LOCK:
-        _AIO_FASTLANE_CACHE[k] = (time.time(), streams)
-
-# Shared executor for upstream fetches (lets fastlane return without waiting for background fetch completion)
-FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=max(2, FETCH_WORKERS))
-
 
 # ---------------------------
 # Simple in-process rate limiting (no extra deps)
@@ -2002,265 +2020,263 @@ def _fetch_streams_from_base(base: str, auth: str, type_: str, id_: str, tag: st
         return []
 
 
+# ---------- FASTLANE (Patch 3): shared fetch executor + AIO cache ----------
+WRAP_FETCH_WORKERS = int(os.getenv("WRAP_FETCH_WORKERS", "8") or 8)
+FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=WRAP_FETCH_WORKERS)
+
+AIO_CACHE_TTL_S = int(os.getenv("AIO_CACHE_TTL_S", "600") or 600)   # 0 disables cache
+AIO_CACHE_MAX = int(os.getenv("AIO_CACHE_MAX", "200") or 200)
+AIO_CACHE_MODE = (os.getenv("AIO_CACHE_MODE", "off") or "off").lower()  # off|swr|soft
+AIO_SOFT_TIMEOUT_S = float(os.getenv("AIO_SOFT_TIMEOUT_S", "0") or 0)   # only used in 'soft' mode
+
+# Prov2-only fastlane (separate from AIO cache modes): early-return if Prov2 alone is "good enough"
+FASTLANE_ENABLED = _parse_bool(os.getenv("FASTLANE_ENABLED", "false"), False)
+FASTLANE_MIN_STREAMS = _safe_int(os.getenv("FASTLANE_MIN_STREAMS", "8"), 8)
+
+_AIO_CACHE = {}  # key -> (ts_monotonic, streams, count)
+_AIO_CACHE_LOCK = threading.Lock()
+
+def _aio_cache_get(key: str):
+    if AIO_CACHE_TTL_S <= 0:
+        return None
+    now = time.monotonic()
+    with _AIO_CACHE_LOCK:
+        v = _AIO_CACHE.get(key)
+        if not v:
+            return None
+        ts, streams, count = v
+        if (now - ts) > AIO_CACHE_TTL_S:
+            _AIO_CACHE.pop(key, None)
+            return None
+        return streams, count
+
+def _aio_cache_set(key: str, streams: list, count: int):
+    if AIO_CACHE_TTL_S <= 0:
+        return
+    now = time.monotonic()
+    with _AIO_CACHE_LOCK:
+        _AIO_CACHE[key] = (now, streams, count)
+        # evict oldest entries if over cap
+        while len(_AIO_CACHE) > AIO_CACHE_MAX:
+            oldest = next(iter(_AIO_CACHE))
+            _AIO_CACHE.pop(oldest, None)
+
+def _aio_cache_key(type_: str, id_: str, extras) -> str:
+    # extras can be dict or None; keep stable key
+    if not extras:
+        return f"{type_}:{id_}"
+    try:
+        return f"{type_}:{id_}:{json.dumps(extras, sort_keys=True, separators=(',',':'))}"
+    except Exception:
+        return f"{type_}:{id_}:{str(extras)}"
+
 def get_streams_single(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float, no_retry: bool = False) -> tuple[list[dict[str, Any]], int, int]:
     """Fetch a single provider and return (streams, count, ms)."""
     t0 = time.time()
+
+def try_fastlane(*, prov2_fut, aio_fut, aio_key: str, prov2_url: str, aio_url: str, type_: str, id_: str, is_android: bool, client_timeout_s: float, deadline: float):
+    """Prov2-only early return. Returns (out, aio_in, prov2_in, aio_ms, p2_ms, prefiltered, stats) or None."""
+    if not FASTLANE_ENABLED or not prov2_fut or not prov2_url:
+        return None
+    # Cap how long we wait for Prov2 before deciding. We never block on AIO here.
+    try:
+        prov2_timeout = (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT)
+        remaining = max(0.05, float(deadline) - time.monotonic())
+        wait_s = min(float(prov2_timeout), remaining)
+        p2_streams, prov2_in, p2_ms = prov2_fut.result(timeout=wait_s)
+    except FuturesTimeoutError:
+        return None
+    except Exception:
+        return None
+
+    # Run the normal pipeline on Prov2-only to see if it's already "good enough".
+    try:
+        out, stats = filter_and_format(type_, id_, p2_streams, aio_in=0, prov2_in=prov2_in, is_android=is_android)
+    except Exception:
+        return None
+
+    try:
+        cached_tb = 0
+        usenet = 0
+        for s in out:
+            bh = (s.get('behaviorHints') or {}) if isinstance(s, dict) else {}
+            prov = (bh.get('provider') or '').upper()
+            if prov == 'TB' and bh.get('cached') is True:
+                cached_tb += 1
+            if prov in USENET_PRIORITY:
+                usenet += 1
+    except Exception:
+        cached_tb = 0
+        usenet = 0
+
+    if len(out) < FASTLANE_MIN_STREAMS and cached_tb < FASTLANE_MIN_STREAMS and usenet < int(MIN_USENET_DELIVER or 0):
+        return None
+
+    # Warm AIO cache in the background so the next request can merge instantly.
+    if aio_fut and AIO_CACHE_TTL_S > 0:
+        def _update_cache_cb(fut):
+            try:
+                s, cnt, _ms = fut.result()
+                if s:
+                    _aio_cache_set(aio_key, s, cnt)
+            except Exception:
+                pass
+        try:
+            aio_fut.add_done_callback(_update_cache_cb)
+        except Exception:
+            pass
+
+    # Fill in fetch timings for logs.
+    stats.ms_fetch_aio = 0
+    stats.ms_fetch_p2 = int(p2_ms or 0)
+
+    logger.info(
+        "FASTLANE_TRIGGERED rid=%s type=%s id=%s out=%d p2_in=%d cached_tb=%d usenet=%d p2_ms=%d aio=%s p2=%s",
+        _rid(), type_, id_, len(out), prov2_in, cached_tb, usenet, int(p2_ms or 0),
+        bool(aio_url), bool(prov2_url),
+    )
+    return out, 0, prov2_in, 0, int(p2_ms or 0), True, stats
+
     streams = _fetch_streams_from_base(base, auth, type_, id_, tag, timeout=timeout, no_retry=no_retry)
     ms = int((time.time() - t0) * 1000)
     return streams, len(streams), ms
 
-def get_streams(
-    type_: str,
-    id_: str,
-    *,
-    is_android: bool = False,
-    client_timeout_s: float | None = None,
-) -> Tuple[List[Dict[str, Any]], int, int, int, int]:
-    """Fetch provider streams in parallel (best-effort) and return merged results.
-
-    Key behavior: after AIO returns, we only wait a *small grace period* for P2.
-    This prevents slow P2 reads from causing client timeouts / Gunicorn aborts.
+def get_streams(type_: str, id_: str, *, is_android: bool = False, client_timeout_s: float | None = None):
     """
-    rid = _rid()
+    Fetch streams from:
+      - AIO_BASE (debrid instance)
+      - PROV2_BASE (usenet instance)
+
+    Patch 3 ("fastlane") adds optional AIO cache / soft-timeout:
+      - AIO_CACHE_MODE=off  : previous behavior (wait for both)
+      - AIO_CACHE_MODE=swr  : use cached AIO immediately (stale-while-revalidate) and refresh in background
+      - AIO_CACHE_MODE=soft : wait up to AIO_SOFT_TIMEOUT_S for AIO; if not ready, fall back to cached AIO (if any)
+
+    Notes:
+      - This function must NOT use a "with ThreadPoolExecutor(...)" context manager,
+        because that would block on exit and defeat early-return/caching.
+    """
+    if client_timeout_s is None:
+        client_timeout_s = ANDROID_STREAM_TIMEOUT if is_android else DESKTOP_STREAM_TIMEOUT
+
+    t0 = time.monotonic()
+    deadline = t0 + float(client_timeout_s)
+
+    # In this wrapper, extras are not used (movie/series id already encodes what upstream needs).
+    # Kept here for future series extras support.
+    extras = None
+
+    aio_url = f"{AIO_BASE}/stream/{type_}/{id_}.json" if AIO_BASE else ""
+    prov2_url = f"{PROV2_BASE}/stream/{type_}/{id_}.json" if PROV2_BASE else ""
+
+
     aio_streams: List[Dict[str, Any]] = []
-    prov2_streams: List[Dict[str, Any]] = []
-    aio_ms = 0
-    p2_ms = 0
-
-    total_timeout = float(
-        client_timeout_s
-        if client_timeout_s is not None
-        else (ANDROID_STREAM_TIMEOUT if is_android else DESKTOP_STREAM_TIMEOUT)
-    )
-    aio_timeout = float(ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT)
-    p2_timeout = float(ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT)
-    logger.debug(
-        "DEBUG_CONFIG rid=%s AIO_BASE=%s AIO_AUTH_set=%s PROV2_BASE=%s PROV2_AUTH_set=%s WRAP_URL_SHORT=%s",
-        _rid(), AIO_BASE, bool(AIO_AUTH), PROV2_BASE, bool(PROV2_AUTH), bool(WRAP_URL_SHORT)
-    )
-
-    # After AIO completes, don't block long for P2.
-    p2_grace = 1.5 if is_android else 4.0
-
-    # Fire both fetches at once. Always use the no-retry session so read timeouts don't balloon.
+    p2_streams: List[Dict[str, Any]] = []
     aio_in = 0
-    p2_in = 0
-    merged: List[Dict[str, Any]] = []
-
-    deadline = time.monotonic() + max(0.1, total_timeout)
-
-    
-    # Fetch in parallel. Use shared executor so we can "fastlane" return without waiting
-    # for slow AIO to finish (it can refresh the cache in the background).
-    aio_streams = []
-    prov2_streams = []
+    prov2_in = 0
     aio_ms = 0
     p2_ms = 0
+
+    aio_key = _aio_cache_key(type_, id_, extras)
+    cached = _aio_cache_get(aio_key)
 
     aio_fut = None
     p2_fut = None
 
-    if aio_url:
-        aio_fut = FETCH_EXECUTOR.submit(get_streams_single, aio_url, "AIO", aio_timeout, rid)
+    if AIO_BASE:
+        aio_fut = FETCH_EXECUTOR.submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, id_, extras, float(client_timeout_s))
+    if PROV2_BASE:
+        p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, id_, extras, float(client_timeout_s))
+    # Fastlane: Prov2-only early return if it's already good enough (does not wait on AIO).
+    fl = try_fastlane(
+        prov2_fut=p2_fut,
+        aio_fut=aio_fut,
+        aio_key=aio_key,
+        prov2_url=prov2_url,
+        aio_url=aio_url,
+        type_=type_,
+        id_=id_,
+        is_android=is_android,
+        client_timeout_s=float(client_timeout_s),
+        deadline=deadline,
+    )
+    if fl is not None:
+        return fl
 
-        # When the background fetch completes, refresh cache for next requests.
-        def _aio_done(fut):
-            try:
-                s, _n, _ms = fut.result()
-                if s:
-                    _aio_cache_set(type_, id_, s)
-                    logger.debug("AIO_FASTLANE_CACHE_SET rid=%s type=%s id=%s count=%d ms=%d", rid, type_, id_, len(s), _ms)
-            except Exception:
-                return
 
-        aio_fut.add_done_callback(_aio_done)
-
-    if p2_url:
-        p2_fut = FETCH_EXECUTOR.submit(get_streams_single, p2_url, "P2", p2_timeout, rid)
-
-    fastlane_used = False
-    fastlane_hit = False
-    fastlane_age = None
-
-    # 1) AIO: use real result if it finishes quickly; otherwise use cached AIO (if any).
-    if aio_fut:
-        if AIO_FASTLANE_SOFT_TIMEOUT and AIO_FASTLANE_SOFT_TIMEOUT > 0:
-            try:
-                aio_streams, _aio_n, aio_ms = aio_fut.result(timeout=AIO_FASTLANE_SOFT_TIMEOUT)
-            except FuturesTimeoutError:
-                fastlane_used = True
-                cached, age = _aio_cache_get(type_, id_)
-                if cached:
-                    aio_streams = cached
-                    fastlane_hit = True
-                    fastlane_age = age
-                    aio_ms = int(AIO_FASTLANE_SOFT_TIMEOUT * 1000)
-                else:
-                    # Cache miss: optionally wait a little longer for the real AIO result so the first-ever
-                    # request after deploy isn't "P2-only".
-                    if AIO_FASTLANE_MISS_GRACE_S and AIO_FASTLANE_MISS_GRACE_S > 0:
-                        try:
-                            aio_streams, _aio_n2, aio_ms = aio_fut.result(timeout=AIO_FASTLANE_MISS_GRACE_S)
-                            fastlane_used = False
-                            logger.info(
-                                "AIO_FASTLANE_MISS_GRACE rid=%s type=%s id=%s extra_s=%.2f",
-                                rid,
-                                type_,
-                                id_,
-                                AIO_FASTLANE_MISS_GRACE_S,
-                            )
-                        except FuturesTimeoutError:
-                            aio_streams = []
-                            aio_ms = int((AIO_FASTLANE_SOFT_TIMEOUT + AIO_FASTLANE_MISS_GRACE_S) * 1000)
-                    else:
-                        aio_streams = []
-                        aio_ms = int(AIO_FASTLANE_SOFT_TIMEOUT * 1000)
-                if fastlane_used:
-                    logger.info(
-                        "AIO_FASTLANE rid=%s type=%s id=%s soft_s=%.2f cache_hit=%s age_s=%s",
-                    rid,
-                    type_,
-                    id_,
-                    AIO_FASTLANE_SOFT_TIMEOUT,
-                    fastlane_hit,
-                    (f"{fastlane_age:.1f}" if fastlane_age is not None else "-"),
-                )
-            except Exception as e:
-                logger.warning("AIO fetch failed rid=%s err=%s", rid, e)
-                aio_streams = []
-                aio_ms = 0
-        else:
-            try:
-                aio_streams, _aio_n, aio_ms = aio_fut.result()
-            except Exception as e:
-                logger.warning("AIO fetch failed rid=%s err=%s", rid, e)
-                aio_streams = []
-                aio_ms = 0
-
-    # 2) P2: best-effort. Give it a grace window; shorter when we fastlane.
-    if p2_fut:
-        grace_ms = FASTLANE_P2_GRACE_MS if fastlane_used else P2_GRACE_MS
-        grace_s = max(0.0, min(grace_ms / 1000.0, deadline - time.time()))
+    def _harvest_p2():
+        nonlocal p2_streams, prov2_in, p2_ms
+        if not p2_fut:
+            return
+        remaining = max(0.05, deadline - time.monotonic())
         try:
-            if p2_fut.done():
-                prov2_streams, _p2_n, p2_ms = p2_fut.result()
-            elif grace_s > 0:
-                prov2_streams, _p2_n, p2_ms = p2_fut.result(timeout=grace_s)
-            else:
-                prov2_streams = []
-                p2_ms = 0
+            p2_streams, prov2_in, p2_ms = p2_fut.result(timeout=remaining)
         except FuturesTimeoutError:
-            prov2_streams = []
-            p2_ms = int(grace_s * 1000)
-        except Exception as e:
-            logger.warning("P2 fetch failed rid=%s err=%s", rid, e)
-            prov2_streams = []
-            p2_ms = 0
+            # leave empty; may still finish later
+            p2_streams, prov2_in, p2_ms = [], 0, int((time.monotonic() - t0) * 1000)
 
-    aio_in = len(aio_streams)
-    p2_in = len(prov2_streams)
+    mode = AIO_CACHE_MODE
 
+    if mode == "swr" and cached is not None:
+        # Use cached AIO instantly; refresh in background
+        aio_streams, aio_in = cached
+        aio_ms = 0
 
-    # Pre-cap each provider feed to keep CPU bounded on huge payloads.
-    # This preserves balance between AIO and P2 while still allowing a later global re-rank.
-    PRECAP_PER_PROVIDER = _safe_int(os.environ.get('PRECAP_PER_PROVIDER', '125'), 125)
-    if PRECAP_PER_PROVIDER > 0:
-        # Pre-cap sorting: keep best candidates before slicing (helps preserve TB/2160p streams).
-        def _precap_sort_key(_s: Dict[str, Any]) -> Tuple[int, int, int]:
-            if not isinstance(_s, dict):
-                return (0, 0, 0)
-            bh = (_s.get("behaviorHints") or {})
-            prov_raw = (_s.get("provider") or bh.get("provider") or bh.get("source") or "")
-            prov = str(prov_raw or "").upper().strip()
-            # If provider is missing, try a cheap token sniff from text.
-            if not prov:
-                txt = f"{_s.get('name','')} {_s.get('description','')} {bh.get('filename','')} {bh.get('source','')}".upper()
-                if re.search(r"(?<![A-Z0-9])TORBOX(?![A-Z0-9])|(?<![A-Z0-9])TB(?![A-Z0-9])", txt):
-                    prov = "TB"
-                elif re.search(r"(?<![A-Z0-9])REAL[- ]?DEBRID(?![A-Z0-9])|(?<![A-Z0-9])RD(?![A-Z0-9])", txt):
-                    prov = "RD"
-                elif re.search(r"(?<![A-Z0-9])ALL[- ]?DEBRID(?![A-Z0-9])|(?<![A-Z0-9])AD(?![A-Z0-9])", txt):
-                    prov = "AD"
-                elif re.search(r"(?<![A-Z0-9])NZBDAV(?![A-Z0-9])|(?<![A-Z0-9])ND(?![A-Z0-9])", txt):
-                    prov = "ND"
-                else:
-                    prov = "UNK"
-            # Resolution (cheap sniff)
-            txt2 = f"{_s.get('name','')} {_s.get('description','')} {bh.get('filename','')}".upper()
-            if "2160" in txt2 or "4K" in txt2:
-                res_i = 2160
-            elif "1080" in txt2:
-                res_i = 1080
-            elif "720" in txt2:
-                res_i = 720
+        if aio_fut:
+            def _update_cache_cb(fut):
+                try:
+                    s, cnt, _ms = fut.result()
+                    if s:
+                        _aio_cache_set(aio_key, s, cnt)
+                except Exception:
+                    pass
+            aio_fut.add_done_callback(_update_cache_cb)
+
+        _harvest_p2()
+
+    elif mode == "soft" and aio_fut is not None:
+        soft = float(AIO_SOFT_TIMEOUT_S or 0)
+        if soft <= 0:
+            # behave like "off"
+            soft = max(0.05, deadline - time.monotonic())
+
+        try:
+            aio_streams, aio_in, aio_ms = aio_fut.result(timeout=min(soft, max(0.05, deadline - time.monotonic())))
+        except FuturesTimeoutError:
+            if cached is not None:
+                aio_streams, aio_in = cached
             else:
-                res_i = 0
+                aio_streams, aio_in = [], 0
+            aio_ms = int(soft * 1000)
+
+            # refresh cache when AIO finishes
+            def _update_cache_cb(fut):
+                try:
+                    s, cnt, _ms = fut.result()
+                    if s:
+                        _aio_cache_set(aio_key, s, cnt)
+                except Exception:
+                    pass
+            aio_fut.add_done_callback(_update_cache_cb)
+
+        _harvest_p2()
+
+    else:
+        # mode == "off" OR no cache: wait for AIO and P2 within the deadline
+        if aio_fut:
+            remaining = max(0.05, deadline - time.monotonic())
             try:
-                seed_i = int(_s.get("seeders") or _s.get("seeds") or 0)
-            except Exception:
-                seed_i = 0
-            # Higher is better: premium score, then resolution, then seeders.
-            prem = 999 - _provider_rank(prov)
-            return (prem, res_i, seed_i)
-        if len(aio_streams) > PRECAP_PER_PROVIDER:
-            logger.info("PRECAP_AIO rid=%s before=%d after=%d", _rid(), len(aio_streams), PRECAP_PER_PROVIDER)
-            aio_streams.sort(key=_precap_sort_key, reverse=True)
-            aio_streams = aio_streams[:PRECAP_PER_PROVIDER]
-        if len(prov2_streams) > PRECAP_PER_PROVIDER:
-            logger.info("PRECAP_P2 rid=%s before=%d after=%d", _rid(), len(prov2_streams), PRECAP_PER_PROVIDER)
-            prov2_streams.sort(key=_precap_sort_key, reverse=True)
-            prov2_streams = prov2_streams[:PRECAP_PER_PROVIDER]
+                aio_streams, aio_in, aio_ms = aio_fut.result(timeout=remaining)
+            except FuturesTimeoutError:
+                aio_streams, aio_in, aio_ms = [], 0, int((time.monotonic() - t0) * 1000)
 
-    if aio_streams:
-        merged.extend(aio_streams)
-    if prov2_streams:
-        merged.extend(prov2_streams)
+        _harvest_p2()
 
-    return merged, aio_in, p2_in, aio_ms, p2_ms
+        if aio_streams:
+            _aio_cache_set(aio_key, aio_streams, aio_in)
 
-
-
-# ---------------------------
-# Pipeline stats (required; used by /stream and filter_and_format)
-# ---------------------------
-@dataclass
-class PipeStats:
-    aio_in: int = 0
-    prov2_in: int = 0
-    merged_in: int = 0
-    dropped_error: int = 0
-    dropped_missing_url: int = 0
-    dropped_pollution: int = 0
-    dropped_low_seeders: int = 0
-    dropped_lang: int = 0
-    dropped_low_premium: int = 0
-    dropped_rd: int = 0
-    dropped_ad: int = 0
-    dropped_low_res: int = 0
-    dropped_old_age: int = 0
-    dropped_blacklist: int = 0
-    dropped_fakes_db: int = 0
-    dropped_title_mismatch: int = 0
-    dropped_dead_url: int = 0
-    dropped_uncached: int = 0
-    dropped_uncached_tb: int = 0
-    dropped_android_magnets: int = 0
-    deduped: int = 0
-    delivered: int = 0
-
-    # Timing/diagnostics (ms)
-    ms_fetch_aio: int = 0
-    ms_fetch_p2: int = 0
-    ms_tmdb: int = 0
-    ms_tb_api: int = 0
-    ms_tb_webdav: int = 0
-    ms_tb_usenet: int = 0
-
-    # Hash counts (diagnostics)
-    tb_api_hashes: int = 0
-    tb_webdav_hashes: int = 0
-    tb_usenet_hashes: int = 0
-
+    merged = aio_streams + p2_streams
+    return merged, aio_in, prov2_in, aio_ms, p2_ms, False, None
 
 def hash_stats(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
     total = len(pairs)
@@ -2770,13 +2786,18 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     break
                 if (_m.get('provider') or '').upper() != 'TB':
                     continue
-                h = (_m.get('infohash') or '').lower().strip()
-                if h and h not in seen_h:
+                h = norm_infohash(_m.get('infohash'))
+                if h and re.fullmatch(r"[0-9a-f]{40}", h) and h not in seen_h:
                     seen_h.add(h)
                     hashes.append(h)
             if len(hashes) >= TB_API_MIN_HASHES:
                 t0 = time.time()
-                cached_map = tb_get_cached(hashes)
+                cached_map_raw = tb_get_cached(hashes)
+                cached_map = {}
+                for _k, _v in (cached_map_raw or {}).items():
+                    _nk = norm_infohash(_k)
+                    if _nk:
+                        cached_map[_nk] = bool(_v)
                 stats.ms_tb_api = int((time.time() - t0) * 1000)
                 stats.tb_api_hashes = len(hashes)
             else:
@@ -2786,9 +2807,12 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         kept = []
         dropped_uncached = 0
         dropped_uncached_tb = 0
+        tb_flip = 0
+        tb_total = 0
         for _s, _m in candidates:
             provider = (_m.get('provider') or '').upper()
-            h = (_m.get('infohash') or '').lower().strip()
+            h = norm_infohash(_m.get('infohash'))
+            orig_tb_cached = (_m.get('cached') is True)
             bh = _s.get('behaviorHints') or {}
             text = (str(_s.get('name') or '') + ' ' + str(_s.get('description') or '') + ' ' + str(bh.get('filename') or '') + ' ' + str(bh.get('bingeGroup') or '')).lower()
 
@@ -2811,6 +2835,10 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 cached_marker = None
 
             _m['cached'] = cached_marker
+            if provider == 'TB' and h:
+                tb_total += 1
+                if cached_marker is True and not orig_tb_cached:
+                    tb_flip += 1
             if h and isinstance(cached_marker, bool):
                 with CACHED_HISTORY_LOCK:
                     CACHED_HISTORY[h] = cached_marker
@@ -2825,6 +2853,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             else:
                 kept.append((_s, _m))
 
+        if tb_total:
+            logger.info("TB_FLIPS rid=%s flipped=%s/%s tb_api_hashes=%s", _rid(), tb_flip, tb_total, int(stats.tb_api_hashes or 0))
         candidates = kept
         stats.dropped_uncached += dropped_uncached
         stats.dropped_uncached_tb += dropped_uncached_tb
@@ -3013,14 +3043,18 @@ def stream(type_: str, id_: str):
     is_android = is_android_client()
 
     try:
-        streams, aio_in, prov2_in, ms_aio, ms_p2 = get_streams(
+        streams, aio_in, prov2_in, ms_aio, ms_p2, prefiltered, pre_stats = get_streams(
             type_,
             id_,
             is_android=is_android,
             client_timeout_s=(ANDROID_STREAM_TIMEOUT if is_android else DESKTOP_STREAM_TIMEOUT),
         )
-        # NOTE: filter_and_format returns a fresh PipeStats; set fetch timings after it returns.
-        out, stats = filter_and_format(type_, id_, streams, aio_in=aio_in, prov2_in=prov2_in, is_android=is_android)
+        if prefiltered:
+            out = streams
+            stats = pre_stats if isinstance(pre_stats, PipeStats) else PipeStats()
+        else:
+            # NOTE: filter_and_format returns a fresh PipeStats; set fetch timings after it returns.
+            out, stats = filter_and_format(type_, id_, streams, aio_in=aio_in, prov2_in=prov2_in, is_android=is_android)
         stats.aio_in = aio_in
         stats.prov2_in = prov2_in
         stats.ms_fetch_aio = ms_aio
