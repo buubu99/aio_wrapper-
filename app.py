@@ -12,6 +12,48 @@ import difflib
 import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass
+
+# ---------------------------
+# Pipeline stats (required)
+# ---------------------------
+@dataclass
+class PipeStats:
+    aio_in: int = 0
+    prov2_in: int = 0
+    merged_in: int = 0
+    dropped_error: int = 0
+    dropped_missing_url: int = 0
+    dropped_pollution: int = 0
+    dropped_low_seeders: int = 0
+    dropped_lang: int = 0
+    dropped_low_premium: int = 0
+    dropped_rd: int = 0
+    dropped_ad: int = 0
+    dropped_low_res: int = 0
+    dropped_old_age: int = 0
+    dropped_blacklist: int = 0
+    dropped_fakes_db: int = 0
+    dropped_title_mismatch: int = 0
+    dropped_dead_url: int = 0
+    dropped_uncached: int = 0
+    dropped_uncached_tb: int = 0
+    dropped_android_magnets: int = 0
+    deduped: int = 0
+    delivered: int = 0
+
+    # Timing/diagnostics (ms)
+    ms_fetch_aio: int = 0
+    ms_fetch_p2: int = 0
+    ms_tmdb: int = 0
+    ms_tb_api: int = 0
+    ms_tb_webdav: int = 0
+    ms_tb_usenet: int = 0
+
+    # Hash counts (diagnostics)
+    tb_api_hashes: int = 0
+    tb_webdav_hashes: int = 0
+    tb_usenet_hashes: int = 0
+
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
