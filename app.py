@@ -10,6 +10,7 @@ import unicodedata
 import uuid
 import difflib
 import threading
+import resource  # For memory tracking (ru_maxrss)
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
@@ -39,10 +40,16 @@ class PipeStats:
     dropped_uncached_tb: int = 0
     dropped_android_magnets: int = 0
     dropped_iphone_magnets: int = 0
+    dropped_platform_specific: int = 0  # Total platform-specific drops (android+iphone)
     client_platform: str = ""
     deduped: int = 0
     delivered: int = 0
 
+
+    # Cache summary (delivered only)
+    cache_hit: int = 0
+    cache_miss: int = 0
+    cache_rate: float = 0.0  # cache_hit/(cache_hit+cache_miss)
     # Timing/diagnostics (ms)
     ms_fetch_aio: int = 0
     ms_fetch_p2: int = 0
@@ -54,6 +61,8 @@ class PipeStats:
     # Per-filter timings (ms)
     ms_title_mismatch: int = 0
     ms_uncached_check: int = 0
+
+    memory_peak_kb: int = 0  # ru_maxrss delta during request (kb on Linux)
 
     # Hash counts (diagnostics)
     tb_api_hashes: int = 0
@@ -67,6 +76,11 @@ class PipeStats:
     counts_out: Dict[str, Any] = field(default_factory=dict)
 
     # Captured issues for weekly review
+    # Error breakdown (fetch/meta + exceptions)
+    errors_timeout: int = 0
+    errors_parse: int = 0
+    errors_api: int = 0
+
     error_reasons: List[str] = field(default_factory=list)
     flag_issues: List[str] = field(default_factory=list)
 
@@ -2105,9 +2119,8 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
         for s in streams:
             if isinstance(s, dict):
                 bh = s.setdefault("behaviorHints", {})
-                bh.setdefault("wrap_src", tag)
-                bh.setdefault("source_tag", tag)
-                bh.setdefault("source", tag)
+                bh["wrap_src"] = tag
+                bh["source_tag"] = tag
         meta["count"] = int(len(streams))
         meta["ok"] = True
         return streams, meta
@@ -2624,7 +2637,7 @@ def _summarize_streams_for_counts(streams: List[Dict[str, Any]]) -> Dict[str, An
             continue
         out["total"] += 1
         bh = s.get("behaviorHints") or {}
-        supplier = (bh.get("wrap_src") or bh.get("source_tag") or bh.get("source") or "UNK")
+        supplier = (bh.get("wrap_src") or bh.get("source_tag") or "UNK")
         supplier = str(supplier).upper()
         try:
             m = classify(s)
@@ -3190,6 +3203,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             else:
                 stats.dropped_android_magnets += magnets
                 platform = "android"
+            # Total platform-specific drops (android+iphone magnets)
+            stats.dropped_platform_specific += magnets
             logger.info("MOBILE_FILTER rid=%s platform=%s dropped_magnets=%s", _rid(), platform, magnets)
             candidates = kept
 
@@ -3255,7 +3270,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         logger.debug("DELIVERED_TOP5 rid=%s count=%d", _rid(), len(delivered))
         for i, d in enumerate(delivered_dbg[:5]):
             logger.debug(
-                "  #%d res=%s seeders=%s prov=%s cached=%s hash=%s url_len=%s name=%r",
+                "  #%d res=%s seeders=%s prov=%s cached=%s hash=%s url_len=%s platform_note=%s name=%r",
                 i,
                 d.get("res"),
                 d.get("seeders"),
@@ -3263,6 +3278,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 d.get("cached"),
                 "yes" if d.get("has_hash") else "no",
                 d.get("url_len"),
+                ("android" if is_android else ("iphone" if is_iphone else "")),
                 d.get("name"),
             )
 
@@ -3363,7 +3379,7 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.12",
+            "version": "1.0.13",
             "name": f"AIO Wrapper (Rich Output, 2 Lines Left) 9.1 [{cfg}]",
             "description": "Merges 2 providers and outputs a brand-new, strict-client-safe stream schema with rich AIOStreams-style emoji formatting (2-line left column).",
             "resources": ["stream"],
@@ -3377,6 +3393,12 @@ def manifest():
 def stream(type_: str, id_: str):
     if not _is_valid_stream_id(type_, id_):
         return jsonify({"streams": []}), 400
+
+    mem_start = 0
+    try:
+        mem_start = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss or 0)
+    except Exception:
+        mem_start = 0
 
     t0 = time.time()
     stats = PipeStats()
@@ -3419,6 +3441,13 @@ def stream(type_: str, id_: str):
         # Ensure platform info survives prefiltered stats
         stats.client_platform = platform
 
+        # Memory tracking (ru_maxrss delta; kb on Linux)
+        try:
+            mem_end = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss or 0)
+            stats.memory_peak_kb = max(0, int(mem_end) - int(mem_start or 0))
+        except Exception:
+            stats.memory_peak_kb = 0
+
         # Attach fetch timings
         stats.aio_in = int(aio_in or 0)
         stats.prov2_in = int(prov2_in or 0)
@@ -3429,6 +3458,20 @@ def stream(type_: str, id_: str):
         try:
             stats.fetch_aio = _compact_fetch_meta((fetch_meta or {}).get("aio") or {})
             stats.fetch_p2 = _compact_fetch_meta((fetch_meta or {}).get("p2") or {})
+            # Error breakdown from fetch meta (timeout/json/other)
+            try:
+                for _fm in (stats.fetch_aio, stats.fetch_p2):
+                    _err = str((_fm or {}).get("err") or "").lower().strip()
+                    if not _err:
+                        continue
+                    if _err == "timeout":
+                        stats.errors_timeout += 1
+                    elif _err == "json":
+                        stats.errors_parse += 1
+                    elif _err not in ("", "no_base"):
+                        stats.errors_api += 1
+            except Exception:
+                pass
         except Exception:
             stats.fetch_aio, stats.fetch_p2 = {}, {}
         try:
@@ -3529,19 +3572,52 @@ def stream(type_: str, id_: str):
 
         payload: Dict[str, Any] = {"streams": out_for_client, "cacheMaxAge": int(CACHE_TTL)}
         if want_dbg:
+            # Best-effort debug even when the main stream handler threw.
             try:
-                csum = _summarize_streams_for_counts(out_for_client)
+                if (not stats.fetch_aio) or (not stats.fetch_p2):
+                    fm = locals().get("fetch_meta") or {}
+                    stats.fetch_aio = stats.fetch_aio or _compact_fetch_meta((fm.get("aio") if isinstance(fm, dict) else {}) or {})
+                    stats.fetch_p2 = stats.fetch_p2 or _compact_fetch_meta((fm.get("p2") if isinstance(fm, dict) else {}) or {})
             except Exception:
-                csum = {}
+                pass
+            try:
+                if not stats.counts_in:
+                    stats.counts_in = _summarize_streams_for_counts(locals().get("streams") or [])
+            except Exception:
+                pass
+            try:
+                out_sum = _summarize_streams_for_counts(out_for_client)
+            except Exception:
+                out_sum = {}
             payload["debug"] = {
                 "rid": _rid(),
                 "platform": platform,
                 "cache": ("hit" if served_from_cache else "miss"),
                 "served_cache": bool(served_from_cache),
-                "fetch": {"aio": {}, "p2": {}},
-                "in": csum,
-                "out": csum,
+                "fetch": {"aio": stats.fetch_aio, "p2": stats.fetch_p2},
+                "in": (stats.counts_in or {}),
+                "out": out_sum,
+                "timing_ms": {
+                    "aio": int(stats.ms_fetch_aio or 0),
+                    "p2": int(stats.ms_fetch_p2 or 0),
+                    "tmdb": int(stats.ms_tmdb or 0),
+                    "tb_api": int(stats.ms_tb_api or 0),
+                    "tb_webdav": int(stats.ms_tb_webdav or 0),
+                    "title": int(stats.ms_title_mismatch or 0),
+                    "uncached": int(stats.ms_uncached_check or 0),
+                },
                 "delivered": int(len(out_for_client) if out_for_client is not None else 0),
+                "drops": {
+                    "error": int(stats.dropped_error or 0),
+                    "missing_url": int(stats.dropped_missing_url or 0),
+                    "pollution": int(stats.dropped_pollution or 0),
+                    "title_mismatch": int(stats.dropped_title_mismatch or 0),
+                    "dead_url": int(stats.dropped_dead_url or 0),
+                    "uncached": int(stats.dropped_uncached or 0),
+                    "uncached_tb": int(stats.dropped_uncached_tb or 0),
+                    "android_magnets": int(stats.dropped_android_magnets or 0),
+                    "iphone_magnets": int(stats.dropped_iphone_magnets or 0),
+                },
                 "errors": list(stats.error_reasons)[:8],
                 "flags": list(stats.flag_issues)[:12],
             }
@@ -3581,29 +3657,40 @@ def stream(type_: str, id_: str):
             flags=list(stats.flag_issues) if isinstance(stats.flag_issues, list) else [],
         )
 
+        # Flag platform-specific drops (magnets removed on mobile)
+        try:
+            if int(stats.dropped_platform_specific or 0) > 0 and isinstance(stats.flag_issues, list):
+                _bd = f"android:{int(stats.dropped_android_magnets or 0)},iphone:{int(stats.dropped_iphone_magnets or 0)}"
+                stats.flag_issues.append(f"platform_drops:{_bd}")
+        except Exception:
+            pass
+
         logger.info(
-            "WRAP_TIMING rid=%s type=%s id=%s client=%s aio_ms=%s p2_ms=%s tmdb_ms=%s title_ms=%s uncached_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_api_hashes=%s tb_wd_hashes=%s",
-            _rid(), type_, id_, (stats.client_platform or platform),
+            "WRAP_TIMING rid=%s type=%s id=%s aio_ms=%s p2_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s",
+            _rid(), type_, id_,
             int(stats.ms_fetch_aio or 0), int(stats.ms_fetch_p2 or 0), int(stats.ms_tmdb or 0),
+            int(stats.ms_tb_api or 0), int(stats.ms_tb_webdav or 0), int(stats.ms_tb_usenet or 0),
             int(stats.ms_title_mismatch or 0), int(stats.ms_uncached_check or 0),
-            int(stats.ms_tb_api or 0), int(stats.ms_tb_webdav or 0),
-            int(stats.tb_api_hashes or 0), int(stats.tb_webdav_hashes or 0),
+            int(stats.tb_api_hashes or 0), int(stats.tb_webdav_hashes or 0), int(stats.tb_usenet_hashes or 0),
+            int(stats.memory_peak_kb or 0),
         )
         logger.info(
-            "WRAP_STATS rid=%s type=%s id=%s client=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s android_magnets=%s iphone_magnets=%s deduped=%s delivered=%s served_cache=%s flags=%s errors=%s ms=%s",
-            _rid(), type_, id_, (stats.client_platform or platform),
+            "WRAP_STATS rid=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s android_magnets=%s iphone_magnets=%s dropped_platform_specific=%s deduped=%s delivered=%s cache_hit=%s cache_miss=%s cache_rate=%.2f platform=%s flags=%s errors=%s errors_timeout=%s errors_parse=%s errors_api=%s ms=%s",
+            _rid(), type_, id_,
             int(stats.aio_in or 0), int(stats.prov2_in or 0), int(stats.merged_in or 0),
             int(stats.dropped_error or 0), int(stats.dropped_missing_url or 0), int(stats.dropped_pollution or 0),
-            int(stats.dropped_low_seeders or 0), int(stats.dropped_lang or 0),
-            int(stats.dropped_low_premium or 0),
-            int(stats.dropped_rd or 0), int(stats.dropped_ad or 0), int(stats.dropped_low_res or 0), int(stats.dropped_old_age or 0),
-            int(stats.dropped_blacklist or 0), int(stats.dropped_fakes_db or 0), int(stats.dropped_title_mismatch or 0), int(stats.dropped_dead_url or 0),
-            int(stats.dropped_uncached or 0), int(stats.dropped_uncached_tb or 0),
-            int(stats.dropped_android_magnets or 0), int(stats.dropped_iphone_magnets or 0),
+            int(stats.dropped_low_seeders or 0), int(stats.dropped_lang or 0), int(stats.dropped_low_premium or 0),
+            int(stats.dropped_rd or 0), int(stats.dropped_ad or 0), int(stats.dropped_low_res or 0),
+            int(stats.dropped_old_age or 0), int(stats.dropped_blacklist or 0), int(stats.dropped_fakes_db or 0),
+            int(stats.dropped_title_mismatch or 0), int(stats.dropped_dead_url or 0), int(stats.dropped_uncached or 0),
+            int(stats.dropped_uncached_tb or 0), int(stats.dropped_android_magnets or 0), int(stats.dropped_iphone_magnets or 0),
+            int(stats.dropped_platform_specific or 0),
             int(stats.deduped or 0), int(stats.delivered or 0),
-            1 if served_from_cache else 0,
+            int(stats.cache_hit or 0), int(stats.cache_miss or 0), float(stats.cache_rate or 0.0),
+            str(stats.client_platform or ""),
             ",".join(list(stats.flag_issues)[:8]) if isinstance(stats.flag_issues, list) else "",
             ",".join(list(stats.error_reasons)[:6]) if isinstance(stats.error_reasons, list) else "",
+            int(stats.errors_timeout or 0), int(stats.errors_parse or 0), int(stats.errors_api or 0),
             ms_total,
         )
 
@@ -3629,6 +3716,11 @@ def handle_unhandled_exception(e):
 
     # Last-resort safety net so Stremio doesn't get HTML 500s (which break jq/tests).
     logger.exception("UNHANDLED %s %s: %s", request.method, request.path, e)
+    try:
+        if "timeout" in str(e).lower():
+            logger.warning("EXEC_ISSUE rid=%s: timeout in %s", _rid(), request.path)
+    except Exception:
+        pass
 
     if request.path.endswith("/manifest.json"):
         return manifest()
@@ -3672,10 +3764,16 @@ def handle_unhandled_exception(e):
                 "platform": platform,
                 "cache": ("hit" if bool(cached) else "miss"),
                 "served_cache": bool(cached),
+                "fetch": {
+                    "aio": {"ok": False, "err": "unhandled"},
+                    "p2": {"ok": False, "err": "unhandled"},
+                },
                 "in": csum,
                 "out": csum,
+                "timing_ms": {},
                 "delivered": int(len(out_for_client) if out_for_client is not None else 0),
-                "error": type(e).__name__,
+                "errors": [f"unhandled:{type(e).__name__}"],
+                "flags": ["unhandled_exception"],
             }
         return jsonify(payload), 200
 
