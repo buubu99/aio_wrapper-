@@ -231,6 +231,8 @@ USENET_PRIORITY = _safe_csv(os.environ.get('USENET_PRIORITY', 'ND,EW,NG'))
 USENET_SEEDER_BOOST = _safe_int(os.environ.get('USENET_SEEDER_BOOST', '10'), 10)
 INSTANT_BOOST_TOP_N = _safe_int(os.environ.get('INSTANT_BOOST_TOP_N', '0'), 0)  # 0=off; set in Render if wanted
 DIVERSITY_TOP_M = _safe_int(os.environ.get('DIVERSITY_TOP_M', '0'), 0)  # 0=off; set in Render if wanted
+DIVERSITY_POOL_MULT = _safe_int(os.environ.get('DIVERSITY_POOL_MULT', '10'), 10)  # pool = m * mult (lets diversity pull from deeper)
+CANDIDATE_WINDOW_MULT = _safe_int(os.environ.get('CANDIDATE_WINDOW_MULT', '10'), 10)  # window = DELIVER_CAP * mult (buffer for quotas)
 DIVERSITY_THRESHOLD = _safe_float(os.environ.get('DIVERSITY_THRESHOLD', '0.85'), 0.85)  # quality guard for diversity (0.0-1.0)
 P2_SRC_BOOST = _safe_int(os.environ.get('P2_SRC_BOOST', '5'), 5)  # slight preference for P2 when diversifying
 INPUT_CAP_PER_SOURCE = _safe_int(os.environ.get('INPUT_CAP_PER_SOURCE', '0'), 0)  # 0=off; per-supplier cap if set
@@ -300,8 +302,8 @@ ANDROID_VERIFY_OFF = _parse_bool(os.environ.get("ANDROID_VERIFY_OFF", "false"), 
 
 
 # Force a minimum share of usenet results (if they exist)
-MIN_USENET_KEEP = _safe_int(os.environ.get('MIN_USENET_KEEP', '3'), 3)
-MIN_USENET_DELIVER = _safe_int(os.environ.get('MIN_USENET_DELIVER', '3'), 3)
+MIN_USENET_KEEP = _safe_int(os.environ.get('MIN_USENET_KEEP', '0'), 0)
+MIN_USENET_DELIVER = _safe_int(os.environ.get('MIN_USENET_DELIVER', '0'), 0)
 
 # Optional local/remote filtering sources
 USE_BLACKLISTS = _parse_bool(os.environ.get("USE_BLACKLISTS", "true"), True)
@@ -2930,7 +2932,7 @@ def _diversify_by_quality_bucket(
         return out_pairs
 
     # Pull from a wider pool so we can swap in "nearby" candidates that were just below the cut.
-    pool_n = min(len(out_pairs), max(m * 4, 200))
+    pool_n = min(len(out_pairs), max(m * DIVERSITY_POOL_MULT, 200))
     pool = out_pairs[:pool_n]
     tail = out_pairs[pool_n:]
 
@@ -3385,8 +3387,15 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # Candidate window: a little bigger so we can satisfy usenet quotas.
 
-    window = max(deliver_cap_eff, MIN_USENET_KEEP, MIN_USENET_DELIVER, 1)
-    candidates = out_pairs[: min(len(out_pairs), window * 4, MAX_CANDIDATES)]
+    base_window = max(deliver_cap_eff, MIN_USENET_KEEP, MIN_USENET_DELIVER, 1)
+    window = min(len(out_pairs), base_window * CANDIDATE_WINDOW_MULT, MAX_CANDIDATES)
+    candidates = out_pairs[:window]
+    try:
+        _win_usenet = sum(1 for p in candidates if _is_usenet(p[0]))
+        _win_p2 = sum(1 for p in candidates if (str((p[0].get('behaviorHints') or {}).get('wrap_src') or (p[0].get('behaviorHints') or {}).get('source_tag') or '').upper() == 'P2'))
+        logger.info(f"CAND_WINDOW rid={rid} window={window}/{len(out_pairs)} deliver_cap={deliver_cap_eff} usenet_in_window={_win_usenet} p2_in_window={_win_p2}")
+    except Exception:
+        pass
 
     # Android/TV: remove streams that resolve to known error placeholders (e.g., /static/500.mp4)
     if is_android and not ANDROID_VERIFY_OFF:
