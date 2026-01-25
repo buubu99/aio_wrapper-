@@ -229,10 +229,10 @@ PREFERRED_LANG = os.environ.get("PREFERRED_LANG", "EN").upper()
 PREMIUM_PRIORITY = _safe_csv(os.environ.get('PREMIUM_PRIORITY', 'TB,RD,AD,ND'))
 USENET_PRIORITY = _safe_csv(os.environ.get('USENET_PRIORITY', 'ND,EW,NG'))
 USENET_SEEDER_BOOST = _safe_int(os.environ.get('USENET_SEEDER_BOOST', '10'), 10)
-INSTANT_BOOST_TOP_N = _safe_int(os.environ.get('INSTANT_BOOST_TOP_N', '100'), 100)
-DIVERSITY_TOP_M = _safe_int(os.environ.get('DIVERSITY_TOP_M', '30'), 30)
-INPUT_CAP_PER_SOURCE = _safe_int(os.environ.get('INPUT_CAP_PER_SOURCE', '300'), 300)
-DL_ASSOC_PARSE = _parse_bool(os.environ.get('DL_ASSOC_PARSE', 'true'), True)
+INSTANT_BOOST_TOP_N = _safe_int(os.environ.get('INSTANT_BOOST_TOP_N', '0'), 0)  # 0=off; set in Render if wanted
+DIVERSITY_TOP_M = _safe_int(os.environ.get('DIVERSITY_TOP_M', '0'), 0)  # 0=off; set in Render if wanted
+INPUT_CAP_PER_SOURCE = _safe_int(os.environ.get('INPUT_CAP_PER_SOURCE', '0'), 0)  # 0=off; per-supplier cap if set
+DL_ASSOC_PARSE = _parse_bool(os.environ.get('DL_ASSOC_PARSE', 'true'), True)  # default true; set false in Render to disable
 VERIFY_PREMIUM = _parse_bool(os.environ.get("VERIFY_PREMIUM", "true"), True)
 ASSUME_PREMIUM_ON_FAIL = _parse_bool(os.environ.get("ASSUME_PREMIUM_ON_FAIL", "false"), False)
 POLL_ATTEMPTS = _safe_int(os.environ.get('POLL_ATTEMPTS', '2'), 2)
@@ -2262,7 +2262,11 @@ def _fetch_streams_from_base(base: str, auth: str, type_: str, id_: str, tag: st
         if resp.status_code != 200:
             return []
         data = resp.json() if resp.content else {}
-        streams = (data.get('streams') or [])[:min(INPUT_CAP, INPUT_CAP_PER_SOURCE)]
+        raw_streams = (data.get('streams') or [])
+        cap_n = int(INPUT_CAP)
+        if INPUT_CAP_PER_SOURCE and int(INPUT_CAP_PER_SOURCE) > 0:
+            cap_n = min(cap_n, int(INPUT_CAP_PER_SOURCE))
+        streams = raw_streams[:cap_n]
         # Lightweight tagging for debug (does not expose tokens)
         for s in streams:
             if isinstance(s, dict):
@@ -3198,7 +3202,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     except Exception as _e:
         logger.debug("POST_SORT_TOP_ERR rid=%s err=%s", _rid(), _e)
 
-    # OPTIONAL: Instant boost in top N (defaults ON; set INSTANT_BOOST_TOP_N=0 to disable).
+    # OPTIONAL: Instant boost in top N (OFF by default; set INSTANT_BOOST_TOP_N in Render to enable).
     instant_boost_top_n = INSTANT_BOOST_TOP_N
     if instant_boost_top_n and instant_boost_top_n > 0:
         top_n = min(int(instant_boost_top_n), len(out_pairs))
@@ -3219,7 +3223,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         except Exception:
             pass
 
-    # OPTIONAL: Diversity nudge in top M (defaults ON; set DIVERSITY_TOP_M=0 to disable).
+    # OPTIONAL: Diversity nudge in top M (OFF by default; set DIVERSITY_TOP_M in Render to enable).
     # Deterministic greedy selection: lightly penalize repeats of supplier and provider in the *top slice* only.
     diversity_top_m = DIVERSITY_TOP_M
     if diversity_top_m and diversity_top_m > 0:
