@@ -228,6 +228,9 @@ PREFERRED_LANG = os.environ.get("PREFERRED_LANG", "EN").upper()
 # Premium priorities and verification
 PREMIUM_PRIORITY = _safe_csv(os.environ.get('PREMIUM_PRIORITY', 'TB,RD,AD,ND'))
 USENET_PRIORITY = _safe_csv(os.environ.get('USENET_PRIORITY', 'ND,EW,NG'))
+USENET_SEEDER_BOOST = _safe_int(os.environ.get('USENET_SEEDER_BOOST', '10'), 10)  # NEW: tiebreak for seeders=0 usenet
+INSTANT_BOOST_TOP_N = _safe_int(os.environ.get('INSTANT_BOOST_TOP_N', '0'), 0)  # NEW: 0=off; try 100 to favor cached in top-N ties
+DIVERSITY_TOP_M = _safe_int(os.environ.get('DIVERSITY_TOP_M', '0'), 0)  # NEW: 0=off; try 20 to nudge provider mix in top-M ties
 VERIFY_PREMIUM = _parse_bool(os.environ.get("VERIFY_PREMIUM", "true"), True)
 ASSUME_PREMIUM_ON_FAIL = _parse_bool(os.environ.get("ASSUME_PREMIUM_ON_FAIL", "false"), False)
 POLL_ATTEMPTS = _safe_int(os.environ.get('POLL_ATTEMPTS', '2'), 2)
@@ -584,11 +587,21 @@ def _verify_stream_url(s: Dict[str, Any], timeout: Optional[float] = None, range
 
 
 def _provider_rank(provider: str) -> int:
+    # Provider codes are parsed from stream text (e.g., TB/RD/AD/ND/DL).
+    # NOTE: Upstream "DL" is treated as Debrid-Link for logging clarity; ranking treats it as DL.
     prov = (provider or '').upper().strip()
+    if prov == 'DEBRIDLINK':
+        prov = 'DL'
+
     if prov in PREMIUM_PRIORITY:
         return PREMIUM_PRIORITY.index(prov)
     if prov in USENET_PRIORITY:
         return len(PREMIUM_PRIORITY) + USENET_PRIORITY.index(prov)
+
+    # If DL isn't configured in PREMIUM_PRIORITY, keep it above unknown/junk (mid-tier).
+    if prov == 'DL':
+        return len(PREMIUM_PRIORITY) + len(USENET_PRIORITY) + 1
+
     return 999
 
 
@@ -1692,7 +1705,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
             break
     # Fallback: extract a Usenet identifier from the playback URL if present (e.g. TorBox hash/guid)
     if not usenet_hash and url:
-        m2 = re.search(r'\"hash\"\s*:\s*\"([0-9a-fA-F]{8,64})\"', url)
+        m2 = re.search(r'"hash"\s*:\s*"([0-9a-fA-F]{8,64})"', url)
         if not m2:
             m2 = re.search(r'/download/\d+/([0-9a-fA-F]{8,64})', url)
         if m2:
@@ -2698,6 +2711,8 @@ _RES_ORDER = ["2160P", "1440P", "1080P", "720P", "480P", "SD"]
 
 def _stack_for_provider(p: str) -> str:
     p = (p or "UNK").upper()
+    if p == "DEBRIDLINK":
+        p = "DL"
     if p in _DEBRID_PROVIDERS:
         return "debrid"
     if p in _USENET_PROVIDERS or p in USENET_PRIORITY:
@@ -2777,8 +2792,10 @@ def _summarize_streams_for_counts(streams: List[Dict[str, Any]]) -> Dict[str, An
             m = classify(s)
         except Exception:
             m = {}
-        prov = str(m.get("provider") or "UNK").upper()
-        stack = _stack_for_provider(prov)
+        prov_raw = str(m.get("provider") or "UNK").upper()
+        prov_norm = "DL" if prov_raw == "DEBRIDLINK" else prov_raw
+        prov_label = "DEBRIDLINK" if prov_norm == "DL" else prov_norm  # log clarity: DL -> DEBRIDLINK
+        stack = _stack_for_provider(prov_norm)
         res = _res_bucket(m.get("res") or "")
         size_b = int(m.get("size") or 0)
         size_k = _size_bucket(size_b)
@@ -2786,7 +2803,7 @@ def _summarize_streams_for_counts(streams: List[Dict[str, Any]]) -> Dict[str, An
         cached = bh.get("cached", None)
 
         _bump(out["by_supplier"], supplier)
-        _bump(out["by_provider"], prov)
+        _bump(out["by_provider"], prov_label)
         _bump(out["by_stack"], stack)
         _bump(out["by_res"], res)
         _bump(out["by_size"], size_k)
@@ -3074,20 +3091,83 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     except Exception as _e:
         logger.debug(f"HASH_STATS_ERR rid={_rid()} err={_e}")
 
-    # Sorting: enforce premium streams first, then resolution/seeders.
-    # This makes the first MAX_DELIVER feel like a true "premium" view.
-
+    # Sorting: QUALITY-FIRST global sort across the merged providers.
+    # Order: res > size > seeders (usenet boost for seeders=0) > provider rank > cached.
+    # This prevents appended providers from being buried under provider-first ordering.
     def sort_key(pair: Tuple[Dict[str, Any], Dict[str, Any]]):
         s, m = pair
         prov = (m.get('provider', 'ZZ') or 'ZZ').upper()
-        prov_idx = _provider_rank(prov)
+        prov_idx = _provider_rank(prov)  # Lower is better (premium first)
         cached = m.get('cached')
-        cached_val = 0 if cached is True else 1 if cached == 'LIKELY' else 2
-        res = _res_to_int(m.get('res') or 'SD')
-        seeders = int(m.get('seeders') or 0)
-        return (prov_idx, cached_val, -res, -seeders)
+        cached_val = 0.0 if cached is True else 0.5 if cached == 'LIKELY' else 2.0  # Lower is better; LIKELY near True
+        res = _res_to_int(m.get('res') or 'SD')  # Higher is better
+        seeders = _safe_int(m.get('seeders') or 0, 0)  # Higher is better
+        size_b = _safe_int(m.get('size') or 0, 0)  # Bytes; higher is better
+
+        # Usenet fallback: seeders are often 0; give a small tiebreak so REMUX usenet doesn't sink.
+        if seeders == 0 and (prov in USENET_PRIORITY or prov in _USENET_PROVIDERS):
+            seeders = int(USENET_SEEDER_BOOST)
+
+        return (-res, -size_b, -seeders, prov_idx, cached_val)
 
     out_pairs.sort(key=sort_key)
+
+    # Proof log: post-sort top 5 (supplier/prov/res/size/seeders/cached)
+    try:
+        top5 = []
+        for _s, _m in out_pairs[:5]:
+            _bh = (_s.get("behaviorHints") or {})
+            _supplier = (_bh.get("wrap_src") or _bh.get("source_tag") or "UNK")
+            _prov = (_m.get("provider") or "UNK")
+            _res = (_m.get("res") or "SD")
+            _size_gb = round((_safe_int(_m.get("size") or 0, 0) / (1024 ** 3)), 2) if _m.get("size") else 0
+            _seed = _safe_int(_m.get("seeders") or 0, 0)
+            _cached = _m.get("cached")
+            top5.append((_supplier, _prov, _res, _size_gb, _seed, _cached))
+        logger.debug("POST_SORT_TOP rid=%s top5=%s", _rid(), top5)
+    except Exception as _e:
+        logger.debug("POST_SORT_TOP_ERR rid=%s err=%s", _rid(), _e)
+
+    # OPTIONAL: boost cached/instant items within top-N ties (off by default).
+    if INSTANT_BOOST_TOP_N > 0:
+        n = min(int(INSTANT_BOOST_TOP_N), len(out_pairs))
+        head = out_pairs[:n]
+
+        def _instant_key(p):
+            _s, _m = p
+            _c = _m.get("cached")
+            inst = 0 if _c is True or _c == "LIKELY" else 1
+            return sort_key(p) + (inst,)
+
+        head.sort(key=_instant_key)
+        out_pairs = head + out_pairs[n:]
+        try:
+            logger.debug("POST_INSTANT_TOP rid=%s cached=%s", _rid(), [m.get("cached") for _, m in out_pairs[:5]])
+        except Exception:
+            pass
+
+    # OPTIONAL: diversity nudge within top-M ties (off by default).
+    if DIVERSITY_TOP_M > 0:
+        mmax = min(int(DIVERSITY_TOP_M), len(out_pairs))
+        head = out_pairs[:mmax]
+
+        prov_seen = {}
+        adjusted = []
+        for p in head:
+            _prov = (p[1].get("provider") or "UNK").upper()
+            k = sort_key(p)
+            idx = prov_seen.get(_prov, 0)
+            prov_seen[_prov] = idx + 1
+            penalty = idx * 0.1  # second item from same prov gets +0.1, third +0.2, etc.
+            adjusted.append((k[:-1] + (k[-1] + penalty,), p))
+
+        adjusted.sort(key=lambda x: x[0])
+        head2 = [p for _, p in adjusted]
+        out_pairs = head2 + out_pairs[mmax:]
+        try:
+            logger.debug("POST_DIVERSITY_TOP rid=%s prov=%s", _rid(), [m.get("provider") for _, m in out_pairs[:5]])
+        except Exception:
+            pass
 
     # Candidate window: a little bigger so we can satisfy usenet quotas.
     window = max(deliver_cap_eff, MIN_USENET_KEEP, MIN_USENET_DELIVER, 1)
