@@ -231,6 +231,8 @@ USENET_PRIORITY = _safe_csv(os.environ.get('USENET_PRIORITY', 'ND,EW,NG'))
 USENET_SEEDER_BOOST = _safe_int(os.environ.get('USENET_SEEDER_BOOST', '10'), 10)
 INSTANT_BOOST_TOP_N = _safe_int(os.environ.get('INSTANT_BOOST_TOP_N', '0'), 0)  # 0=off; set in Render if wanted
 DIVERSITY_TOP_M = _safe_int(os.environ.get('DIVERSITY_TOP_M', '0'), 0)  # 0=off; set in Render if wanted
+DIVERSITY_THRESHOLD = _safe_float(os.environ.get('DIVERSITY_THRESHOLD', '0.85'), 0.85)  # quality guard for diversity (0.0-1.0)
+P2_SRC_BOOST = _safe_int(os.environ.get('P2_SRC_BOOST', '5'), 5)  # slight preference for P2 when diversifying
 INPUT_CAP_PER_SOURCE = _safe_int(os.environ.get('INPUT_CAP_PER_SOURCE', '0'), 0)  # 0=off; per-supplier cap if set
 DL_ASSOC_PARSE = _parse_bool(os.environ.get('DL_ASSOC_PARSE', 'true'), True)  # default true; set false in Render to disable
 VERIFY_PREMIUM = _parse_bool(os.environ.get("VERIFY_PREMIUM", "true"), True)
@@ -2914,6 +2916,140 @@ def _compact_fetch_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     keep = ("tag", "ok", "status", "bytes", "count", "ms", "err")
     return {k: meta.get(k) for k in keep if k in meta and meta.get(k) not in (None, "", {})}
 
+# Diversify top M while preserving quality: pick from a larger pool, bucketed by resolution, then mix providers/suppliers.
+# - Does NOT force lower resolutions above higher ones; it fills 4K first, then 1080p, etc.
+# - Uses a size-based threshold so "diversity" can't pull tiny encodes ahead of huge REMUXes.
+def _diversify_by_quality_bucket(
+    out_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+    m: int,
+    sort_key,
+    threshold: float,
+    p2_src_boost: int,
+) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    if not out_pairs or m <= 0:
+        return out_pairs
+
+    # Pull from a wider pool so we can swap in "nearby" candidates that were just below the cut.
+    pool_n = min(len(out_pairs), max(m * 4, 200))
+    pool = out_pairs[:pool_n]
+    tail = out_pairs[pool_n:]
+
+    from collections import defaultdict
+
+    def _supplier_of(pair):
+        s, _m = pair
+        bh = (s.get("behaviorHints") or {}) if isinstance(s, dict) else {}
+        return str((bh.get("wrap_src") or bh.get("source_tag") or "UNK")).upper()
+
+    def _size_gb(pair) -> float:
+        _s, _m = pair
+        try:
+            return float(_m.get("size") or 0) / (1024.0 ** 3)
+        except Exception:
+            return 0.0
+
+    # Group pool by resolution (numeric) so higher res never gets displaced by lower res.
+    res_groups = defaultdict(list)
+    for p in pool:
+        res_v = _res_to_int((p[1].get("res") or "SD"))
+        res_groups[res_v].append(p)
+
+    # Highest resolution first (e.g., 2160, 1080, 720...)
+    res_levels = sorted(res_groups.keys(), reverse=True)
+
+    selected: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    prov_ct = defaultdict(int)
+    sup_ct = defaultdict(int)
+
+    # Clamp threshold sane range; if user sets weird value, just fall back.
+    try:
+        threshold = float(threshold)
+    except Exception:
+        threshold = 0.85
+    if threshold <= 0.0 or threshold > 1.0:
+        threshold = 0.85
+
+    # Convert P2 boost into a small penalty reduction in cached_val-space.
+    p2_bonus = max(0.0, float(p2_src_boost) * 0.05)
+
+    for res_v in res_levels:
+        if len(selected) >= m:
+            break
+
+        bucket = res_groups[res_v]
+        if not bucket:
+            continue
+
+        # Within a resolution bucket, group by (provider, supplier) so we can alternate across both.
+        groups = defaultdict(list)
+        for pair in bucket:
+            prov = str(pair[1].get("provider") or "UNK").upper()
+            sup = _supplier_of(pair)
+            groups[(prov, sup)].append(pair)
+
+        # Greedy selection within this res bucket.
+        bucket_selected: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+
+        while len(selected) < m:
+            best_pair = None
+            best_group = None
+            best_k = None
+
+            # Size floor for this res bucket (only after we have at least one selected in this bucket).
+            min_size = min((_size_gb(p) for p in bucket_selected), default=0.0)
+
+            for (prov, sup), lst in groups.items():
+                if not lst:
+                    continue
+                cand = lst[0]
+                size = _size_gb(cand)
+
+                # Quality guard: don't pick something far smaller than what we've already accepted in this bucket.
+                if min_size > 0.0 and size > 0.0 and size < (threshold * min_size):
+                    continue
+
+                base = sort_key(cand)  # ( -res, -size, -seeders, cached_val, prov_idx )
+                penalty = (prov_ct[prov] * 0.12) + (sup_ct[sup] * 0.18)
+                if sup == "P2":
+                    penalty = penalty - p2_bonus
+
+                k = (base[0], base[1], base[2], base[3] + penalty, base[4])
+                if best_k is None or k < best_k:
+                    best_k = k
+                    best_pair = cand
+                    best_group = (prov, sup)
+
+            if best_pair is None:
+                # If threshold blocks everything (rare), fall back to "best available" without the size guard.
+                for (prov, sup), lst in groups.items():
+                    if not lst:
+                        continue
+                    cand = lst[0]
+                    base = sort_key(cand)
+                    penalty = (prov_ct[prov] * 0.12) + (sup_ct[sup] * 0.18)
+                    if sup == "P2":
+                        penalty = penalty - p2_bonus
+                    k = (base[0], base[1], base[2], base[3] + penalty, base[4])
+                    if best_k is None or k < best_k:
+                        best_k = k
+                        best_pair = cand
+                        best_group = (prov, sup)
+
+            if best_pair is None:
+                break  # nothing left in this bucket
+
+            # Select it
+            groups[best_group].pop(0)
+            selected.append(best_pair)
+            bucket_selected.append(best_pair)
+            prov_ct[best_group[0]] += 1
+            sup_ct[best_group[1]] += 1
+
+    # Rebuild list: diversified top M from pool, then the remaining pool items in original order, then tail.
+    sel_ids = {id(p) for p in selected[:m]}
+    remaining_pool = [p for p in pool if id(p) not in sel_ids]
+    return selected[:m] + remaining_pool + tail
+
 def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0, is_android: bool = False, is_iphone: bool = False, fast_mode: bool = False, deliver_cap: Optional[int] = None) -> Tuple[List[Dict[str, Any]], PipeStats]:
     stats = PipeStats()
     rid = _rid()
@@ -3229,49 +3365,26 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # OPTIONAL: Diversity nudge in top M (OFF by default; set DIVERSITY_TOP_M in Render to enable).
     # Deterministic greedy selection: lightly penalize repeats of supplier and provider in the *top slice* only.
-    diversity_top_m = DIVERSITY_TOP_M
-    if diversity_top_m and diversity_top_m > 0:
-        top_m = min(int(diversity_top_m), len(out_pairs))
-        pool = out_pairs[:top_m]
-        tail = out_pairs[top_m:]
+diversity_top_m = DIVERSITY_TOP_M
+if diversity_top_m > 0:
+    out_pairs = _diversify_by_quality_bucket(
+        out_pairs,
+        m=min(diversity_top_m, len(out_pairs)),
+        sort_key=sort_key,
+        threshold=DIVERSITY_THRESHOLD,
+        p2_src_boost=P2_SRC_BOOST,
+    )
+    try:
+        sup_top10 = []
+        for _s, _m in out_pairs[:10]:
+            bh = (_s.get('behaviorHints') or {}) if isinstance(_s, dict) else {}
+            sup_top10.append(str((bh.get('wrap_src') or bh.get('source_tag') or 'UNK')).upper())
+        logger.debug("POST_DIVERSITY_BUCKET rid=%s sup_top10=%s", rid, sup_top10)
+    except Exception:
+        pass
 
-        from collections import defaultdict
-        prov_ct = defaultdict(int)
-        sup_ct = defaultdict(int)
-        selected = []
+# Candidate window: a little bigger so we can satisfy usenet quotas.
 
-        def _supplier_of(pair):
-            s, _m = pair
-            bh = (s.get("behaviorHints") or {}) if isinstance(s, dict) else {}
-            return str((bh.get("wrap_src") or bh.get("source_tag") or "UNK")).upper()
-
-        while pool:
-            best_i = None
-            best_k = None
-            for i, pair in enumerate(pool):
-                s, m = pair
-                prov = str(m.get("provider") or "UNK").upper()
-                sup = _supplier_of(pair)
-                base = sort_key(pair)
-                penalty = (prov_ct[prov] * 0.12) + (sup_ct[sup] * 0.18)
-                # Apply penalty by inflating cached_val slightly in ties
-                k = (base[0], base[1], base[2], base[3] + penalty, base[4], i)
-                if best_k is None or k < best_k:
-                    best_k = k
-                    best_i = i
-            chosen = pool.pop(best_i)
-            selected.append(chosen)
-            prov = str(chosen[1].get("provider") or "UNK").upper()
-            sup = _supplier_of(chosen)
-            prov_ct[prov] += 1
-            sup_ct[sup] += 1
-
-        out_pairs = selected + tail
-        try:
-            logger.debug("POST_DIVERSITY_TOP rid=%s sup_top10=%s", _rid(), [_supplier_of(p) for p in out_pairs[:10]])
-        except Exception:
-            pass
-    # Candidate window: a little bigger so we can satisfy usenet quotas.
     window = max(deliver_cap_eff, MIN_USENET_KEEP, MIN_USENET_DELIVER, 1)
     candidates = out_pairs[: min(len(out_pairs), window * 4, MAX_CANDIDATES)]
 
@@ -3756,7 +3869,7 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.14",
+            "version": "1.0.15",
             "name": f"AIO Wrapper (Rich Output, 2 Lines Left) 9.1 [{cfg}]",
             "description": "Merges 2 providers and outputs a brand-new, strict-client-safe stream schema with rich AIOStreams-style emoji formatting (2-line left column).",
             "resources": ["stream"],
