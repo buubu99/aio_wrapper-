@@ -325,7 +325,6 @@ _BLACKLIST_LOCK = threading.Lock()
 _FAKES_LOCK = threading.Lock()
 
 
-
 # --- infohash normalization ---
 _INFOHASH_HEX_RE = re.compile(r"(?i)\b[0-9a-f]{40}\b")
 _INFOHASH_B32_RE = re.compile(r"(?i)\b[a-z2-7]{32}\b")
@@ -401,7 +400,6 @@ def normalize_label(label: str) -> str:
     return s
 
 
-
 def _human_size_bytes(n: int) -> str:
     try:
         n = int(n or 0)
@@ -442,7 +440,6 @@ def _extract_infohash(text: str) -> str | None:
     if m:
         return m.group(1).lower()
     return None
-
 
 
 def is_premium_plan(provider: str) -> bool:
@@ -937,8 +934,6 @@ def wrap_playback_url(url: str) -> str:
     return u
 
 
-
-
 app = Flask(__name__)
 
 
@@ -1036,7 +1031,6 @@ def add_common_headers(response):
 @app.get("/")
 def root():
     return "ok", 200
-
 
 
 @app.route("/r/<path:token>", methods=["GET", "HEAD", "OPTIONS"])
@@ -1503,7 +1497,6 @@ def _enforce_rate_limit() -> Optional[tuple[Dict[str, Any], int]]:
             return ({'streams': []}, 429)
         q.append(now)
     return None
-
 
 
 def _extract_age_days(text: str) -> Optional[int]:
@@ -2337,7 +2330,6 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
         meta["ms"] = int((time.time() - t0) * 1000)
 
 
-
 # ---------- FASTLANE (Patch 3): shared fetch executor + AIO cache ----------
 WRAP_FETCH_WORKERS = int(os.getenv("WRAP_FETCH_WORKERS", "8") or 8)
 FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=WRAP_FETCH_WORKERS)
@@ -2378,6 +2370,18 @@ def _aio_cache_set(key: str, streams: list, count: int):
         while len(_AIO_CACHE) > AIO_CACHE_MAX:
             oldest = next(iter(_AIO_CACHE))
             _AIO_CACHE.pop(oldest, None)
+
+
+def _make_aio_cache_update_cb(aio_key: str):
+    """Return a Future callback that updates the AIO cache when the fetch completes."""
+    def _cb(fut):
+        try:
+            s, cnt, _ms, _meta = fut.result()
+            if s:
+                _aio_cache_set(aio_key, s, cnt)
+        except Exception:
+            pass
+    return _cb
 
 def _aio_cache_key(type_: str, id_: str, extras) -> str:
     # extras can be dict or None; keep stable key
@@ -2434,15 +2438,8 @@ def try_fastlane(*, prov2_fut, aio_fut, aio_key: str, prov2_url: str, aio_url: s
 
     # Warm AIO cache in the background so the next request can merge instantly.
     if aio_fut and AIO_CACHE_TTL_S > 0:
-        def _update_cache_cb(fut):
-            try:
-                s, cnt, _ms, _meta = fut.result()
-                if s:
-                    _aio_cache_set(aio_key, s, cnt)
-            except Exception:
-                pass
         try:
-            aio_fut.add_done_callback(_update_cache_cb)
+            aio_fut.add_done_callback(_make_aio_cache_update_cb(aio_key))
         except Exception:
             pass
 
@@ -2542,14 +2539,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, client_timeou
         aio_ms = 0
 
         if aio_fut:
-            def _update_cache_cb(fut):
-                try:
-                    s, cnt, _ms, _meta = fut.result()
-                    if s:
-                        _aio_cache_set(aio_key, s, cnt)
-                except Exception:
-                    pass
-            aio_fut.add_done_callback(_update_cache_cb)
+            aio_fut.add_done_callback(_make_aio_cache_update_cb(aio_key))
 
         _harvest_p2()
 
@@ -2569,14 +2559,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, client_timeou
             aio_ms = int(soft * 1000)
 
             # refresh cache when AIO finishes
-            def _update_cache_cb(fut):
-                try:
-                    s, cnt, _ms, _meta = fut.result()
-                    if s:
-                        _aio_cache_set(aio_key, s, cnt)
-                except Exception:
-                    pass
-            aio_fut.add_done_callback(_update_cache_cb)
+            aio_fut.add_done_callback(_make_aio_cache_update_cb(aio_key))
 
         _harvest_p2()
 
@@ -2664,7 +2647,6 @@ def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
     size_bucket = int(size_i / (500 * 1024 * 1024)) if size_i else -1
     normalized_label = (normalized_label or '')[:80]
     return f"nohash:{normalized_label}:{size_bucket}:{res}"
-
 
 
 def _drop_bad_top_n(
@@ -2781,7 +2763,6 @@ def _res_to_int(res: str) -> int:
     if "480" in s or "SD" in s:
         return 480
     return 0  # Default low
-
 
 
 # ---------------------------
@@ -3391,35 +3372,46 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     window = min(len(out_pairs), base_window * CANDIDATE_WINDOW_MULT, MAX_CANDIDATES)
     candidates = out_pairs[:window]
     # Candidate-window visibility (diversity proof)
-    # Logs how much USENET and P2 are visible in the *pre-cap* candidate list.
-    # This must never throw (the log analyzer expects these fields).
-    def _is_usenet(pair):
-        return (pair[1].get("provider") or "") in USENET_PRIORITY
+    _usenet_set = {str(x).upper() for x in (USENET_PRIORITY or [])}
+    _is_usenet = lambda pair: (
+        isinstance(pair, (list, tuple))
+        and len(pair) >= 2
+        and (str(((pair[1] or {}) if isinstance(pair[1], dict) else {}).get("provider") or "")).upper() in _usenet_set
+    )
+
+    def _is_p2(pair):
+        if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+            s = pair[0] if isinstance(pair[0], dict) else {}
+            meta = pair[1] if isinstance(pair[1], dict) else {}
+        elif isinstance(pair, dict):
+            s = pair
+            meta = {}
+        else:
+            return False
+        if str(meta.get("supplier") or "").upper() == "P2":
+            return True
+        bh = s.get("behaviorHints") or {}
+        return str(bh.get("wrap_src") or "").upper() == "P2"
 
     try:
-        _w = max(int(CAND_WINDOW or 0), 0)
-        _pool = candidates[: min(_w, len(candidates))] if _w else []
+        _w = max(int((CANDIDATE_WINDOW_MULT or 0) * int(deliver_cap_eff or 0)), 0)
+        _pool = out_pairs[: min(_w, len(out_pairs))] if _w else []
         _win_usenet = sum(1 for p in _pool if _is_usenet(p))
-        _win_p2 = sum(
-            1
-            for p in _pool
-            if (p[1].get("supplier") == "P2")
-            or (((p[0].get("behaviorHints") or {}).get("wrap_src") or "") == "P2")
-        )
-        _in_usenet = sum(1 for p in candidates if _is_usenet(p))
+        _win_p2 = sum(1 for p in _pool if _is_p2(p))
+        _in_usenet = sum(1 for p in out_pairs if _is_usenet(p))
         logger.info(
             "CAND_WINDOW rid=%s id=%s window=%d in_pairs=%d cap=%d in_usenet=%d usenet_in_window=%d p2_in_window=%d",
-            _rid(),
-            imdb_id,
+            rid,
+            id_,
             _w,
-            len(candidates),
-            deliver_cap_eff,
+            len(out_pairs),
+            int(deliver_cap_eff or 0),
             _in_usenet,
             _win_usenet,
             _win_p2,
         )
     except Exception as e:
-        logger.warning("CAND_WINDOW_FAIL rid=%s id=%s err=%s", _rid(), imdb_id, str(e))
+        logger.warning("CAND_WINDOW_FAIL rid=%s id=%s err=%s", rid, id_, str(e))
 
     # Android/TV: remove streams that resolve to known error placeholders (e.g., /static/500.mp4)
     if is_android and not ANDROID_VERIFY_OFF:
@@ -3899,7 +3891,7 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.16",
+            "version": "1.0.19",
             "name": f"AIO Wrapper (Rich Output, 2 Lines Left) 9.1 [{cfg}]",
             "description": "Merges 2 providers and outputs a brand-new, strict-client-safe stream schema with rich AIOStreams-style emoji formatting (2-line left column).",
             "resources": ["stream"],
