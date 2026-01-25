@@ -3390,12 +3390,34 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     base_window = max(deliver_cap_eff, MIN_USENET_KEEP, MIN_USENET_DELIVER, 1)
     window = min(len(out_pairs), base_window * CANDIDATE_WINDOW_MULT, MAX_CANDIDATES)
     candidates = out_pairs[:window]
+    # Candidate-window visibility (diversity proof)
     try:
-        _win_usenet = sum(1 for p in candidates if _is_usenet(p[0]))
-        _win_p2 = sum(1 for p in candidates if (str((p[0].get('behaviorHints') or {}).get('wrap_src') or (p[0].get('behaviorHints') or {}).get('source_tag') or '').upper() == 'P2'))
-        logger.info(f"CAND_WINDOW rid={rid} window={window}/{len(out_pairs)} deliver_cap={deliver_cap_eff} usenet_in_window={_win_usenet} p2_in_window={_win_p2}")
-    except Exception:
-        pass
+        def _stream_of(p):
+            if isinstance(p, (list, tuple)) and p and isinstance(p[0], dict):
+                return p[0]
+            if isinstance(p, dict):
+                return p
+            return None
+
+        _win_usenet = 0
+        _win_p2 = 0
+        for p in candidates:
+            s = _stream_of(p)
+            if not s:
+                continue
+            if _is_usenet(s):
+                _win_usenet += 1
+            bh = s.get('behaviorHints') or {}
+            src = str(bh.get('wrap_src') or bh.get('source_tag') or '').upper()
+            if src == 'P2':
+                _win_p2 += 1
+
+        logger.info(
+            f"CAND_WINDOW rid={rid} id={id_} window={window}/{len(out_pairs)} deliver_cap={deliver_cap_eff} "
+            f"usenet_in_window={_win_usenet} p2_in_window={_win_p2}"
+        )
+    except Exception as e:
+        logger.warning(f"CAND_WINDOW_FAIL rid={rid} id={id_} err={e}")
 
     # Android/TV: remove streams that resolve to known error placeholders (e.g., /static/500.mp4)
     if is_android and not ANDROID_VERIFY_OFF:
