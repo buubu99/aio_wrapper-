@@ -2028,6 +2028,22 @@ def build_stream_object_rich(
     elif cached_hint == "LIKELY":
         bh_out["cached"] = "LIKELY"
 
+    # Preserve wrapper supplier tag (AIO/P2) on delivered streams so WRAP_COUNTS out.by_supplier stays correct.
+    # NOTE: behaviorHints.source may be WEB/BLURAY/REMUX/etc; supplier is tracked separately in wrap_src/source_tag.
+    try:
+        supplier = (raw_bh.get("wrap_src") or raw_bh.get("source_tag") or "").strip()
+        supplier_u = str(supplier).upper() if supplier else ""
+        allowed = {str(AIO_TAG).upper(), str(PROV2_TAG).upper()}
+        if supplier_u in allowed:
+            bh_out["wrap_src"] = supplier_u
+            bh_out["source_tag"] = supplier_u
+        else:
+            bh_out["wrap_src"] = "UNK"
+            bh_out["source_tag"] = "UNK"
+    except Exception:
+        bh_out["wrap_src"] = "UNK"
+        bh_out["source_tag"] = "UNK"
+
     out = {
         "name": name,
         "description": description,
@@ -2079,10 +2095,10 @@ def _fetch_streams_from_base(base: str, auth: str, type_: str, id_: str, tag: st
         for s in streams:
             if isinstance(s, dict):
                 bh = s.setdefault('behaviorHints', {})
-                # Preserve supplier tag separately from content 'source' (which later becomes WEB/BLURAY/etc)
+                # Preserve wrapper supplier tag separately from content 'source' (which later becomes WEB/BLURAY/etc)
+                # IMPORTANT: do NOT overwrite behaviorHints.source here; it is content-origin (WEB/BLURAY/etc), not supplier.
                 bh.setdefault('wrap_src', tag)
                 bh.setdefault('source_tag', tag)
-                bh.setdefault('source', tag)
         return streams
     except json.JSONDecodeError as e:
         logger.error(f'{tag} JSON error: {e}; head={resp.text[:200] if "resp" in locals() else ""}')
@@ -2637,7 +2653,15 @@ def _summarize_streams_for_counts(streams: List[Dict[str, Any]]) -> Dict[str, An
             continue
         out["total"] += 1
         bh = s.get("behaviorHints") or {}
-        supplier = (bh.get("wrap_src") or bh.get("source_tag") or "UNK")
+        supplier = (bh.get("wrap_src") or "")
+        if not supplier:
+            # Only trust source_tag when it matches our wrapper supplier tags (avoid WEB/BLURAY/REMUX/etc pollution)
+            st = (bh.get("source_tag") or "").strip()
+            st_u = str(st).upper() if st else ""
+            allowed = {str(AIO_TAG).upper(), str(PROV2_TAG).upper()}
+            supplier = st_u if st_u in allowed else "UNK"
+        supplier = str(supplier).upper()
+
         supplier = str(supplier).upper()
         try:
             m = classify(s)
