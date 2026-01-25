@@ -3059,7 +3059,30 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # - RD/AD: heuristic only (no API checks anymore)
     # Cache checks / premium validation
     cached_map: Dict[str, bool] = {}
+
+    # Point 3 clarity: always log whether "uncached" enforcement actually ran,
+    # and whether it was only marking (KEEP) vs hard dropping (DROP).
+    uncached_policy = "SKIP"   # SKIP | KEEP | DROP
+    uncached_reason = ""
+    uncached_ran = False
+    dropped_uncached = 0
+    dropped_uncached_tb = 0
+
+    if fast_mode:
+        uncached_reason = "fast_mode"
+    elif VALIDATE_OFF:
+        uncached_reason = "VALIDATE_OFF"
+    elif not VERIFY_CACHED_ONLY:
+        uncached_reason = "VERIFY_CACHED_ONLY=false"
+    elif STRICT_PREMIUM_ONLY:
+        uncached_policy = "DROP"
+        uncached_reason = "STRICT_PREMIUM_ONLY=true"
+    else:
+        uncached_policy = "KEEP"
+        uncached_reason = "mark_only"
+
     if (not fast_mode) and VERIFY_CACHED_ONLY and not VALIDATE_OFF:
+        uncached_ran = True
         # TorBox API cached check (batched). Skip very small hash sets to avoid rate-limit/reset churn.
         if TB_CACHE_HINTS:
             hashes: List[str] = []
@@ -3148,6 +3171,16 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         except Exception:
             pass
 
+
+    logger.info(
+        "UNCACHED_POLICY rid=%s policy=%s ran=%s reason=%s dropped_uncached=%s dropped_uncached_tb=%s",
+        _rid(),
+        str(uncached_policy),
+        bool(uncached_ran),
+        str(uncached_reason),
+        int(dropped_uncached or 0),
+        int(dropped_uncached_tb or 0),
+    )
 
     # Clarity log: tells you if TB checks actually ran and how many hashes were checked.
     logger.info(
