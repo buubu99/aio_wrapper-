@@ -1,6 +1,7 @@
 from __future__ import annotations
 import base64
 import hashlib
+import html as _html
 import json
 import logging
 import os
@@ -1085,11 +1086,21 @@ def redirect_stream_url(token: str):
             resp.headers["X-Head-Bypass"] = "1"
             resp.headers["X-Stream-Location"] = url
         resp = _base(resp)
+        # Convenience: expose a human-friendly copy page for the underlying URL
+        try:
+            resp.headers["X-Copy-Page"] = _public_base_url().rstrip("/") + "/copy/" + str(token)
+        except Exception:
+            pass
     else:
         # GET: real playback
         resp = make_response("", 302)
         resp.headers["Location"] = url
         resp = _base(resp)
+        # Convenience: expose a human-friendly copy page for the underlying URL
+        try:
+            resp.headers["X-Copy-Page"] = _public_base_url().rstrip("/") + "/copy/" + str(token)
+        except Exception:
+            pass
 
     # High-signal debug
     try:
@@ -1117,6 +1128,103 @@ class SafeFormatter(logging.Formatter):
         if not hasattr(record, 'rid'):
             record.rid = '-'
         return super().format(record)
+
+
+@app.get("/copy/<path:token>")
+def copy_stream_url(token: str):
+    """Human-friendly helper: resolve /r/<token> to the upstream URL and provide a Copy button."""
+    url = None
+
+    # 1) Short-token map (if enabled)
+    if WRAP_URL_SHORT:
+        try:
+            url = _wrap_url_load(token)
+        except Exception:
+            url = None
+
+    # 2) Restart-safe compressed token
+    if not url and str(token).startswith("z"):
+        try:
+            url = _zurl_decode(token)
+        except Exception:
+            url = None
+
+    # 3) Legacy: token may be base64 of the full URL
+    if not url:
+        try:
+            url = _b64u_decode(token)
+        except Exception:
+            url = None
+
+    if not url:
+        return ("", 404)
+
+    esc = _html.escape
+    upstream = str(url)
+    upstream_esc = esc(upstream, quote=True)
+
+    html_page = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Copy stream URL</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; padding: 24px; max-width: 900px; margin: 0 auto; }}
+    h1 {{ font-size: 18px; margin: 0 0 12px; }}
+    .row {{ display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }}
+    input {{ width: min(820px, 100%); padding: 10px; font-size: 14px; }}
+    button, a {{ padding: 10px 14px; font-size: 14px; text-decoration: none; cursor: pointer; }}
+    .ok {{ opacity: .8; font-size: 12px; margin-top: 8px; }}
+  </style>
+</head>
+<body>
+  <h1>Copy stream URL</h1>
+  <div class="row">
+    <input id="u" value="{upstream_esc}" readonly />
+    <button id="btn" onclick="copyUrl()">Copy</button>
+    <a href="{upstream_esc}" target="_blank" rel="noopener">Open</a>
+  </div>
+  <div id="msg" class="ok"></div>
+  <script>
+    function copyUrl() {{
+      const el = document.getElementById('u');
+      el.focus();
+      el.select();
+      el.setSelectionRange(0, 999999);
+      const v = el.value;
+      const msg = document.getElementById('msg');
+
+      if (navigator.clipboard && navigator.clipboard.writeText) {{
+        navigator.clipboard.writeText(v).then(() => {{
+          msg.textContent = "Copied!";
+        }}).catch(() => {{
+          try {{
+            document.execCommand('copy');
+            msg.textContent = "Copied!";
+          }} catch (e) {{
+            msg.textContent = "Copy failed — select the text and copy manually.";
+          }}
+        }});
+      }} else {{
+        try {{
+          document.execCommand('copy');
+          msg.textContent = "Copied!";
+        }} catch (e) {{
+          msg.textContent = "Copy failed — select the text and copy manually.";
+        }}
+      }}
+    }}
+  </script>
+</body>
+</html>"""
+
+    resp = make_response(html_page, 200)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
 
 class RequestIdFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -2021,7 +2129,9 @@ def build_stream_object_rich(
     # These are ignored by strict clients, but make logs and troubleshooting much easier.
     bh_out["provider"] = str((m or {}).get("provider") or raw_bh.get("provider") or "UNK").upper()
     bh_out["source"] = str((m or {}).get("source") or raw_bh.get("source") or "UNK")
-    if isinstance(raw_bh.get("cached"), (bool, str)):
+    if is_confirmed:
+        bh_out["cached"] = True
+    elif isinstance(raw_bh.get("cached"), (bool, str)):
         bh_out["cached"] = raw_bh.get("cached")
     elif isinstance((m or {}).get("cached"), (bool, str)):
         bh_out["cached"] = (m or {}).get("cached")
@@ -2097,8 +2207,8 @@ def _fetch_streams_from_base(base: str, auth: str, type_: str, id_: str, tag: st
                 bh = s.setdefault('behaviorHints', {})
                 # Preserve wrapper supplier tag separately from content 'source' (which later becomes WEB/BLURAY/etc)
                 # IMPORTANT: do NOT overwrite behaviorHints.source here; it is content-origin (WEB/BLURAY/etc), not supplier.
-                bh.setdefault('wrap_src', tag)
-                bh.setdefault('source_tag', tag)
+                bh['wrap_src'] = tag
+                bh['source_tag'] = tag
         return streams
     except json.JSONDecodeError as e:
         logger.error(f'{tag} JSON error: {e}; head={resp.text[:200] if "resp" in locals() else ""}')
@@ -3314,9 +3424,11 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             # Always write provider/source for debugging & consistent stats
             bh["provider"] = str(m.get("provider") or bh.get("provider") or "UNK").upper()
             bh["source"] = str(m.get("source") or bh.get("source") or "UNK")
-            if m.get("infohash"):
-                if isinstance(cached_marker, bool):
-                    bh.setdefault("cached", cached_marker)
+            # Cache marker should reflect our best-known truth on delivered streams
+            if is_confirmed:
+                bh["cached"] = True
+            elif isinstance(cached_marker, bool):
+                bh["cached"] = cached_marker
             elif cached_hint == "LIKELY":
                 bh.setdefault("cached", "LIKELY")
             if REFORMAT_STREAMS:
@@ -3340,6 +3452,32 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             )
 
     stats.delivered = len(delivered)
+
+    # Cache summary (delivered streams only): keep WRAP_STATS aligned with WRAP_COUNTS out.cached
+    try:
+        hit = 0
+        miss = 0
+        for _s in delivered:
+            if not isinstance(_s, dict):
+                continue
+            _bh = _s.get("behaviorHints") or {}
+            _c = _bh.get("cached", None)
+            if _c is True:
+                hit += 1
+            elif _c is False:
+                miss += 1
+        stats.cache_hit = int(hit)
+        stats.cache_miss = int(miss)
+        denom = hit + miss
+        if denom > 0:
+            stats.cache_rate = float(hit) / float(denom)
+        else:
+            # If nothing is explicitly marked True/False (all LIKELY/UNK), treat non-hit as miss so rate is meaningful.
+            stats.cache_miss = max(0, int(len(delivered) - hit))
+            denom2 = int(stats.cache_hit) + int(stats.cache_miss)
+            stats.cache_rate = (float(stats.cache_hit) / float(denom2)) if denom2 > 0 else 0.0
+    except Exception:
+        pass
 
     # Flag potential issues (per-request; visible in logs and ?debug=1)
     try:
