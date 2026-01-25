@@ -3391,39 +3391,35 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     window = min(len(out_pairs), base_window * CANDIDATE_WINDOW_MULT, MAX_CANDIDATES)
     candidates = out_pairs[:window]
     # Candidate-window visibility (diversity proof)
+    # Logs how much USENET and P2 are visible in the *pre-cap* candidate list.
+    # This must never throw (the log analyzer expects these fields).
+    def _is_usenet(pair):
+        return (pair[1].get("provider") or "") in USENET_PRIORITY
+
     try:
-        _win_usenet = 0
-        _win_p2 = 0
-
-        for p in candidates:
-            s = None
-            meta = {}
-            if isinstance(p, (list, tuple)):
-                if len(p) >= 1 and isinstance(p[0], dict):
-                    s = p[0]
-                if len(p) >= 2 and isinstance(p[1], dict):
-                    meta = p[1] or {}
-            elif isinstance(p, dict):
-                s = p
-
-            if not isinstance(s, dict):
-                continue
-
-            bh = s.get("behaviorHints") or {}
-            prov = str((meta.get("provider") or bh.get("provider") or "")).upper()
-            src = str((bh.get("wrap_src") or bh.get("source_tag") or meta.get("supplier") or "")).upper()
-
-            if prov == "ND":
-                _win_usenet += 1
-            if src == "P2":
-                _win_p2 += 1
-
+        _w = max(int(CAND_WINDOW or 0), 0)
+        _pool = candidates[: min(_w, len(candidates))] if _w else []
+        _win_usenet = sum(1 for p in _pool if _is_usenet(p))
+        _win_p2 = sum(
+            1
+            for p in _pool
+            if (p[1].get("supplier") == "P2")
+            or (((p[0].get("behaviorHints") or {}).get("wrap_src") or "") == "P2")
+        )
+        _in_usenet = sum(1 for p in candidates if _is_usenet(p))
         logger.info(
-            "CAND_WINDOW rid=%s id=%s window=%s/%s deliver_cap=%s usenet_in_window=%s p2_in_window=%s",
-            rid, id_, window, len(out_pairs), deliver_cap_eff, _win_usenet, _win_p2
+            "CAND_WINDOW rid=%s id=%s window=%d in_pairs=%d cap=%d in_usenet=%d usenet_in_window=%d p2_in_window=%d",
+            _rid(),
+            imdb_id,
+            _w,
+            len(candidates),
+            deliver_cap_eff,
+            _in_usenet,
+            _win_usenet,
+            _win_p2,
         )
     except Exception as e:
-        logger.warning("CAND_WINDOW_FAIL rid=%s id=%s err=%s", rid, id_, e)
+        logger.warning("CAND_WINDOW_FAIL rid=%s id=%s err=%s", _rid(), imdb_id, str(e))
 
     # Android/TV: remove streams that resolve to known error placeholders (e.g., /static/500.mp4)
     if is_android and not ANDROID_VERIFY_OFF:
@@ -3636,9 +3632,6 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     )
 
     # Ensure we keep/deliver some usenet entries (if configured).
-    def _is_usenet(pair):
-        return pair[1].get('provider') in USENET_PRIORITY
-
     if MIN_USENET_KEEP or MIN_USENET_DELIVER:
         # KEEP: ensure at least MIN_USENET_KEEP in the pool
         if MIN_USENET_KEEP:
