@@ -1556,7 +1556,7 @@ def is_polluted(s: Dict[str, Any], type_: str, season: Optional[int], episode: O
     filename = s.get("behaviorHints", {}).get("filename", "").lower()
     text = f"{name} {desc} {filename}"
     # Container hint from filename/text
-    m_container = re.search(r'\.(MKV|MP4|AVI|M2TS|TS)', text, re.I)
+    m_container = re.search(r'\.(MKV|MP4|AVI|M2TS|TS)\b', text, re.I)
     container = (m_container.group(1).upper() if m_container else "UNK")
     # Series pollution in movie
     if type_ == "movie" and re.search(r"\bs\d{1,2}e\d{1,2}\b|\bepisode\b|\bseason\b", text):
@@ -1586,6 +1586,10 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     desc = s.get("description", "").lower()
     filename = s.get("behaviorHints", {}).get("filename", "").lower()
     text = f"{name} {desc} {filename}"
+    # Container (from filename extension)
+    m_container = re.search(r'\.(MKV|MP4|AVI|M2TS|TS)\b', text, re.I)
+    container = (m_container.group(1).upper() if m_container else 'UNK')
+
     # Provider (prefer formatter-injected shortName tokens; keep word boundaries to avoid HDR->RD)
     provider = "UNK"
     m_sn = re.search(r"\b(TB|TORBOX|RD|REAL[- ]?DEBRID|REALDEBRID|PM|PREMIUMIZE|AD|ALLDEBRID|DL|DEBRID[- ]?LINK|ND|NZBDAV|EW|EWEKA|NG|NZGEEK)\b", text, re.I)
@@ -1608,10 +1612,10 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     #   NOT from WEB-DL release tags.
     # - If Debrid-Link and a base provider token is also present, label as DL-<BASE> (e.g., DL-TB) for logging clarity.
     up = text.upper()
-    has_debridlink = bool(re.search(r"DEBRID[- ]?LINK", text, re.I) or ("🟢DL" in up))
-    has_webdl = bool(re.search(r"WEB-?DL", text, re.I))
+    has_debridlink = bool(re.search(r"\bDEBRID[- ]?LINK\b", text, re.I) or ("🟢DL" in up))
+    has_webdl = bool(re.search(r"\bWEB-?DL\b", text, re.I))
     # Detect associated base provider independently
-    m_assoc = re.search(r"(TB|TORBOX|RD|REAL[- ]?DEBRID|REALDEBRID|AD|ALLDEBRID|ALL[- ]?DEBRID|PM|PREMIUMIZE|ND|NZBDAV|EW|EWEKA|NG|NZGEEK)", text, re.I)
+    m_assoc = re.search(r"\b(TB|TORBOX|RD|REAL[- ]?DEBRID|REALDEBRID|AD|ALLDEBRID|ALL[- ]?DEBRID|PM|PREMIUMIZE|ND|NZBDAV|EW|EWEKA|NG|NZGEEK)\b", text, re.I)
     assoc = None
     if m_assoc:
         tok2 = m_assoc.group(1).upper().replace(' ', '').replace('-', '')
@@ -3752,7 +3756,7 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.13",
+            "version": "1.0.14",
             "name": f"AIO Wrapper (Rich Output, 2 Lines Left) 9.1 [{cfg}]",
             "description": "Merges 2 providers and outputs a brand-new, strict-client-safe stream schema with rich AIOStreams-style emoji formatting (2-line left column).",
             "resources": ["stream"],
