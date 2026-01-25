@@ -3365,25 +3365,25 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # OPTIONAL: Diversity nudge in top M (OFF by default; set DIVERSITY_TOP_M in Render to enable).
     # Deterministic greedy selection: lightly penalize repeats of supplier and provider in the *top slice* only.
-diversity_top_m = DIVERSITY_TOP_M
-if diversity_top_m > 0:
-    out_pairs = _diversify_by_quality_bucket(
-        out_pairs,
-        m=min(diversity_top_m, len(out_pairs)),
-        sort_key=sort_key,
-        threshold=DIVERSITY_THRESHOLD,
-        p2_src_boost=P2_SRC_BOOST,
-    )
-    try:
-        sup_top10 = []
-        for _s, _m in out_pairs[:10]:
-            bh = (_s.get('behaviorHints') or {}) if isinstance(_s, dict) else {}
-            sup_top10.append(str((bh.get('wrap_src') or bh.get('source_tag') or 'UNK')).upper())
-        logger.debug("POST_DIVERSITY_BUCKET rid=%s sup_top10=%s", rid, sup_top10)
-    except Exception:
-        pass
+    diversity_top_m = DIVERSITY_TOP_M
+    if diversity_top_m > 0:
+        out_pairs = _diversify_by_quality_bucket(
+            out_pairs,
+            m=min(diversity_top_m, len(out_pairs)),
+            sort_key=sort_key,
+            threshold=DIVERSITY_THRESHOLD,
+            p2_src_boost=P2_SRC_BOOST,
+        )
+        try:
+            sup_top10 = []
+            for _s, _m in out_pairs[:10]:
+                bh = (_s.get('behaviorHints') or {}) if isinstance(_s, dict) else {}
+                sup_top10.append(str((bh.get('wrap_src') or bh.get('source_tag') or 'UNK')).upper())
+            logger.debug("POST_DIVERSITY_BUCKET rid=%s sup_top10=%s", rid, sup_top10)
+        except Exception:
+            pass
 
-# Candidate window: a little bigger so we can satisfy usenet quotas.
+    # Candidate window: a little bigger so we can satisfy usenet quotas.
 
     window = max(deliver_cap_eff, MIN_USENET_KEEP, MIN_USENET_DELIVER, 1)
     candidates = out_pairs[: min(len(out_pairs), window * 4, MAX_CANDIDATES)]
