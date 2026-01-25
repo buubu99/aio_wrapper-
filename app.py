@@ -3392,32 +3392,38 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     candidates = out_pairs[:window]
     # Candidate-window visibility (diversity proof)
     try:
-        def _stream_of(p):
-            if isinstance(p, (list, tuple)) and p and isinstance(p[0], dict):
-                return p[0]
-            if isinstance(p, dict):
-                return p
-            return None
-
         _win_usenet = 0
         _win_p2 = 0
+
         for p in candidates:
-            s = _stream_of(p)
-            if not s:
+            s = None
+            meta = {}
+            if isinstance(p, (list, tuple)):
+                if len(p) >= 1 and isinstance(p[0], dict):
+                    s = p[0]
+                if len(p) >= 2 and isinstance(p[1], dict):
+                    meta = p[1] or {}
+            elif isinstance(p, dict):
+                s = p
+
+            if not isinstance(s, dict):
                 continue
-            if _is_usenet(s):
+
+            bh = s.get("behaviorHints") or {}
+            prov = str((meta.get("provider") or bh.get("provider") or "")).upper()
+            src = str((bh.get("wrap_src") or bh.get("source_tag") or meta.get("supplier") or "")).upper()
+
+            if prov == "ND":
                 _win_usenet += 1
-            bh = s.get('behaviorHints') or {}
-            src = str(bh.get('wrap_src') or bh.get('source_tag') or '').upper()
-            if src == 'P2':
+            if src == "P2":
                 _win_p2 += 1
 
         logger.info(
-            f"CAND_WINDOW rid={rid} id={id_} window={window}/{len(out_pairs)} deliver_cap={deliver_cap_eff} "
-            f"usenet_in_window={_win_usenet} p2_in_window={_win_p2}"
+            "CAND_WINDOW rid=%s id=%s window=%s/%s deliver_cap=%s usenet_in_window=%s p2_in_window=%s",
+            rid, id_, window, len(out_pairs), deliver_cap_eff, _win_usenet, _win_p2
         )
     except Exception as e:
-        logger.warning(f"CAND_WINDOW_FAIL rid={rid} id={id_} err={e}")
+        logger.warning("CAND_WINDOW_FAIL rid=%s id=%s err=%s", rid, id_, e)
 
     # Android/TV: remove streams that resolve to known error placeholders (e.g., /static/500.mp4)
     if is_android and not ANDROID_VERIFY_OFF:
