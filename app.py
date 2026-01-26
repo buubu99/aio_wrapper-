@@ -1834,7 +1834,7 @@ def format_stream_inplace(
     audio = (m.get('audio') or '').upper().strip()
     size_str = _human_size_bytes(m.get('size', 0))
     seeders = int(m.get('seeders') or 0)
-    container = (m.get('container') or '').upper().strip()
+    container = (m.get('container') or 'UNK').upper().strip()
 
     # Emoji mapping (kept intentionally sparse)
     if PRETTY_EMOJIS:
@@ -3348,6 +3348,31 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # OPTIONAL: Diversity nudge in top M (OFF by default; set DIVERSITY_TOP_M in Render to enable).
     # Deterministic greedy selection: lightly penalize repeats of supplier and provider in the *top slice* only.
+    # Helper predicates for candidate-window visibility metrics (must be defined unconditionally)
+    def _supplier(pair):
+        try:
+            if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                s = pair[0] if isinstance(pair[0], dict) else {}
+                meta = pair[1] if isinstance(pair[1], dict) else {}
+            elif isinstance(pair, dict):
+                s, meta = pair, {}
+            else:
+                return 'UNK'
+            sup = str(meta.get('supplier') or '').upper().strip()
+            if sup:
+                return sup
+            bh = s.get('behaviorHints') or {}
+            sup2 = str(bh.get('wrap_src') or bh.get('source_tag') or '').upper().strip()
+            return sup2 or 'UNK'
+        except Exception:
+            return 'UNK'
+
+    def _is_usenet(pair):
+        return _supplier(pair) == 'USENET'
+
+    def _is_p2(pair):
+        return _supplier(pair) == 'P2'
+
     diversity_top_m = DIVERSITY_TOP_M
     if diversity_top_m > 0:
         out_pairs = _diversify_by_quality_bucket(
