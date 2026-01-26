@@ -1834,7 +1834,7 @@ def format_stream_inplace(
     audio = (m.get('audio') or '').upper().strip()
     size_str = _human_size_bytes(m.get('size', 0))
     seeders = int(m.get('seeders') or 0)
-    container = (m.get('container') or 'UNK').upper().strip()
+    container = (m.get('container') or '').upper().strip()
 
     # Emoji mapping (kept intentionally sparse)
     if PRETTY_EMOJIS:
@@ -1896,7 +1896,9 @@ def format_stream_inplace(
             bh['cached'] = 'LIKELY'
     if m.get('source') and 'source' not in bh:
         bh['source'] = m.get('source')
-    line2_bits = [p for p in [size_str, (container if container and container != 'UNK' else ''), seeds_str, (f"Grp {group}" if group else '')] if p]
+    con_disp = container if container and str(container).upper() not in ('UNK','UNKNOWN') else ''
+    con_disp = container if container and str(container).upper() not in ('UNK','UNKNOWN') else ''
+    line2_bits = [p for p in [size_str, con_disp, seeds_str, (f"Grp {group}" if group else '')] if p]
     line2 = ' • '.join(line2_bits)
     if cached_hint:
         line1 = f"{cached_hint} • {line1}".strip(' •')
@@ -3348,31 +3350,6 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # OPTIONAL: Diversity nudge in top M (OFF by default; set DIVERSITY_TOP_M in Render to enable).
     # Deterministic greedy selection: lightly penalize repeats of supplier and provider in the *top slice* only.
-    # Helper predicates for candidate-window visibility metrics (must be defined unconditionally)
-    def _supplier(pair):
-        try:
-            if isinstance(pair, (list, tuple)) and len(pair) >= 2:
-                s = pair[0] if isinstance(pair[0], dict) else {}
-                meta = pair[1] if isinstance(pair[1], dict) else {}
-            elif isinstance(pair, dict):
-                s, meta = pair, {}
-            else:
-                return 'UNK'
-            sup = str(meta.get('supplier') or '').upper().strip()
-            if sup:
-                return sup
-            bh = s.get('behaviorHints') or {}
-            sup2 = str(bh.get('wrap_src') or bh.get('source_tag') or '').upper().strip()
-            return sup2 or 'UNK'
-        except Exception:
-            return 'UNK'
-
-    def _is_usenet(pair):
-        return _supplier(pair) == 'USENET'
-
-    def _is_p2(pair):
-        return _supplier(pair) == 'P2'
-
     diversity_top_m = DIVERSITY_TOP_M
     if diversity_top_m > 0:
         out_pairs = _diversify_by_quality_bucket(
@@ -3391,52 +3368,97 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         except Exception:
             pass
 
-    # Candidate window: a little bigger so we can satisfy usenet quotas.
-
-    base_window = max(deliver_cap_eff, MIN_USENET_KEEP, MIN_USENET_DELIVER, 1)
-    window = min(len(out_pairs), base_window * CANDIDATE_WINDOW_MULT, MAX_CANDIDATES)
-    candidates = out_pairs[:window]
-    # Candidate-window visibility (diversity proof)
-    _usenet_set = {str(x).upper() for x in (USENET_PRIORITY or [])}
-    _is_usenet = lambda pair: (
-        isinstance(pair, (list, tuple))
-        and len(pair) >= 2
-        and (str(((pair[1] or {}) if isinstance(pair[1], dict) else {}).get("provider") or "")).upper() in _usenet_set
-    )
-
-    def _is_p2(pair):
-        if isinstance(pair, (list, tuple)) and len(pair) >= 2:
-            s = pair[0] if isinstance(pair[0], dict) else {}
-            meta = pair[1] if isinstance(pair[1], dict) else {}
-        elif isinstance(pair, dict):
-            s = pair
-            meta = {}
-        else:
-            return False
-        if str(meta.get("supplier") or "").upper() == "P2":
-            return True
-        bh = s.get("behaviorHints") or {}
-        return str(bh.get("wrap_src") or "").upper() == "P2"
+    # Candidate window (diversity pool visibility)
 
     try:
-        _w = max(int((CANDIDATE_WINDOW_MULT or 0) * int(deliver_cap_eff or 0)), 0)
-        _pool = out_pairs[: min(_w, len(out_pairs))] if _w else []
-        _win_usenet = sum(1 for p in _pool if _is_usenet(p))
-        _win_p2 = sum(1 for p in _pool if _is_p2(p))
-        _in_usenet = sum(1 for p in out_pairs if _is_usenet(p))
+
+        window = int(os.getenv('CAND_WINDOW_SEC', '600') or '600')
+
+        cap = int(os.getenv('STREAM_CAP', '60') or '60')
+
+        now = time.time()
+
+        pairs = candidate_pairs or []
+
+        in_pairs = len(pairs)
+
+        def _pair_ts(pair):
+
+            # Expect pair to be (ts, stream) or a dict with 'ts'/'timestamp'.
+
+            try:
+
+                if isinstance(pair, (tuple, list)) and len(pair) >= 1:
+
+                    return float(pair[0])
+
+                if isinstance(pair, dict):
+
+                    return float(pair.get('ts') or pair.get('timestamp') or 0)
+
+            except Exception:
+
+                return 0.0
+
+            return 0.0
+
+        def _pair_stream(pair):
+
+            try:
+
+                if isinstance(pair, (tuple, list)) and len(pair) >= 2:
+
+                    return pair[1]
+
+                if isinstance(pair, dict):
+
+                    return pair.get('stream') or pair.get('s')
+
+            except Exception:
+
+                return None
+
+            return None
+
+        def _is_usenet(pair):
+
+            s = _pair_stream(pair) or {}
+
+            prov = (s.get('provider') or s.get('prov') or '').upper()
+
+            return ('USENET' in prov) or (prov == 'ND')
+
+        def _is_p2(pair):
+
+            s = _pair_stream(pair) or {}
+
+            sup = (s.get('supplier') or s.get('sup') or '').upper()
+
+            return sup == 'P2'
+
+        def _in_window(pair):
+
+            ts = _pair_ts(pair)
+
+            return ts > 0 and (now - ts) <= window
+
+        in_usenet = sum(1 for p in pairs if _is_usenet(p))
+
+        usenet_in_window = sum(1 for p in pairs if _is_usenet(p) and _in_window(p))
+
+        p2_in_window = sum(1 for p in pairs if _is_p2(p) and _in_window(p))
+
         logger.info(
-            "CAND_WINDOW rid=%s id=%s window=%d in_pairs=%d cap=%d in_usenet=%d usenet_in_window=%d p2_in_window=%d",
-            rid,
-            id_,
-            _w,
-            len(out_pairs),
-            int(deliver_cap_eff or 0),
-            _in_usenet,
-            _win_usenet,
-            _win_p2,
+
+            f"CAND_WINDOW rid={rid} id={id} window={window} in_pairs={in_pairs} cap={cap} "
+
+            f"in_usenet={in_usenet} usenet_in_window={usenet_in_window} p2_in_window={p2_in_window}"
+
         )
+
     except Exception as e:
-        logger.warning("CAND_WINDOW_FAIL rid=%s id=%s err=%s", rid, id_, str(e))
+
+        logger.warning(f"CAND_WINDOW_FAIL rid={rid} id={id} err={e}")
 
     # Android/TV: remove streams that resolve to known error placeholders (e.g., /static/500.mp4)
     if is_android and not ANDROID_VERIFY_OFF:
