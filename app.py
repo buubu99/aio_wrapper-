@@ -3368,97 +3368,47 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         except Exception:
             pass
 
+    # Candidate pool (post-sort/post-diversity). Everything below operates on `candidates`.
+    # NOTE: Patch3 fix — patch2 accidentally referenced `candidates` before it was initialized.
+    if MAX_CANDIDATES and MAX_CANDIDATES > 0:
+        candidates = out_pairs[:MAX_CANDIDATES]
+    else:
+        candidates = list(out_pairs)
+
     # Candidate window (diversity pool visibility)
-
+    # This is *not* time-based; it's a "top-K slice" view so we can see if Usenet/P2 gets squeezed
+    # out before delivery due to sorting/caps.
     try:
+        k = int(os.getenv("CAND_WINDOW_K", "200") or "200")
+        k = max(0, min(k, len(out_pairs)))
+        win_pairs = out_pairs[:k]
 
-        window = int(os.getenv('CAND_WINDOW_SEC', '600') or '600')
+        def _pair_provider(p):
+            _s, _m = p
+            return str(_m.get("provider") or (_s.get("behaviorHints") or {}).get("provider") or "").upper()
 
-        cap = int(os.getenv('STREAM_CAP', '60') or '60')
+        def _pair_supplier(p):
+            _s, _m = p
+            bh = (_s.get("behaviorHints") or {}) if isinstance(_s, dict) else {}
+            return str(bh.get("wrap_src") or bh.get("source_tag") or _m.get("supplier") or "").upper()
 
-        now = time.time()
+        def _is_usenet_pair(p):
+            prov = _pair_provider(p)
+            return ("USENET" in prov) or (prov in set(USENET_PRIORITY)) or (prov == "ND")
 
-        pairs = candidate_pairs or []
+        def _is_p2_pair(p):
+            return _pair_supplier(p) == "P2"
 
-        in_pairs = len(pairs)
-
-        def _pair_ts(pair):
-
-            # Expect pair to be (ts, stream) or a dict with 'ts'/'timestamp'.
-
-            try:
-
-                if isinstance(pair, (tuple, list)) and len(pair) >= 1:
-
-                    return float(pair[0])
-
-                if isinstance(pair, dict):
-
-                    return float(pair.get('ts') or pair.get('timestamp') or 0)
-
-            except Exception:
-
-                return 0.0
-
-            return 0.0
-
-        def _pair_stream(pair):
-
-            try:
-
-                if isinstance(pair, (tuple, list)) and len(pair) >= 2:
-
-                    return pair[1]
-
-                if isinstance(pair, dict):
-
-                    return pair.get('stream') or pair.get('s')
-
-            except Exception:
-
-                return None
-
-            return None
-
-        def _is_usenet(pair):
-
-            s = _pair_stream(pair) or {}
-
-            prov = (s.get('provider') or s.get('prov') or '').upper()
-
-            return ('USENET' in prov) or (prov == 'ND')
-
-        def _is_p2(pair):
-
-            s = _pair_stream(pair) or {}
-
-            sup = (s.get('supplier') or s.get('sup') or '').upper()
-
-            return sup == 'P2'
-
-        def _in_window(pair):
-
-            ts = _pair_ts(pair)
-
-            return ts > 0 and (now - ts) <= window
-
-        in_usenet = sum(1 for p in pairs if _is_usenet(p))
-
-        usenet_in_window = sum(1 for p in pairs if _is_usenet(p) and _in_window(p))
-
-        p2_in_window = sum(1 for p in pairs if _is_p2(p) and _in_window(p))
+        in_usenet = sum(1 for p in out_pairs if _is_usenet_pair(p))
+        usenet_in_k = sum(1 for p in win_pairs if _is_usenet_pair(p))
+        p2_in_k = sum(1 for p in win_pairs if _is_p2_pair(p))
 
         logger.info(
-
-            f"CAND_WINDOW rid={rid} id={id} window={window} in_pairs={in_pairs} cap={cap} "
-
-            f"in_usenet={in_usenet} usenet_in_window={usenet_in_window} p2_in_window={p2_in_window}"
-
+            "CAND_WINDOW rid=%s id=%s k=%s total_pairs=%s in_usenet=%s usenet_in_k=%s p2_in_k=%s",
+            rid, id_, k, len(out_pairs), in_usenet, usenet_in_k, p2_in_k
         )
-
     except Exception as e:
-
-        logger.warning(f"CAND_WINDOW_FAIL rid={rid} id={id} err={e}")
+        logger.warning("CAND_WINDOW_FAIL rid=%s id=%s err=%s", rid, id_, e)
 
     # Android/TV: remove streams that resolve to known error placeholders (e.g., /static/500.mp4)
     if is_android and not ANDROID_VERIFY_OFF:
