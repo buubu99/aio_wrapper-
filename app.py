@@ -3624,10 +3624,10 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     if MIN_USENET_KEEP or MIN_USENET_DELIVER:
         # KEEP: ensure at least MIN_USENET_KEEP in the pool
         if MIN_USENET_KEEP:
-            have = sum(1 for p in candidates if _is_usenet(p))
+            have = sum(1 for p in candidates if _is_usenet_pair(p))
             if have < MIN_USENET_KEEP:
                 for p2 in out_pairs[len(candidates):]:
-                    if _is_usenet(p2) and p2 not in candidates:
+                    if _is_usenet_pair(p2) and p2 not in candidates:
                         candidates.append(p2)
                         have += 1
                         if have >= MIN_USENET_KEEP:
@@ -3635,13 +3635,13 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         # DELIVER: ensure at least MIN_USENET_DELIVER within the first MAX_DELIVER
         if MIN_USENET_DELIVER:
             slice_ = candidates[:deliver_cap_eff]
-            have = sum(1 for p in slice_ if _is_usenet(p))
+            have = sum(1 for p in slice_ if _is_usenet_pair(p))
             if have < MIN_USENET_DELIVER:
-                extras = [p for p in candidates[deliver_cap_eff:] + out_pairs[len(candidates):] if _is_usenet(p) and p not in slice_]
+                extras = [p for p in candidates[deliver_cap_eff:] + out_pairs[len(candidates):] if _is_usenet_pair(p) and p not in slice_]
                 i = 0
                 while have < MIN_USENET_DELIVER and i < len(extras):
                     for j in range(len(slice_) - 1, -1, -1):
-                        if not _is_usenet(slice_[j]):
+                        if not _is_usenet_pair(slice_[j]):
                             slice_[j] = extras[i]
                             i += 1
                             have += 1
