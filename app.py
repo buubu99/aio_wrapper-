@@ -1783,6 +1783,41 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
         "container": container,
     }
 
+def classify_safe(s: Dict[str, Any]) -> Dict[str, Any]:
+    """Best-effort wrapper around classify(). Never raises.
+
+    Any exception in classify() used to generate noisy EXEC_ISSUE logs and dropped streams.
+    This wrapper returns a minimal, safe meta dict so the pipeline can continue and telemetry
+    (like CAND_WINDOW) stays trustworthy.
+    """
+    try:
+        return classify(s)
+    except Exception as e:
+        # Minimal safe defaults. Keep keys consistent with classify().
+        try:
+            name = (s.get("name") or "") if isinstance(s, dict) else ""
+            logger.warning("CLASSIFY_FAIL err=%s name=%s", type(e).__name__, (str(name)[:120] if name else ""))
+        except Exception:
+            pass
+        return {
+            "provider": "UNK",
+            "res": "",
+            "source": "",
+            "codec": "",
+            "audio": "",
+            "language": "EN",
+            "size": 0,
+            "seeders": 0,
+            "infohash": "",
+            "hash_src": "classify_fail",
+            "usenet_hash": "",
+            "group": "",
+            "title_raw": "",
+            "premium_level": 0,
+            "container": "UNK",
+        }
+
+
 # Helper for provider keys (customize as per env)
 def api_key_for_provider(provider: str) -> str:
     provider = (provider or "").upper()
@@ -2856,7 +2891,7 @@ def _summarize_streams_for_counts(streams: List[Dict[str, Any]]) -> Dict[str, An
 
         supplier = str(supplier).upper()
         try:
-            m = classify(s)
+            m = classify_safe(s)
         except Exception:
             m = {}
         prov = str(m.get("provider") or "UNK").upper()
@@ -3162,7 +3197,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             continue
 
         try:
-            m = classify(s)
+            m = classify_safe(s)
         except Exception as e:
             stats.dropped_error += 1
             if len(stats.error_reasons) < 8:
@@ -3414,13 +3449,18 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     else:
         candidates = list(out_pairs)
 
+
+    # Back-compat alias: older telemetry/logging used `candidate_pairs`.
+    candidate_pairs = candidates
+
     # Candidate window (diversity pool visibility)
     # This is *not* time-based; it's a "top-K slice" view so we can see if Usenet/P2 gets squeezed
     # out before delivery due to sorting/caps.
     try:
+        candidate_pairs = list(candidate_pairs or [])
         k = int(os.getenv("CAND_WINDOW_K", "200") or "200")
-        k = max(0, min(k, len(out_pairs)))
-        win_pairs = out_pairs[:k]
+        k = max(0, min(k, len(candidate_pairs)))
+        win_pairs = candidate_pairs[:k]
 
         def _pair_provider(p):
             _s, _m = p
@@ -3438,13 +3478,13 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         def _is_p2_pair(p):
             return _pair_supplier(p) == "P2"
 
-        in_usenet = sum(1 for p in out_pairs if _is_usenet_pair(p))
+        in_usenet = sum(1 for p in candidate_pairs if _is_usenet_pair(p))
         usenet_in_k = sum(1 for p in win_pairs if _is_usenet_pair(p))
         p2_in_k = sum(1 for p in win_pairs if _is_p2_pair(p))
 
         logger.info(
             "CAND_WINDOW rid=%s id=%s k=%s total_pairs=%s in_usenet=%s usenet_in_k=%s p2_in_k=%s",
-            rid, id_, k, len(out_pairs), in_usenet, usenet_in_k, p2_in_k
+            rid, id_, k, len(candidate_pairs), in_usenet, usenet_in_k, p2_in_k
         )
     except Exception as e:
         logger.warning("CAND_WINDOW_FAIL rid=%s id=%s err=%s", rid, id_, e)
@@ -3992,6 +4032,18 @@ def stream(type_: str, id_: str):
     dbg_q = request.args.get("debug") or request.args.get("dbg") or ""
     want_dbg = WRAP_EMBED_DEBUG or (isinstance(dbg_q, str) and dbg_q.strip() not in ("", "0", "false", "False"))
 
+    # Defaults to avoid UnboundLocalError/NameError in exception paths
+    streams = []
+    out: List[Dict[str, Any]] = []
+    out_for_client: List[Dict[str, Any]] = []
+    aio_in = 0
+    prov2_in = 0
+    ms_aio = 0
+    ms_p2 = 0
+    prefiltered = False
+    pre_stats = None
+    fetch_meta = {}
+
     try:
         streams, aio_in, prov2_in, ms_aio, ms_p2, prefiltered, pre_stats, fetch_meta = get_streams(
             type_,
@@ -4069,7 +4121,7 @@ def stream(type_: str, id_: str):
         if out:
             cache_set(cache_key, out)
         else:
-            cached = cache_get(cache_key)
+            cached = cache_get(cache_key) if cache_key else None
             if cached:
                 out = cached
                 served_from_cache = True
