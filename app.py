@@ -429,14 +429,14 @@ def _extract_year(text: str) -> Optional[int]:
         return None
 
 def _extract_infohash(text: str) -> str | None:
-    '''Extract a 40-hex infohash from common patterns like IH:<hash>, infohash=<hash>, btih:<hash>.'''
+    '''Extract an infohash/id token (32–40 hex) from common patterns like IH:<hash>, infohash=<hash>, btih:<hash>.'''
     if not text:
         return None
-    m = re.search(r"\b(?:ih|infohash|btih)\s*[:=]\s*([0-9a-fA-F]{40})\b", text, flags=re.I)
+    m = re.search(r"(?:ih|infohash|btih)\s*[:=]\s*([0-9a-fA-F]{32,40})", text, flags=re.I)
     if m:
         return m.group(1).lower()
     # Some providers embed the hash without a label; accept only if it appears as a standalone token.
-    m = re.search(r"\b([0-9a-fA-F]{40})\b", text)
+    m = re.search(r"\b([0-9a-fA-F]{32,40})\b", text)
     if m:
         return m.group(1).lower()
     return None
@@ -3291,7 +3291,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         logger.debug(f"HASH_STATS_ERR rid={_rid()} err={_e}")
 
     # Sorting: quality-first GLOBAL sort AFTER merge/dedup.
-    # Order: res > size > seeders (usenet boost) > cached > provider rank.
+    # Order: instant > cached > res > size > seeders (usenet boost) > provider rank.
     # This prevents provider-append "burial" and surfaces best quality first.
     def sort_key(pair: Tuple[Dict[str, Any], Dict[str, Any]]):
         s, m = pair
@@ -3299,31 +3299,62 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         size_b = int(m.get('size') or 0)
         seeders = int(m.get('seeders') or 0)
         prov = str(m.get('provider') or 'UNK').upper().strip()
-        # Usenet fallback: many usenet items have 0 seeders, so give a small tiebreak boost
-        if seeders == 0 and prov in USENET_PRIORITY:
+
+        # Usenet fallback: many usenet items have 0 seeders, so give a small tiebreak boost.
+        # Treat ND as usenet-like for this purpose.
+        if seeders == 0 and (prov in USENET_PRIORITY or prov == "ND"):
             seeders = USENET_SEEDER_BOOST
+
         cached = m.get('cached')
         cached_val = 0 if cached is True else 0.5 if cached == 'LIKELY' else 2
+
+        # "Instant / ready-to-play" signal (preferred over provider priority).
+        # Primary signal: formatter tags (CACHED:true + PROXIED:true). Secondary: heuristic on text.
+        desc = ""
+        try:
+            if isinstance(s, dict):
+                desc = s.get("description") or ""
+        except Exception:
+            desc = ""
+        desc_u = str(desc).upper()
+        is_instant = ("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) or _looks_instant(str(desc))
+        instant_val = 0 if is_instant else 1
+
         prov_idx = _provider_rank(prov)
-        return (-res, -size_b, -seeders, cached_val, prov_idx)
+        # Sort order: instant -> cached -> resolution -> size -> seeders -> provider rank
+        return (instant_val, cached_val, -res, -size_b, -seeders, prov_idx)
 
     out_pairs.sort(key=sort_key)
 
-    # Proof log: top 5 after global sort (includes supplier tag from delivered stream)
+    # Proof log: top N after global sort (provider/supplier/res + sort signals)
     try:
-        top5 = []
-        for s, m in out_pairs[:5]:
+        proof_n = _safe_int(os.environ.get("SORT_PROOF_TOP_N", "8"), 8)
+        proof_n = max(1, min(25, int(proof_n or 8)))
+        topn = []
+        for rank, (s, m) in enumerate(out_pairs[:proof_n], start=1):
             bh = (s.get("behaviorHints") or {}) if isinstance(s, dict) else {}
             supplier = (bh.get("wrap_src") or bh.get("source_tag") or "UNK")
-            top5.append({
+            desc = ""
+            try:
+                if isinstance(s, dict):
+                    desc = s.get("description") or ""
+            except Exception:
+                desc = ""
+            desc_u = str(desc).upper()
+            tagged_instant = ("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u)
+            topn.append({
+                "rank": int(rank),
                 "supplier": str(supplier),
                 "prov": str(m.get("provider", "UNK")),
                 "res": str(m.get("res", "SD")),
                 "size_gb": round(float(int(m.get("size") or 0)) / (1024 ** 3), 2),
                 "seeders": int(m.get("seeders") or 0),
                 "cached": m.get("cached", None),
+                "premium_level": m.get("premium_level", None),
+                "tagged_instant": bool(tagged_instant),
+                "sort_key": sort_key((s, m)),
             })
-        logger.info("POST_SORT_TOP rid=%s top5=%s", _rid(), top5)
+        logger.info("POST_SORT_TOP rid=%s topN=%s items=%s", _rid(), proof_n, topn)
     except Exception as _e:
         logger.debug("POST_SORT_TOP_ERR rid=%s err=%s", _rid(), _e)
 
@@ -3336,10 +3367,18 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         def instant_key(p):
             s, m = p
             k = sort_key(p)
-            cached = m.get("cached")
-            instant = 0 if cached in (True, "LIKELY") else 1
-            # Insert instant right after seeders
-            return (k[0], k[1], k[2], instant, k[3], k[4])
+
+            # Extra "super-instant" bump (optional): prefer formatter-tagged ready-to-play streams.
+            desc = ""
+            try:
+                if isinstance(s, dict):
+                    desc = s.get("description") or ""
+            except Exception:
+                desc = ""
+            desc_u = str(desc).upper()
+            super_instant = 0 if ("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) else 1
+
+            return (super_instant,) + k
 
         top_pairs.sort(key=instant_key)
         out_pairs = top_pairs + out_pairs[top_n:]
@@ -3637,19 +3676,47 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             slice_ = candidates[:deliver_cap_eff]
             have = sum(1 for p in slice_ if _is_usenet_pair(p))
             if have < MIN_USENET_DELIVER:
-                extras = [p for p in candidates[deliver_cap_eff:] + out_pairs[len(candidates):] if _is_usenet_pair(p) and p not in slice_]
-                i = 0
-                while have < MIN_USENET_DELIVER and i < len(extras):
-                    for j in range(len(slice_) - 1, -1, -1):
-                        if not _is_usenet_pair(slice_[j]):
-                            slice_[j] = extras[i]
-                            i += 1
-                            have += 1
-                            break
-                    else:
-                        break
-                candidates = slice_ + candidates[deliver_cap_eff:]
-    # Android/Google TV clients can't handle magnet: links; drop them and backfill with direct URLs.
+                # Extras from beyond the deliver slice (and from the tail of out_pairs) that are usenet-like.
+                # Interleave them into the first window WITHOUT re-sorting the full slice (preserves stability).
+                pool = candidates[deliver_cap_eff:] + out_pairs[len(candidates):]
+                extras: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+                seen: set = set()
+
+                for p in pool:
+                    if not _is_usenet_pair(p):
+                        continue
+                    if p in slice_:
+                        continue
+                    try:
+                        k2 = dedup_key(p[0], p[1])
+                    except Exception:
+                        k2 = ""
+                    if k2 and k2 in seen:
+                        continue
+                    if k2:
+                        seen.add(k2)
+                    extras.append(p)
+
+                extras.sort(key=sort_key)
+
+                target_extras = min(MIN_USENET_DELIVER - have, len(extras))
+                if target_extras > 0:
+                    new_slice: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+                    debrid_idx = 0
+                    extra_idx = 0
+                    while len(new_slice) < deliver_cap_eff and (debrid_idx < len(slice_) or extra_idx < target_extras):
+                        if extra_idx < target_extras:
+                            new_slice.append(extras[extra_idx])
+                            extra_idx += 1
+                        if debrid_idx < len(slice_):
+                            new_slice.append(slice_[debrid_idx])
+                            debrid_idx += 1
+                    # Fill remaining slots with original slice (no re-sort)
+                    while len(new_slice) < deliver_cap_eff and debrid_idx < len(slice_):
+                        new_slice.append(slice_[debrid_idx])
+                        debrid_idx += 1
+                    slice_ = new_slice[:deliver_cap_eff]
+            candidates = slice_ + candidates[deliver_cap_eff:]    # Android/Google TV clients can't handle magnet: links; drop them and backfill with direct URLs.
     if is_android:
         def _is_magnet(u: str) -> bool:
             return isinstance(u, str) and u.startswith("magnet:")
