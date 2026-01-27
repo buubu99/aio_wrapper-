@@ -2410,6 +2410,11 @@ def try_fastlane(*, prov2_fut, aio_fut, aio_key: str, prov2_url: str, aio_url: s
     """Prov2-only early return. Returns (out, aio_in, prov2_in, aio_ms, p2_ms, prefiltered, stats, fetch_meta) or None."""
     if not FASTLANE_ENABLED or not prov2_fut or not prov2_url:
         return None
+
+    # Android normal path: do not fastlane-return Prov2-only; wait for AIO merge.
+    # (Android clients were getting usenet-only results when fastlane returned early.)
+    if is_android and not is_iphone:
+        return None
     # Cap how long we wait for Prov2 before deciding. We never block on AIO here.
     try:
         prov2_timeout = (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT)
@@ -4145,6 +4150,7 @@ def stream(type_: str, id_: str):
             type_,
             id_,
             is_android=is_android,
+            is_iphone=is_iphone,
             client_timeout_s=(ANDROID_STREAM_TIMEOUT if (is_android or is_iphone) else DESKTOP_STREAM_TIMEOUT),
         )
 
