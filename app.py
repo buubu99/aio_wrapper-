@@ -2405,7 +2405,7 @@ def get_streams_single(base: str, auth: str, type_: str, id_: str, tag: str, tim
     ms = int(meta.get("ms") or 0)
     return streams, int(len(streams)), ms, meta
 
-def try_fastlane(*, prov2_fut, aio_fut, aio_key: str, prov2_url: str, aio_url: str, type_: str, id_: str, is_android: bool, client_timeout_s: float, deadline: float):
+def try_fastlane(*, prov2_fut, aio_fut, aio_key: str, prov2_url: str, aio_url: str, type_: str, id_: str, is_android: bool, is_iphone: bool = False, client_timeout_s: float, deadline: float):
     """Prov2-only early return. Returns (out, aio_in, prov2_in, aio_ms, p2_ms, prefiltered, stats, fetch_meta) or None."""
     if not FASTLANE_ENABLED or not prov2_fut or not prov2_url:
         return None
@@ -2520,7 +2520,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
         type_=type_,
         id_=id_,
         is_android=is_android,
-            is_iphone=is_iphone,
+        is_iphone=is_iphone,
         client_timeout_s=float(client_timeout_s),
         deadline=deadline,
     )
@@ -4070,7 +4070,7 @@ def stream(type_: str, id_: str):
                 aio_in=aio_in,
                 prov2_in=prov2_in,
                 is_android=is_android,
-                is_iphone=is_iphone,
+        is_iphone=is_iphone,
             )
 
         # Ensure platform info survives prefiltered stats
