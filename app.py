@@ -1554,8 +1554,6 @@ def is_polluted(s: Dict[str, Any], type_: str, season: Optional[int], episode: O
     desc = (s.get("description") or "").lower()
     filename = s.get("behaviorHints", {}).get("filename", "").lower()
     text = f"{name} {desc} {filename}"
-    # +++ Usenet Mod 1: cached tag parsing (matches e.g. 'CACHED:true')
-    cached_tag = True if re.search(r"\bcached\s*:\s*true\b", text, re.I) else None
     # Container hint from filename/text
     m_container = re.search(r'\.(MKV|MP4|AVI|M2TS|TS)\b', text, re.I)
     container = (m_container.group(1).upper() if m_container else "UNK")
@@ -1581,12 +1579,15 @@ _AUDIO_TOKS = ["DDP", "DD+", "DD", "EAC3", "TRUEHD", "DTS-HD", "DTS", "AAC", "AC
 _LANG_TOKS = ["ENG", "ENGLISH", "SPANISH", "FRENCH", "GERMAN", "ITALIAN", "KOREAN", "JAPANESE", "CHINESE", "MULTI", "VOSTFR", "SUBBED"]
 _GROUP_RE = re.compile(r"[-.]([a-z0-9]+)$", re.I)
 _HASH_RE = re.compile(r"btih:([0-9a-fA-F]{40})|([0-9a-fA-F]{40})", re.I)
+_CACHED_TAG_RE = re.compile(r'\bcached\s*:\s*true\b', re.I)  # Matches e.g. 'CACHED:true'
 
 def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     name = s.get("name", "").lower()
     desc = s.get("description", "").lower()
     filename = s.get("behaviorHints", {}).get("filename", "").lower()
     text = f"{name} {desc} {filename}"
+    # +++ Usenet Mod 1: cached tag parsing (matches e.g. 'CACHED:true')
+    cached = True if _CACHED_TAG_RE.search(text) else None
     # Container (from filename extension)
     m_container = re.search(r'\.(MKV|MP4|AVI|M2TS|TS)\b', text, re.I)
     container = (m_container.group(1).upper() if m_container else 'UNK')
@@ -1771,7 +1772,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     premium_level = 1 if is_premium_plan(provider) else 0
     return {
         "provider": provider,
-        "cached": cached_tag,
+        "cached": cached,
         "res": res,
         "source": source,
         "codec": codec,
