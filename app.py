@@ -2504,10 +2504,16 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
     aio_key = _aio_cache_key(type_, id_, extras)
     cached = _aio_cache_get(aio_key)
 
+    iphone_usenet_mode = bool(is_iphone and IPHONE_USENET_ONLY)
+    if iphone_usenet_mode:
+        # iOS/iphone usenet-only: do NOT use AIO cache and do NOT fetch AIO at all
+        cached = None
+        aio_meta = {'tag': AIO_TAG, 'ok': False, 'err': 'skipped_iphone_usenet_only'}
+
     aio_fut = None
     p2_fut = None
 
-    if AIO_BASE:
+    if AIO_BASE and not iphone_usenet_mode:
         aio_fut = FETCH_EXECUTOR.submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, id_, AIO_TAG, (ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT))
     if PROV2_BASE:
         p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT))
@@ -2588,31 +2594,14 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
 
     merged = aio_streams + p2_streams
 
-    # +++ New: iPhone/iPad usenet-only branch (restrict to proxied usenet from PROV2)
+    # +++ New: iPhone/iPad usenet-only branch (prov2-only; AIO is skipped above)
     if is_iphone and IPHONE_USENET_ONLY:
-        usenet_streams: List[Dict[str, Any]] = []
-        prov_tokens = [p.lower() for p in (USENET_PROVIDERS or USENET_PRIORITY or []) if p]
-        for s in p2_streams:  # PROV2 = usenet instance
-            desc = str(s.get('description', '') or '')
-            name = str(s.get('name', '') or '')
-            text = f"{name} {desc}".lower()
-            if 'usenet' not in text:
-                continue
-            if prov_tokens and not any(p in text for p in prov_tokens):
-                continue
-            # Enforce proxied playback (formatter tag)
-            if 'proxied:true' not in text and 'proxied=true' not in text:
-                continue
-            usenet_streams.append(s)
-        if usenet_streams:
-            merged = usenet_streams
-        else:
-            # Fallback: still prefer PROV2-only on iOS, even if tags aren't present
-            merged = p2_streams
+        merged = p2_streams
         try:
             logger.info('IPHONE_USENET_ONLY rid=%s p2_in=%d kept=%d', _rid(), len(p2_streams), len(merged))
         except Exception:
             pass
+
     return merged, aio_in, prov2_in, aio_ms, p2_ms, False, None, {'aio': aio_meta, 'p2': p2_meta}
 
 def hash_stats(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
@@ -3075,6 +3064,48 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     stats.prov2_in = prov2_in
     stats.merged_in = len(streams)
 
+    iphone_usenet_mode = bool(is_iphone and IPHONE_USENET_ONLY)
+    usenet_priority_set = {str(p).upper() for p in (USENET_PRIORITY or []) if p}
+    if iphone_usenet_mode and usenet_priority_set:
+        _before = len(streams)
+
+        def _prov_guess(_s: Dict[str, Any]) -> str:
+            try:
+                if not isinstance(_s, dict):
+                    return "UNK"
+                bh = _s.get("behaviorHints") or {}
+                p = None
+                if isinstance(bh, dict):
+                    p = bh.get("provider") or bh.get("prov")
+                p = p or _s.get("prov") or _s.get("provider")
+                if p:
+                    return str(p).upper().strip()
+
+                txt = f"{_s.get('name','')} {_s.get('description','')}"
+                if isinstance(bh, dict):
+                    txt += f" {bh.get('filename','')}"
+                txt_u = txt.upper()
+
+                # common alias normalization
+                if re.search(r"(?<![A-Z0-9])EWEKA(?![A-Z0-9])", txt_u):
+                    return "EW"
+                if re.search(r"(?<![A-Z0-9])NZGEEK(?![A-Z0-9])", txt_u):
+                    return "NG"
+
+                for ap in usenet_priority_set:
+                    if re.search(rf"(?<![A-Z0-9]){re.escape(ap)}(?![A-Z0-9])", txt_u):
+                        return ap
+                return "UNK"
+            except Exception:
+                return "UNK"
+
+        _filtered = [s for s in streams if _prov_guess(s) in usenet_priority_set]
+        if _filtered:
+            streams = _filtered
+
+        logger.debug("IPHONE_USENET_ONLY filtered to %d usenet streams (from %d)", len(streams), _before)
+        stats.merged_in = len(streams)
+
     deliver_cap_eff = int(deliver_cap or MAX_DELIVER or 60)
 
     cached_map: Dict[str, bool] = {}
@@ -3366,6 +3397,10 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
         prov_idx = _provider_rank(prov)
         # Sort order: instant -> cached -> resolution -> size -> seeders -> provider rank
+        # Sort order: instant -> cached -> resolution -> size -> seeders -> provider rank
+        if iphone_usenet_mode and usenet_priority_set:
+            usenet_rank = 0 if prov in usenet_priority_set else 1
+            return (usenet_rank, instant_val, cached_val, -res, -size_b, -seeders, prov_idx)
         return (instant_val, cached_val, -res, -size_b, -seeders, prov_idx)
 
     out_pairs.sort(key=sort_key)
