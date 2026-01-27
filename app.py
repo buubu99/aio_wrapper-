@@ -1460,6 +1460,80 @@ def android_sanitize_out_stream(stream: Any) -> Optional[Dict[str, Any]]:
     return out
 
 
+
+# ---------------------------
+# iPhone post-processing
+# ---------------------------
+def unwrap_full_url(short_url: str) -> str:
+    """Resolve our /r/<token> redirector URLs back to the upstream playback URL.
+
+    Some iOS clients behave better with the full upstream URL (avoids hashing/validation quirks).
+    """
+    try:
+        if not short_url:
+            return short_url
+        u = str(short_url)
+        base = _public_base_url().rstrip('/')
+        token = None
+        if u.startswith(base + '/r/'):
+            token = u[len(base + '/r/'):]
+        elif u.startswith('/r/'):
+            token = u[3:]
+        if not token:
+            return u
+
+        url = None
+        # 1) Short-token map (if enabled)
+        if WRAP_URL_SHORT:
+            try:
+                url = _wrap_url_load(token)
+            except Exception:
+                url = None
+
+        # 2) Restart-safe compressed token
+        if not url and str(token).startswith('z'):
+            try:
+                url = _zurl_decode(token)
+            except Exception:
+                url = None
+
+        # 3) Legacy base64 token
+        if not url:
+            try:
+                url = _b64u_decode(token)
+            except Exception:
+                url = None
+        return url or u
+    except Exception:
+        return short_url
+
+
+def iphone_post_process_streams(out: List[Dict[str, Any]], want_dbg: bool, payload: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """iPhone/iOS tweaks: unwrap /r/<token> to full URLs and attach a lightweight user tip in debug."""
+    try:
+        for s in out or []:
+            if not isinstance(s, dict):
+                continue
+            u = s.get('url')
+            if isinstance(u, str) and '/r/' in u:
+                s['url'] = unwrap_full_url(u)
+    except Exception:
+        pass
+
+    if want_dbg and isinstance(payload, dict):
+        try:
+            dbg = payload.get('debug')
+            if not isinstance(dbg, dict):
+                dbg = {}
+                payload['debug'] = dbg
+            dbg.setdefault(
+                'iphone_tip',
+                'iPhone tip: For best addon playback, use Safari and add Stremio Web to your Home Screen (Share → Add to Home Screen).',
+            )
+        except Exception:
+            pass
+    return out
+
 def android_sanitize_stream_list(streams: Any) -> List[Dict[str, Any]]:
     if not isinstance(streams, list):
         return []
@@ -1552,6 +1626,8 @@ def is_polluted(s: Dict[str, Any], type_: str, season: Optional[int], episode: O
     desc = (s.get("description") or "").lower()
     filename = s.get("behaviorHints", {}).get("filename", "").lower()
     text = f"{name} {desc} {filename}"
+    # +++ New: parse formatter tag "CACHED:true" (usenet visibility)
+    cached_tag = bool(_CACHED_TAG_RE.search(text))
     # Container hint from filename/text
     m_container = re.search(r'\.(MKV|MP4|AVI|M2TS|TS)\b', text, re.I)
     container = (m_container.group(1).upper() if m_container else "UNK")
@@ -1577,6 +1653,7 @@ _AUDIO_TOKS = ["DDP", "DD+", "DD", "EAC3", "TRUEHD", "DTS-HD", "DTS", "AAC", "AC
 _LANG_TOKS = ["ENG", "ENGLISH", "SPANISH", "FRENCH", "GERMAN", "ITALIAN", "KOREAN", "JAPANESE", "CHINESE", "MULTI", "VOSTFR", "SUBBED"]
 _GROUP_RE = re.compile(r"[-.]([a-z0-9]+)$", re.I)
 _HASH_RE = re.compile(r"btih:([0-9a-fA-F]{40})|([0-9a-fA-F]{40})", re.I)
+_CACHED_TAG_RE = re.compile(r"\bcached\s*:\s*true\b", re.I)
 
 def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     name = s.get("name", "").lower()
@@ -1767,6 +1844,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     premium_level = 1 if is_premium_plan(provider) else 0
     return {
         "provider": provider,
+        "cached": (True if cached_tag else None),
         "res": res,
         "source": source,
         "codec": codec,
@@ -3306,7 +3384,10 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             seeders = USENET_SEEDER_BOOST
 
         cached = m.get('cached')
+        usenet_cached_boost = _safe_float(os.environ.get('USENET_CACHE_VAL_BOOST', os.environ.get('USENET_CACHED_VAL_BOOST', '2')), 2.0)
         cached_val = 0 if cached is True else 0.5 if cached == 'LIKELY' else 2
+        if prov in USENET_PRIORITY or prov == "ND":
+            cached_val = min(cached_val, usenet_cached_boost)
 
         # "Instant / ready-to-play" signal (preferred over provider priority).
         # Primary signal: formatter tags (CACHED:true + PROXIED:true). Secondary: heuristic on text.
@@ -3594,6 +3675,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         dropped_uncached_tb = 0
         tb_flip = 0
         tb_total = 0
+        usenet_provs = set([p.upper() for p in USENET_PRIORITY]) | {"ND"}  # ensure ND treated as usenet
         for _s, _m in candidates:
             provider = (_m.get('provider') or '').upper()
             h = norm_infohash(_m.get('infohash'))
@@ -3614,8 +3696,11 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     cached_marker = False
             elif provider in ('RD', 'AD'):
                 cached_marker = bool(_heuristic_cached(_s, _m))
-            elif provider in USENET_PRIORITY:
-                cached_marker = 'LIKELY' if _looks_instant(text) else None
+            elif provider in usenet_provs:
+                # Preserve explicit cached=True tag from classify() if present; otherwise fall back to LIKELY heuristic.
+                cached_marker = _m.get('cached')
+                if cached_marker is None:
+                    cached_marker = 'LIKELY' if _looks_instant(text) else None
             else:
                 cached_marker = None
 
@@ -4133,6 +4218,10 @@ def stream(type_: str, id_: str):
                 "flags": list(stats.flag_issues)[:12],
             }
 
+        # iPhone/iOS: unwrap /r/<token> to full upstream URLs + add tip in debug
+        if is_iphone:
+            payload['streams'] = iphone_post_process_streams(payload.get('streams') or [], want_dbg=want_dbg, payload=payload)
+
         return jsonify(payload), 200
 
     except Exception as e:
@@ -4209,6 +4298,10 @@ def stream(type_: str, id_: str):
                 "errors": list(stats.error_reasons)[:8],
                 "flags": list(stats.flag_issues)[:12],
             }
+        # iPhone/iOS: unwrap /r/<token> to full upstream URLs + add tip in debug
+        if is_iphone:
+            payload['streams'] = iphone_post_process_streams(payload.get('streams') or [], want_dbg=want_dbg, payload=payload)
+
         return jsonify(payload), 200
 
     finally:
@@ -4363,6 +4456,10 @@ def handle_unhandled_exception(e):
                 "errors": [f"unhandled:{type(e).__name__}"],
                 "flags": ["unhandled_exception"],
             }
+        # iPhone/iOS: unwrap /r/<token> to full upstream URLs + add tip in debug
+        if is_iphone:
+            payload['streams'] = iphone_post_process_streams(payload.get('streams') or [], want_dbg=want_dbg, payload=payload)
+
         return jsonify(payload), 200
 
     return ("Internal Server Error", 500)
