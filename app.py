@@ -1722,7 +1722,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
             unit = m.group(2).upper()
             size = int(val * (1024 ** 3 if unit == "GB" else 1024 ** 2))
     # Seeders
-    m_seeds = re.search(r"(\\d+)\\s*(?:seeds?|seeders?)\\b", text, re.I)
+    m_seeds = re.search(r"(\d+)\s*(?:seeds?|seeders?)\b", text, re.I)
     seeders = int(m_seeds.group(1)) if m_seeds else 0
     # Infohash
     url = s.get("url", "") or s.get("externalUrl", "")
@@ -3334,7 +3334,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         prov = str(m.get('provider') or 'UNK').upper().strip()
 
         # Usenet fallback: many usenet items have 0 seeders, so give a small tiebreak boost.
-        # Treat ND as usenet-like for this purpose.
+        usenet_provs = {str(p).upper() for p in (USENET_PROVIDERS or USENET_PRIORITY or [])}
+        usenet_provs.add('ND')  # Treat ND as usenet-like
+
         if seeders == 0 and (prov in usenet_provs):
             seeders = USENET_SEEDER_BOOST
 
@@ -3344,7 +3346,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         elif cached == 'LIKELY':
             cached_val = 0.5
         else:
-            cached_val = usenet_uncached_val if (prov in usenet_provs) else 2
+            cached_val = 1.0 if (prov in usenet_provs) else 2.0
 
         # Optional: on iPhone/iPad, prefer usenet (PROV2) slightly to avoid iOS torrent edge cases
         if is_iphone and (prov in usenet_provs):
@@ -3636,6 +3638,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         dropped_uncached_tb = 0
         tb_flip = 0
         tb_total = 0
+        usenet_provs = {str(p).upper() for p in (USENET_PROVIDERS or USENET_PRIORITY or [])}
+        usenet_provs.add('ND')  # Treat ND as usenet-like
         for _s, _m in candidates:
             provider = (_m.get('provider') or '').upper()
             h = norm_infohash(_m.get('infohash'))
