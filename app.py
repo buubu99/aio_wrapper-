@@ -2521,7 +2521,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
         type_=type_,
         id_=id_,
         is_android=is_android,
-        is_iphone=is_iphone,
+            is_iphone=is_iphone,
         client_timeout_s=float(client_timeout_s),
         deadline=deadline,
     )
@@ -4071,7 +4071,7 @@ def stream(type_: str, id_: str):
                 aio_in=aio_in,
                 prov2_in=prov2_in,
                 is_android=is_android,
-        is_iphone=is_iphone,
+                is_iphone=is_iphone,
             )
 
         # Ensure platform info survives prefiltered stats
