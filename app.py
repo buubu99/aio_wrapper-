@@ -2631,10 +2631,62 @@ def hash_stats(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
 def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
     """Stable dedup key.
 
-    - Prefer infohash when present (universal across providers). Keep resolution to preserve distinct encodes.
-    - If no infohash, fallback to URL (hashed) + size when available.
-    - Last resort: normalized label.
+    - Torrent/debrid: prefer infohash (strong, global) + resolution (preserve distinct encodes).
+    - Usenet: upstream "infohash" may be a placeholder shared by many results, which can collapse
+      the entire set down to a couple of items. For usenet providers, prefer URL/label+size bucketing.
     """
+    # Provider detection (best-effort)
+    try:
+        bh = (stream.get('behaviorHints') or {}) if isinstance(stream, dict) else {}
+        prov = (
+            (meta.get('provider') if isinstance(meta, dict) else None)
+            or (bh.get('provider') if isinstance(bh, dict) else None)
+            or (stream.get('prov') if isinstance(stream, dict) else None)
+            or (stream.get('provider') if isinstance(stream, dict) else None)
+            or ''
+        )
+        prov_u = str(prov).upper().strip()
+    except Exception:
+        prov_u = ''
+
+    # Common usenet set
+    usenet_provs = {str(p).upper() for p in (USENET_PROVIDERS or USENET_PRIORITY or []) if p}
+    usenet_provs.add('ND')  # Treat ND as usenet-like
+
+    # Shared fields
+    res = ((meta.get('res') if isinstance(meta, dict) else None) or 'SD').upper()
+    raw_url = (stream.get('url') or stream.get('externalUrl') or '') if isinstance(stream, dict) else ''
+    raw_url = (raw_url or '').strip()
+    size = (meta.get('size') if isinstance(meta, dict) else None) or (meta.get('bytes') if isinstance(meta, dict) else None) or (meta.get('videoSize') if isinstance(meta, dict) else None) or 0
+    try:
+        size_i = int(size or 0)
+    except Exception:
+        size_i = 0
+
+    # USENET: prefer URL-based key even if a (possibly-placeholder) infohash exists.
+    if prov_u in usenet_provs:
+        if raw_url:
+            uhash = hashlib.sha1(raw_url.encode('utf-8')).hexdigest()[:16]
+            size_bucket = int(size_i / (500 * 1024 * 1024)) if size_i else -1
+            return f"usenet:{prov_u}:u:{uhash}:{size_bucket}:{res}"
+
+        bh = (stream.get('behaviorHints') or {}) if isinstance(stream, dict) else {}
+        try:
+            normalized_label = normalize_label(
+                (bh.get('filename') if isinstance(bh, dict) else None)
+                or (bh.get('bingeGroup') if isinstance(bh, dict) else None)
+                or (stream.get('name') if isinstance(stream, dict) else None)
+                or (stream.get('description') if isinstance(stream, dict) else None)
+                or ''
+            )
+        except Exception:
+            normalized_label = ''
+
+        size_bucket = int(size_i / (500 * 1024 * 1024)) if size_i else -1
+        normalized_label = (normalized_label or '')[:80]
+        return f"usenet:{prov_u}:nohash:{normalized_label}:{size_bucket}:{res}"
+
+    # Non-usenet: prefer infohash
     infohash = (
         (meta.get('infohash') if isinstance(meta, dict) else None)
         or (meta.get('infoHash') if isinstance(meta, dict) else None)
@@ -2643,27 +2695,23 @@ def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
         or ''
     )
     infohash = (infohash or '').lower().strip()
-    res = (meta.get('res') or 'SD').upper()
-
     if infohash:
         return f"h:{infohash}:{res}"
 
-    raw_url = (stream.get('url') or stream.get('externalUrl') or '')
-    raw_url = (raw_url or '').strip()
-    size = meta.get('size') or meta.get('bytes') or meta.get('videoSize') or 0
-    try:
-        size_i = int(size or 0)
-    except Exception:
-        size_i = 0
-
+    # Fallback: URL-hash + size
     if raw_url:
         uhash = hashlib.sha1(raw_url.encode('utf-8')).hexdigest()[:16]
         return f"u:{uhash}:{size_i}:{res}"
 
-    bh = stream.get('behaviorHints') or {}
+    # Last resort: normalized label (+ size bucket)
+    bh = (stream.get('behaviorHints') or {}) if isinstance(stream, dict) else {}
     try:
         normalized_label = normalize_label(
-            bh.get('filename') or bh.get('bingeGroup') or stream.get('name', '') or stream.get('description', '')
+            (bh.get('filename') if isinstance(bh, dict) else None)
+            or (bh.get('bingeGroup') if isinstance(bh, dict) else None)
+            or (stream.get('name') if isinstance(stream, dict) else None)
+            or (stream.get('description') if isinstance(stream, dict) else None)
+            or ''
         )
     except Exception:
         normalized_label = ''
@@ -2671,6 +2719,7 @@ def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
     size_bucket = int(size_i / (500 * 1024 * 1024)) if size_i else -1
     normalized_label = (normalized_label or '')[:80]
     return f"nohash:{normalized_label}:{size_bucket}:{res}"
+
 
 
 def _drop_bad_top_n(
