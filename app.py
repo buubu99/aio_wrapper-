@@ -3936,6 +3936,41 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     except Exception as _e:
         logger.debug("NZBGEEK_READY_ERR rid=%s err=%s", rid, _e)
 
+    # MARKERS: show how many streams were validated by each "instant" mechanism.
+    # NOTE: TB instant is NOT WebDAV here; it is usually signaled by upstream tags (CACHED:TRUE + PROXIED:TRUE)
+    # that were computed from hashes upstream (or by our TorBox API hash check when VERIFY_CACHED_ONLY=true).
+    try:
+        from collections import Counter
+        c_tot = Counter(); c_tagged = Counter(); c_cachedtag = Counter(); c_proxiedtag = Counter(); c_hash = Counter(); c_ready = Counter()
+        for _s, _m in out_pairs:
+            prov = str(_m.get('provider') or 'UNK').upper().strip()
+            c_tot[prov] += 1
+            desc_u = ''
+            try:
+                if isinstance(_s, dict):
+                    desc_u = str(_s.get('description') or '').upper()
+            except Exception:
+                desc_u = ''
+            has_cached_tag = ('CACHED:TRUE' in desc_u)
+            has_proxied_tag = ('PROXIED:TRUE' in desc_u)
+            if has_cached_tag:
+                c_cachedtag[prov] += 1
+            if has_proxied_tag:
+                c_proxiedtag[prov] += 1
+            if has_cached_tag and has_proxied_tag:
+                c_tagged[prov] += 1
+            if _m.get('infohash'):
+                c_hash[prov] += 1
+            if _m.get('ready'):
+                c_ready[prov] += 1
+
+        logger.info(
+            'INSTA_MARKERS rid=%s totals=%s tagged_instant=%s cached_tag=%s proxied_tag=%s has_hash=%s ready=%s',
+            _rid(), dict(c_tot), dict(c_tagged), dict(c_cachedtag), dict(c_proxiedtag), dict(c_hash), dict(c_ready)
+        )
+    except Exception as _e:
+        logger.debug('INSTA_MARKERS_ERR rid=%s err=%s', _rid(), _e)
+
     # Sorting: quality-first GLOBAL sort AFTER merge/dedup.
     # Order: (iPhone usenet) ready > instant > cached > res > size > seeders > provider.
     # (general) instant > cached > ready > res > size > seeders > provider.
