@@ -3991,64 +3991,105 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             from collections import deque
 
             def _pair_provider(_pair):
+                """Provider bucket used for mixing. Mirrors what clients see."""
                 try:
-                    return (_pair[1].get("provider") or "").upper().strip() or "UNK"
+                    s, m = _pair
+                    bh = (s.get("behaviorHints") or {}) if isinstance(s, dict) else {}
+                    prov = (
+                        (m.get("provider") if isinstance(m, dict) else None)
+                        or (m.get("prov") if isinstance(m, dict) else None)
+                        or (bh.get("provider") if isinstance(bh, dict) else None)
+                        or (s.get("prov") if isinstance(s, dict) else None)
+                        or (s.get("provider") if isinstance(s, dict) else None)
+                        or ""
+                    )
+                    prov_u = str(prov).upper().strip()
                 except Exception:
-                    return "UNK"
+                    prov_u = ""
 
-            # If we only have one provider, nothing to do.
-            _top_provs = [_pair_provider(p) for p in out_pairs[:deliver_cap_eff]]
+                # Collapse all Usenet variants into ND so streak/mix matches displayed provider.
+                if prov_u in {"ND", "NZB", "NZBDAV", "EW", "EWEKA", "NG", "NZGEEK"}:
+                    return "ND"
+                if prov_u in {"TORBOX"}:
+                    return "TB"
+                if prov_u in {"REALDEBRID", "REAL-DEBRID"}:
+                    return "RD"
+                return prov_u or "UNK"
+
+            # Only re-order the delivered slice; keep the tail (undelivered) as-is.
+            _work = out_pairs[:deliver_cap_eff]
+            _tail = out_pairs[deliver_cap_eff:]
+
+            # If we only have one provider in the delivered slice, nothing to do.
+            _top_provs = [_pair_provider(p) for p in _work]
             if len(set(_top_provs)) >= 2:
-                _usenet_set = set(
-                    (p.strip().upper() for p in (USENET_PRIORITY.split(",") if USENET_PRIORITY else []) if p.strip())
-                ) or {"ND", "EW", "NG"}
                 _premium_set = set(p.strip().upper() for p in (PREMIUM_PRIORITY or []) if str(p).strip())
 
                 # Bucketize while preserving current (quality-sorted) order inside each provider.
                 _buckets = {}
-                for _i, _pair in enumerate(out_pairs):
+                _counts = {}
+                for _i, _pair in enumerate(_work):
                     _p = _pair_provider(_pair)
                     _buckets.setdefault(_p, deque()).append((_i, _pair))
+                    _counts[_p] = _counts.get(_p, 0) + 1
+
+                _providers = list(_counts.keys())
+
+                # Deterministic provider order: premium-first, then others, Usenet last.
+                def _prov_rank(p):
+                    if p in _premium_set:
+                        return (0, p)
+                    if p == "ND":
+                        return (2, p)
+                    return (1, p)
+
+                _providers.sort(key=_prov_rank)
+
+                _total = len(_work)
+                _used = {p: 0 for p in _providers}
+                _expected = {p: (_counts[p] / float(_total)) for p in _providers}
 
                 _out = []
                 _last = None
                 _streak = 0
 
-                # Tune: allow short runs of Usenet, but prevent massive blocks.
-                _MAX_USENET_STREAK = 6
-                _MAX_OTHER_STREAK = 12
+                # Stronger mixing: keep providers interleaved across the whole delivered slice.
+                _MAX_USENET_STREAK = 1
+                _MAX_OTHER_STREAK = 1
 
-                while len(_out) < len(out_pairs):
-                    _choices = []
-                    for _p, _dq in _buckets.items():
-                        if not _dq:
-                            continue
-                        if _p == _last:
-                            _mx = _MAX_USENET_STREAK if _p in _usenet_set else _MAX_OTHER_STREAK
-                            if _streak >= _mx:
-                                continue
-                        _choices.append(_p)
-
+                for _pos in range(_total):
+                    _choices = [p for p in _providers if _buckets.get(p) and len(_buckets[p]) > 0]
                     if not _choices:
-                        # Forced: only provider(s) left are the streaking one(s)
-                        for _p, _dq in _buckets.items():
-                            if _dq:
-                                _choices = [_p]
-                                break
+                        break
 
-                    # Pick the provider whose next item is "best" under current ordering, with a slight preference
-                    # to premium providers when we are breaking a Usenet streak.
+                    def _mx(p):
+                        return _MAX_USENET_STREAK if p == "ND" else _MAX_OTHER_STREAK
+
+                    _filtered = []
+                    for p in _choices:
+                        if p == _last and _streak >= _mx(p):
+                            continue
+                        _filtered.append(p)
+                    if not _filtered:
+                        _filtered = _choices
+
+                    # Fair scheduling: pick provider most "behind" its expected share,
+                    # tie-break by earlier original index to preserve quality within-provider ordering.
                     _best_p = None
                     _best_key = None
-                    for _p in _choices:
-                        _idx0, _ = _buckets[_p][0]
-                        _key = (_idx0,)
+                    for p in _filtered:
+                        _idx0, _ = _buckets[p][0]
+                        deficit = (_expected[p] * (_pos + 1)) - _used[p]
+                        premium_bonus = 0.25 if (p in _premium_set) else 0.0
+                        # Minimize key => maximize deficit+bonus, then prefer earlier index.
+                        _key = (-(deficit + premium_bonus), _idx0, p)
                         if _best_key is None or _key < _best_key:
                             _best_key = _key
-                            _best_p = _p
+                            _best_p = p
 
                     _idx0, _pair = _buckets[_best_p].popleft()
                     _out.append(_pair)
+                    _used[_best_p] += 1
 
                     if _best_p == _last:
                         _streak += 1
@@ -4056,8 +4097,10 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                         _last = _best_p
                         _streak = 1
 
-                out_pairs = _out
-
+                out_pairs = _out + _tail
+            else:
+                # Only one provider present; leave as-is.
+                pass
                 try:
                     _top_by = {}
                     for _s, _m in out_pairs[:deliver_cap_eff]:
