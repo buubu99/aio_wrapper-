@@ -267,19 +267,18 @@ VERIFY_PREMIUM = _parse_bool(os.environ.get("VERIFY_PREMIUM", "true"), True)
 ASSUME_PREMIUM_ON_FAIL = _parse_bool(os.environ.get("ASSUME_PREMIUM_ON_FAIL", "false"), False)
 POLL_ATTEMPTS = _safe_int(os.environ.get('POLL_ATTEMPTS', '2'), 2)
 
-# TorBox WebDAV (optional fast existence checks; gated by USE_TB_WEBDAV)
-USE_TB_WEBDAV = _parse_bool(os.environ.get('USE_TB_WEBDAV', 'true'), True)
-TB_WEBDAV_URL = os.environ.get('TB_WEBDAV_URL', 'https://webdav.torbox.app')
-TB_WEBDAV_USER = os.environ.get('TB_WEBDAV_USER', '')
-TB_WEBDAV_PASS = os.environ.get('TB_WEBDAV_PASS', '')
-TB_WEBDAV_TIMEOUT = _safe_float(os.environ.get('TB_WEBDAV_TIMEOUT', '1.0'), 1.0)
-TB_WEBDAV_WORKERS = _safe_int(os.environ.get('TB_WEBDAV_WORKERS', '10'), 10)
-TB_WEBDAV_TEMPLATES = [t.strip() for t in os.environ.get('TB_WEBDAV_TEMPLATES', 'downloads/{hash}/').split(',') if t.strip()]
+# TorBox WebDAV — INACTIVE  //✅
+# Kept as stubs for future experimentation, but FORCED OFF so it never affects runtime or logic.
+WEBDAV_INACTIVE = True  # INACTIVE  //✅
+USE_TB_WEBDAV = False   # INACTIVE  //✅ (ignore env)
+TB_WEBDAV_URL = os.environ.get('TB_WEBDAV_URL', 'https://webdav.torbox.app')  # INACTIVE  //✅
+TB_WEBDAV_USER = os.environ.get('TB_WEBDAV_USER', '')  # INACTIVE  //✅
+TB_WEBDAV_PASS = os.environ.get('TB_WEBDAV_PASS', '')  # INACTIVE  //✅
+TB_WEBDAV_TIMEOUT = _safe_float(os.environ.get('TB_WEBDAV_TIMEOUT', '1.0'), 1.0)  # INACTIVE  //✅
+TB_WEBDAV_WORKERS = _safe_int(os.environ.get('TB_WEBDAV_WORKERS', '10'), 10)  # INACTIVE  //✅
+TB_WEBDAV_TEMPLATES = [t.strip() for t in os.environ.get('TB_WEBDAV_TEMPLATES', 'downloads/{hash}/').split(',') if t.strip()]  # INACTIVE  //✅
+TB_WEBDAV_STRICT = False  # INACTIVE  //✅ (ignore env)
 
-# Optional: drop TorBox streams that WebDAV cannot confirm (fast-ish, but still extra requests)
-TB_WEBDAV_STRICT = _parse_bool(os.environ.get('TB_WEBDAV_STRICT', 'true'), True)
-
-# Optional: cached/instant validation for RD/AD (heuristics by default; strict workflow is opt-in)
 VERIFY_CACHED_ONLY = _parse_bool(os.environ.get("VERIFY_CACHED_ONLY", "false"), False)
 STRICT_PREMIUM_ONLY = _parse_bool(os.environ.get('STRICT_PREMIUM_ONLY', 'false'), False)  # loose default; strict drops uncached
 MIN_CACHE_CONFIDENCE = _safe_float(os.environ.get('MIN_CACHE_CONFIDENCE', '0.8'), 0.8)
@@ -734,6 +733,9 @@ class _WebDavUnauthorized(RuntimeError):
 
 
 def _tb_webdav_exists(url: str) -> bool:
+    if WEBDAV_INACTIVE:
+        return False  # INACTIVE  //✅
+
     try:
         r = session.request(
             'PROPFIND',
@@ -752,6 +754,8 @@ def _tb_webdav_exists(url: str) -> bool:
 
 
 def tb_webdav_batch_check(hashes: List[str], stats: Optional[PipeStats] = None) -> set:
+    if WEBDAV_INACTIVE:
+        return set()  # INACTIVE  //✅
     if not hashes or not TB_WEBDAV_URL:
         return set()
     base = TB_WEBDAV_URL.rstrip('/')
@@ -4371,7 +4375,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # WebDAV strict (optional): drop TB items that WebDAV cannot confirm.
     # This can be used even without TB_API_KEY / TB_CACHE_HINTS.
-    if (not fast_mode) and (not VALIDATE_OFF) and USE_TB_WEBDAV and TB_WEBDAV_USER and TB_WEBDAV_PASS and candidates and (TB_WEBDAV_STRICT or (not VERIFY_TB_CACHE_OFF)):
+    if (not fast_mode) and (not VALIDATE_OFF) and (not WEBDAV_INACTIVE) and USE_TB_WEBDAV and TB_WEBDAV_USER and TB_WEBDAV_PASS and candidates and (TB_WEBDAV_STRICT or (not VERIFY_TB_CACHE_OFF)):
         tb_hashes: list[str] = []
         seen_tb: set[str] = set()
         for _s, _m in candidates:
@@ -4430,6 +4434,73 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # Cache checks / premium validation
     cached_map: Dict[str, bool] = {}
 
+    # TorBox hash-insta API cached check — runs even when VERIFY_CACHED_ONLY=false (mark-only).
+    tb_api_ran = False
+    tb_api_reason = ""
+    tb_hashes: List[str] = []
+    if fast_mode:
+        tb_api_reason = "fast_mode"
+    elif VALIDATE_OFF:
+        tb_api_reason = "validate_off"
+    elif not TB_CACHE_HINTS:
+        tb_api_reason = "cache_hints=false"
+    elif not TB_API_KEY:
+        tb_api_reason = "disabled_or_no_key"
+    elif not candidates:
+        tb_api_reason = "no_candidates"
+    else:
+        seen_h: set[str] = set()
+        for _s, _m in candidates:
+            if len(tb_hashes) >= TB_MAX_HASHES:
+                break
+            if (_m.get('provider') or '').upper() != 'TB':
+                continue
+            h = norm_infohash(_m.get('infohash'))
+            if h and re.fullmatch(r"[0-9a-f]{40}", h) and h not in seen_h:
+                seen_h.add(h)
+                tb_hashes.append(h)
+
+        if len(tb_hashes) < int(TB_API_MIN_HASHES or 0):
+            tb_api_reason = "min_hashes"
+        else:
+            try:
+                t0 = time.time()
+                cached_map_raw = tb_get_cached(tb_hashes)
+                cached_map = {}
+                for _k, _v in (cached_map_raw or {}).items():
+                    _nk = norm_infohash(_k)
+                    if _nk:
+                        cached_map[_nk] = bool(_v)
+                stats.ms_tb_api = int((time.time() - t0) * 1000)
+                stats.tb_api_hashes = len(tb_hashes)
+                tb_api_ran = True
+                tb_api_reason = "ok"
+                try:
+                    _t = sum(1 for _v in (cached_map or {}).values() if _v)
+                    _f = sum(1 for _v in (cached_map or {}).values() if (_v is False))
+                    logger.info(
+                        "TB_API_DONE rid=%s hashes=%d true=%d false=%d ms_tb_api=%d",
+                        _rid(), int(len(tb_hashes)), int(_t), int(_f), int(stats.ms_tb_api or 0)
+                    )
+                except Exception as _e:
+                    logger.debug("TB_API_DONE_ERR rid=%s err=%s", _rid(), _e)
+            except Exception as _e:
+                tb_api_reason = "api_error"
+                try:
+                    logger.warning("TB_API_ERR rid=%s err=%s", _rid(), _e)
+                except Exception:
+                    pass
+
+    try:
+        logger.info(
+            "TB_API_CHECK rid=%s ran=%s reason=%s hashes=%d min=%d cache_hints=%s api_key=%s fast=%s validate_off=%s verify_cached_only=%s",
+            _rid(), bool(tb_api_ran), str(tb_api_reason), int(len(tb_hashes)), int(TB_API_MIN_HASHES or 0),
+            bool(TB_CACHE_HINTS), bool(TB_API_KEY), bool(fast_mode), bool(VALIDATE_OFF), bool(VERIFY_CACHED_ONLY),
+        )
+    except Exception:
+        pass
+
+
     # Point 3 clarity: always log whether "uncached" enforcement actually ran,
     # and whether it was only marking (KEEP) vs hard dropping (DROP).
     uncached_policy = "SKIP"   # SKIP | KEEP | DROP
@@ -4451,49 +4522,44 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         uncached_policy = "KEEP"
         uncached_reason = "mark_only"
 
+
+    # Mark-only: update TB cached flags from the API even when VERIFY_CACHED_ONLY=false (no dropping).
+    if (not fast_mode) and (not VALIDATE_OFF) and (not VERIFY_CACHED_ONLY) and tb_api_ran:
+        tb_total = 0
+        tb_mark_true = 0
+        tb_mark_false = 0
+        tb_flip = 0
+        for _s, _m in candidates:
+            if (_m.get('provider') or '').upper() != 'TB':
+                continue
+            tb_total += 1
+            h = norm_infohash(_m.get('infohash'))
+            orig_tb_cached = (_m.get('cached') is True)
+            if h and h in cached_map:
+                _m['cached'] = bool(cached_map.get(h, False))
+                if _m['cached'] is True:
+                    tb_mark_true += 1
+                else:
+                    tb_mark_false += 1
+                if _m['cached'] is True and not orig_tb_cached:
+                    tb_flip += 1
+                with CACHED_HISTORY_LOCK:
+                    CACHED_HISTORY[h] = bool(_m['cached'])
+        if tb_total:
+            try:
+                logger.info("TB_FLIPS rid=%s flipped=%s/%s tb_api_hashes=%s", _rid(), tb_flip, tb_total, int(stats.tb_api_hashes or 0))
+                logger.info(
+                    "TB_MARK_SUMMARY rid=%s mode=mark_only tb_total=%d mark_true=%d mark_false=%d src_api=%d src_hist=%d src_assume=%d src_nohash=%d",
+                    _rid(), int(tb_total), int(tb_mark_true), int(tb_mark_false),
+                    int(tb_total), 0, 0, 0,
+                )
+            except Exception:
+                pass
+
     if (not fast_mode) and VERIFY_CACHED_ONLY and not VALIDATE_OFF:
         uncached_ran = True
-        # TorBox API cached check (batched). Skip very small hash sets to avoid rate-limit/reset churn.
-        if TB_CACHE_HINTS:
-            hashes: List[str] = []
-            seen_h: set = set()
-            for _s, _m in candidates:
-                if len(hashes) >= TB_MAX_HASHES:
-                    break
-                if (_m.get('provider') or '').upper() != 'TB':
-                    continue
-                h = norm_infohash(_m.get('infohash'))
-                if h and re.fullmatch(r"[0-9a-f]{40}", h) and h not in seen_h:
-                    seen_h.add(h)
-                    hashes.append(h)
-            if len(hashes) >= TB_API_MIN_HASHES:
-                # Maintain: TB strict API/WebDAV (not affected by RD heuristics)
-                try:
-                    logger.debug("TB_CACHE_MAINTAIN rid=%s hashes=%d", _rid(), len(hashes))
-                except Exception:
-                    pass
-
-                t0 = time.time()
-                cached_map_raw = tb_get_cached(hashes)
-                cached_map = {}
-                for _k, _v in (cached_map_raw or {}).items():
-                    _nk = norm_infohash(_k)
-                    if _nk:
-                        cached_map[_nk] = bool(_v)
-                stats.ms_tb_api = int((time.time() - t0) * 1000)
-                stats.tb_api_hashes = len(hashes)
-                try:
-                    _t = sum(1 for _v in (cached_map or {}).values() if _v)
-                    _f = sum(1 for _v in (cached_map or {}).values() if (_v is False))
-                    logger.info(
-                        "TB_API_DONE rid=%s hashes=%d true=%d false=%d ms_tb_api=%d",
-                        _rid(), int(len(hashes)), int(_t), int(_f), int(stats.ms_tb_api or 0)
-                    )
-                except Exception as _e:
-                    logger.debug("TB_API_DONE_ERR rid=%s err=%s", _rid(), _e)
-            else:
-                logger.info(f"TB_API_SKIP rid={_rid()} hashes={len(hashes)} <{TB_API_MIN_HASHES}")
-
+        # TorBox API cached check is performed above (runs even when VERIFY_CACHED_ONLY=false).
+        # Here we only attach cached markers / enforce policy based on `cached_map`.
         # Attach cached markers to meta; in loose mode we do NOT hard-drop.
         t_unc0 = time.time()
         kept = []
@@ -4596,13 +4662,20 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # Clarity log: tells you if TB checks actually ran and how many hashes were checked.
     logger.info(
-        "TB_CHECKS rid=%s webdav_active=%s webdav_strict=%s api_active=%s api_hashes=%s webdav_hashes=%s",
+        "TB_CHECKS rid=%s webdav_active=%s webdav_reason=%s api_ran=%s api_reason=%s api_hashes=%s tb_hashes=%s min=%s cache_hints=%s api_key=%s fast=%s validate_off=%s verify_cached_only=%s",
         _rid(),
-        bool(USE_TB_WEBDAV and TB_WEBDAV_USER),
-        bool(TB_WEBDAV_STRICT),
-        bool(TB_API_KEY and TB_CACHE_HINTS and (stats.tb_api_hashes or 0) > 0),
+        False,
+        "INACTIVE",
+        bool(tb_api_ran),
+        str(tb_api_reason),
         int(stats.tb_api_hashes or 0),
-        int(stats.tb_webdav_hashes or 0),
+        int(len(tb_hashes)),
+        int(TB_API_MIN_HASHES or 0),
+        bool(TB_CACHE_HINTS),
+        bool(TB_API_KEY),
+        bool(fast_mode),
+        bool(VALIDATE_OFF),
+        bool(VERIFY_CACHED_ONLY),
     )
 
     # Ensure we keep/deliver some usenet entries (if configured).
