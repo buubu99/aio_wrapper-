@@ -1143,6 +1143,10 @@ def redirect_stream_url(token: str):
 
     if request.method == "HEAD":
         mode = (WRAP_HEAD_MODE or "200_noloc").lower()
+        # iOS/AVPlayer clients may treat a bypassed HEAD (Content-Length: 0) as "empty" and stall.
+        # Prefer redirect-style HEAD on iOS, configurable via WRAP_HEAD_MODE_IOS.
+        if is_iphone_client():
+            mode = (os.environ.get("WRAP_HEAD_MODE_IOS", "302") or "302").lower()
         if mode == "302":
             resp = make_response("", 302)
             resp.headers["Location"] = url
