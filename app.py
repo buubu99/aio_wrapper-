@@ -73,6 +73,12 @@ class PipeStats:
     tb_webdav_hashes: int = 0
     tb_usenet_hashes: int = 0
 
+    # RD heuristic marker counters (per-request; proves heuristic ran)
+    rd_heur_calls: int = 0
+    rd_heur_true: int = 0
+    rd_heur_false: int = 0
+    rd_heur_conf_sum: float = 0.0
+
     # Debug/summary objects (kept small; used for logs and optional debug responses)
     fetch_aio: Dict[str, Any] = field(default_factory=dict)
     fetch_p2: Dict[str, Any] = field(default_factory=dict)
@@ -1326,6 +1332,9 @@ def _before_request() -> None:
 def _rid() -> str:
     return g.request_id if has_request_context() and hasattr(g, "request_id") else "GLOBAL"
 
+# Thread-local pointer to current request stats for lightweight heuristic markers.
+_TLS = threading.local()
+
 def is_android_client() -> bool:
     """Best-effort detection of Android/TV-ish clients for tighter time budgets.
 
@@ -1622,12 +1631,33 @@ def _cache_confidence(s: Dict[str, Any], meta: Dict[str, Any]) -> float:
         return 0.0
 
 def _heuristic_cached(s: Dict[str, Any], meta: Dict[str, Any]) -> bool:
-    # Add: RD heuristic maintain (France cancel—lower threshold for RD)
+    """Heuristic cache signal.
+
+    For RD we maintain a lower threshold (no API checks) and we also record a per-request marker
+    so logs can prove the heuristic actually ran.
+    """
     conf = _cache_confidence(s, meta)
     provider = str(meta.get('provider') or s.get('provider') or '').upper().strip()
+
+    # RD-specific lower threshold (heuristic; no API checks)
     if provider in ('RD', 'REALDEBRID'):
-        return conf >= 0.7  # RD-specific lower threshold (heuristic)
+        thr = 0.7
+        ok = conf >= thr
+        try:
+            st = getattr(_TLS, "stats", None)
+            if st is not None:
+                st.rd_heur_calls += 1
+                st.rd_heur_conf_sum += float(conf or 0.0)
+                if ok:
+                    st.rd_heur_true += 1
+                else:
+                    st.rd_heur_false += 1
+        except Exception:
+            pass
+        return ok
+
     return conf >= MIN_CACHE_CONFIDENCE
+
 
 # ---------------------------
 # Pollution detection (optional; v20-style)
@@ -3389,6 +3419,11 @@ def check_nzbgeek_readiness(imdbid: str) -> List[str]:
 def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0, is_android: bool = False, is_iphone: bool = False, fast_mode: bool = False, deliver_cap: Optional[int] = None) -> Tuple[List[Dict[str, Any]], PipeStats]:
     stats = PipeStats()
     rid = _rid()
+    # Expose per-request stats to heuristic helpers (thread-local)
+    try:
+        _TLS.stats = stats
+    except Exception:
+        pass
     stats.aio_in = aio_in
     stats.prov2_in = prov2_in
     stats.merged_in = len(streams)
@@ -3869,6 +3904,13 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 t0_ready = time.time()
                 ready_titles = check_nzbgeek_readiness(imdbid)
                 stats.ms_tb_usenet += int((time.time() - t0_ready) * 1000)
+                try:
+                    logger.info(
+                        "NZBGEEK_DONE rid=%s imdb=%s ready_titles=%s ms_tb_usenet=%s",
+                        _rid(), imdbid, len(ready_titles or []), stats.ms_tb_usenet
+                    )
+                except Exception:
+                    pass
 
         if ready_titles:
             flagged = 0
@@ -4405,6 +4447,15 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                         cached_map[_nk] = bool(_v)
                 stats.ms_tb_api = int((time.time() - t0) * 1000)
                 stats.tb_api_hashes = len(hashes)
+                try:
+                    _t = sum(1 for _v in (cached_map or {}).values() if _v)
+                    _f = sum(1 for _v in (cached_map or {}).values() if (_v is False))
+                    logger.info(
+                        "TB_API_DONE rid=%s hashes=%d true=%d false=%d ms_tb_api=%d",
+                        _rid(), int(len(hashes)), int(_t), int(_f), int(stats.ms_tb_api or 0)
+                    )
+                except Exception as _e:
+                    logger.debug("TB_API_DONE_ERR rid=%s err=%s", _rid(), _e)
             else:
                 logger.info(f"TB_API_SKIP rid={_rid()} hashes={len(hashes)} <{TB_API_MIN_HASHES}")
 
@@ -4415,6 +4466,12 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         dropped_uncached_tb = 0
         tb_flip = 0
         tb_total = 0
+        tb_mark_true = 0
+        tb_mark_false = 0
+        tb_src_api = 0
+        tb_src_hist = 0
+        tb_src_assume = 0
+        tb_src_nohash = 0
         usenet_provs = {str(p).upper() for p in (USENET_PROVIDERS or USENET_PRIORITY or [])}
         usenet_provs.add('ND')  # Treat ND as usenet-like
         for _s, _m in candidates:
@@ -4428,13 +4485,17 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             if provider == 'TB':
                 if h and cached_map:
                     cached_marker = bool(cached_map.get(h, False))
+                    tb_src_api += 1
                 elif h:
                     with CACHED_HISTORY_LOCK:
                         cached_marker = bool(CACHED_HISTORY.get(h, False))
+                    tb_src_hist += 1
                 elif ASSUME_PREMIUM_ON_FAIL:
                     cached_marker = True
+                    tb_src_assume += 1
                 else:
                     cached_marker = False
+                    tb_src_nohash += 1
             elif provider in ('RD', 'AD'):
                 cached_marker = bool(_heuristic_cached(_s, _m))
             elif provider in usenet_provs:
@@ -4449,9 +4510,13 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 cached_marker = None
 
             _m['cached'] = cached_marker
-            if provider == 'TB' and h:
+            if provider == 'TB':
                 tb_total += 1
-                if cached_marker is True and not orig_tb_cached:
+                if cached_marker is True:
+                    tb_mark_true += 1
+                else:
+                    tb_mark_false += 1
+                if h and cached_marker is True and not orig_tb_cached:
                     tb_flip += 1
             if h and isinstance(cached_marker, bool):
                 with CACHED_HISTORY_LOCK:
@@ -4469,6 +4534,11 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
         if tb_total:
             logger.info("TB_FLIPS rid=%s flipped=%s/%s tb_api_hashes=%s", _rid(), tb_flip, tb_total, int(stats.tb_api_hashes or 0))
+            logger.info(
+                "TB_MARK_SUMMARY rid=%s tb_total=%d mark_true=%d mark_false=%d src_api=%d src_hist=%d src_assume=%d src_nohash=%d",
+                _rid(), int(tb_total), int(tb_mark_true), int(tb_mark_false),
+                int(tb_src_api), int(tb_src_hist), int(tb_src_assume), int(tb_src_nohash)
+            )
         candidates = kept
         stats.dropped_uncached += dropped_uncached
         stats.dropped_uncached_tb += dropped_uncached_tb
@@ -4784,6 +4854,53 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             stats.flag_issues.append(f"slow_title:{int(stats.ms_title_mismatch)}ms")
         if int(stats.ms_uncached_check or 0) >= int(FLAG_SLOW_UNCACHED_MS):
             stats.flag_issues.append(f"slow_uncached:{int(stats.ms_uncached_check)}ms")
+    except Exception:
+        pass
+
+
+    # RD heuristic marker (parity with NZBGeek markers): proves RD heuristic actually ran.
+    try:
+        rd_out_true = rd_out_likely = rd_out_false = rd_out_unk = 0
+        for _s in delivered:
+            if not isinstance(_s, dict):
+                continue
+            _bh = _s.get("behaviorHints") or {}
+            _prov = str((_s.get("provider") or _bh.get("provider") or "")).upper().strip()
+            if _prov.startswith("DL-"):
+                _prov = _prov[3:]
+            if _prov not in ("RD", "REALDEBRID"):
+                continue
+            _c = _bh.get("cached", None)
+            if _c is True:
+                rd_out_true += 1
+            elif _c is False:
+                rd_out_false += 1
+            elif _c == "LIKELY":
+                rd_out_likely += 1
+            else:
+                rd_out_unk += 1
+
+        if int(getattr(stats, "rd_heur_calls", 0) or 0) > 0 or (rd_out_true + rd_out_likely + rd_out_false + rd_out_unk) > 0:
+            avg_conf = (float(getattr(stats, "rd_heur_conf_sum", 0.0) or 0.0) / float(stats.rd_heur_calls)) if int(stats.rd_heur_calls or 0) > 0 else 0.0
+            logger.info(
+                "RD_HEUR_MAINTAIN rid=%s mode=heuristic thr=0.70 calls=%d ok=%d miss=%d avg_conf=%.2f out_cached_true=%d out_cached_likely=%d out_cached_false=%d out_cached_unk=%d",
+                _rid(),
+                int(getattr(stats, "rd_heur_calls", 0) or 0),
+                int(getattr(stats, "rd_heur_true", 0) or 0),
+                int(getattr(stats, "rd_heur_false", 0) or 0),
+                float(avg_conf),
+                int(rd_out_true),
+                int(rd_out_likely),
+                int(rd_out_false),
+                int(rd_out_unk),
+            )
+    except Exception:
+        pass
+
+    # Clear TLS stats pointer to avoid leaking across requests
+    try:
+        if hasattr(_TLS, "stats"):
+            delattr(_TLS, "stats")
     except Exception:
         pass
 
