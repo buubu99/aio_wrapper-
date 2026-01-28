@@ -10,6 +10,9 @@ import time
 import unicodedata
 import uuid
 import difflib
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from xml.etree import ElementTree as ET  # NZBGeek (Newznab) readiness checks
 import threading
 import resource  # For memory tracking (ru_maxrss)
 from collections import defaultdict, deque
@@ -221,6 +224,12 @@ TB_API_TIMEOUT = _safe_float(os.environ.get('TB_API_TIMEOUT', '8'), 8.0)
 TMDB_TIMEOUT = _safe_float(os.environ.get('TMDB_TIMEOUT', '8'), 8.0)
 # TMDB for metadata
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
+# NZBGeek readiness checks (Newznab API). Optional; set NZBGEEK_APIKEY in Render to enable.
+NZBGEEK_APIKEY = os.environ.get("NZBGEEK_APIKEY", "")
+NZBGEEK_BASE = os.environ.get("NZBGEEK_BASE", "https://api.nzbgeek.info/api")
+NZBGEEK_TIMEOUT = _safe_float(os.environ.get("NZBGEEK_TIMEOUT", "5"), 5.0)
+NZBGEEK_TITLE_MATCH_MIN_RATIO = _safe_float(os.environ.get("NZBGEEK_TITLE_MATCH_MIN_RATIO", "0.80"), 0.80)
+
 BUILD_ID = os.environ.get("BUILD_ID", "1.0")
 # Additional filters
 MIN_SEEDERS = _safe_int(os.environ.get('MIN_SEEDERS', '1'), 1)
@@ -3113,6 +3122,122 @@ def _diversify_by_quality_bucket(
     remaining_pool = [p for p in pool if id(p) not in sel_ids]
     return selected[:m] + remaining_pool + tail
 
+# ---------------------------
+# NZBGeek readiness (Newznab)
+# ---------------------------
+
+_NZB_NEWZNAB_NS = "http://www.newznab.com/DTD/2010/feeds/attributes/"
+
+def _extract_imdbid_for_nzbgeek(id_: str) -> str:
+    """Return imdb id like 'tt1234567' from 'imdb:tt...' or raw 'tt...' ids."""
+    try:
+        if not id_:
+            return ""
+        sid = str(id_).strip()
+        if sid.startswith("imdb:"):
+            sid = sid.split(":", 1)[1].strip()
+        # Some callers pass plain tt0123456
+        if re.match(r"^tt\d{5,10}$", sid):
+            return sid
+    except Exception:
+        return ""
+    return ""
+
+def check_nzbgeek_readiness(imdbid: str) -> List[str]:
+    """Query NZBGeek (Newznab) and return a list of *normalized* titles we consider 'ready'.
+
+    Notes from your real response:
+    - NZBGeek returns NEWZNAB attrs like grabs/password/size/usenetdate, but **not** 'age' or 'completion'.
+    - The response may include multiple category attrs and sometimes 'XXX' categories; we skip those.
+    """
+    ready_titles: List[str] = []
+    if not NZBGEEK_APIKEY:
+        return ready_titles
+
+    try:
+        # IMPORTANT: do not log this URL (it contains the apikey)
+        url = f"{NZBGEEK_BASE}?t=search&imdbid={imdbid}&apikey={NZBGEEK_APIKEY}&extended=1"
+        r = requests.get(url, timeout=5)
+        if r.status_code != 200:
+            return ready_titles
+
+        root = ET.fromstring(r.content)
+        ns = {'newznab': 'http://www.newznab.com/DTD/2010/feeds/attributes/'}
+        now_utc = datetime.now(timezone.utc)
+
+        for item in root.findall('./channel/item'):
+            title = (item.findtext('title') or '').strip()
+            if not title:
+                continue
+
+            # Fast category guards (avoid accidental adult results)
+            cat_text = (item.findtext('category') or '')
+            if 'XXX' in cat_text.upper():
+                continue
+
+            # Collect all newznab attrs (some names appear multiple times, e.g., category)
+            attrs = defaultdict(list)
+            for a in item.findall('newznab:attr', ns):
+                n = (a.get('name') or '').strip()
+                v = (a.get('value') or '').strip()
+                if n:
+                    attrs[n].append(v)
+
+            cat_ids = attrs.get('category') or []
+            # NZBGeek uses 6000+ for XXX categories (e.g., 6000/6040 in your sample)
+            if any(v.startswith('6') for v in cat_ids if v):
+                continue
+
+            # Pull the fields we actually have in the real feed
+            try:
+                grabs = int((attrs.get('grabs') or ['0'])[0] or 0)
+            except Exception:
+                grabs = 0
+            try:
+                size_bytes = int((attrs.get('size') or ['0'])[0] or 0)
+            except Exception:
+                size_bytes = 0
+            password = ((attrs.get('password') or ['0'])[0] or '0').strip()
+
+            # Age: NZBGeek does not provide 'age' attr in your output, so compute from usenetdate/pubDate.
+            date_str = ((attrs.get('usenetdate') or [''])[0] or '').strip() or (item.findtext('pubDate') or '').strip()
+            age_days: Optional[int] = None
+            if date_str:
+                try:
+                    dt = parsedate_to_datetime(date_str)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    dt = dt.astimezone(timezone.utc)
+                    age_days = int((now_utc - dt).total_seconds() // 86400)
+                except Exception:
+                    age_days = None
+
+            # Readiness heuristic (conservative):
+            # - password-protected posts often fail instant play
+            # - require decent size (filters tiny junk)
+            # - require some grabs (filters dead/obscure)
+            # - require "recent enough" as a reliability proxy (usenet retention/fills)
+            is_ready = (
+                grabs >= 20 and
+                password != '1' and
+                size_bytes > 1_000_000_000
+            )
+            # If we can compute age, apply a recency gate (default 180d so older movies can still get 'ready').
+            if age_days is not None:
+                is_ready = is_ready and (age_days <= 180)
+
+            if is_ready:
+                ready_titles.append(normalize_label(title))
+
+            # keep list bounded (we only use it for matching)
+            if len(ready_titles) >= 200:
+                break
+
+    except Exception as e:
+        logging.warning(f"NZBGeek readiness check failed: {e}")
+
+    return ready_titles
+
 def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0, is_android: bool = False, is_iphone: bool = False, fast_mode: bool = False, deliver_cap: Optional[int] = None) -> Tuple[List[Dict[str, Any]], PipeStats]:
     stats = PipeStats()
     rid = _rid()
@@ -3539,8 +3664,46 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     except Exception as _e:
         logger.debug(f"HASH_STATS_ERR rid={_rid()} err={_e}")
 
+    # +++ NZBGeek Readiness Check for Usenet (iPhone exclusive + general mix)
+    # This is a hint only: it never drops streams, it only sets meta['ready']=True for better ordering.
+    try:
+        usenet_provs_set = {str(p).upper() for p in (USENET_PROVIDERS or USENET_PRIORITY or []) if p}
+        usenet_provs_set.add("ND")  # Treat ND as usenet-like
+        has_usenet = any(str(m.get("provider") or "").upper().strip() in usenet_provs_set for _, m in out_pairs)
+        if has_usenet:
+            imdbid = _extract_imdbid_for_nzbgeek(id_)
+            if imdbid and NZBGEEK_APIKEY:
+                t0_ready = time.time()
+                ready_titles = check_nzbgeek_readiness(imdbid)
+                stats.ms_tb_usenet += int((time.time() - t0_ready) * 1000)
+            else:
+                ready_titles = []
+
+            if ready_titles:
+                flagged = 0
+                for s, m in out_pairs:
+                    prov_u = str(m.get("provider") or "").upper().strip()
+                    if prov_u not in usenet_provs_set:
+                        continue
+                    # Use parsed raw title if available; fall back to name/title.
+                    stream_title = normalize_label(m.get("title_raw") or s.get("title") or s.get("name") or "")
+                    stream_title = stream_title.lower().strip()
+                    if not stream_title:
+                        continue
+                    for rt in ready_titles:
+                        if difflib.SequenceMatcher(None, stream_title, rt).ratio() >= float(NZBGEEK_TITLE_MATCH_MIN_RATIO or 0.80):
+                            m["ready"] = True
+                            flagged += 1
+                            break
+                if flagged:
+                    logger.info("NZBGEEK_READY rid=%s imdb=%s ready_titles=%s flagged=%s ms_tb_usenet=%s",
+                                rid, imdbid, len(ready_titles), flagged, stats.ms_tb_usenet)
+    except Exception as _e:
+        logger.debug("NZBGEEK_READY_ERR rid=%s err=%s", rid, _e)
+
     # Sorting: quality-first GLOBAL sort AFTER merge/dedup.
-    # Order: instant > cached > res > size > seeders (usenet boost) > provider rank.
+    # Order: (iPhone usenet) ready > instant > cached > res > size > seeders > provider.
+    # (general) instant > cached > res > ready > size > seeders > provider.
     # This prevents provider-append "burial" and surfaces best quality first.
     def sort_key(pair: Tuple[Dict[str, Any], Dict[str, Any]]):
         s, m = pair
@@ -3580,13 +3743,14 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         is_instant = ("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) or _looks_instant(str(desc))
         instant_val = 0 if is_instant else 1
 
+        ready_val = 0 if m.get("ready") else 1
         prov_idx = _provider_rank(prov)
         # Sort order: instant -> cached -> resolution -> size -> seeders -> provider rank
         # Sort order: instant -> cached -> resolution -> size -> seeders -> provider rank
         if iphone_usenet_mode and usenet_priority_set:
             usenet_rank = 0 if prov in usenet_priority_set else 1
-            return (usenet_rank, instant_val, cached_val, -res, -size_b, -seeders, prov_idx)
-        return (instant_val, cached_val, -res, -size_b, -seeders, prov_idx)
+            return (usenet_rank, ready_val, instant_val, cached_val, -res, -size_b, -seeders, prov_idx)
+        return (instant_val, cached_val, -res, ready_val, -size_b, -seeders, prov_idx)
 
     out_pairs.sort(key=sort_key)
 
@@ -3627,6 +3791,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 "cached_bh": cached_bh,
                 "cached_m": cached_m,
                 "premium_level": m.get("premium_level", None),
+                "ready": bool(m.get("ready", False)),
                 "tagged_instant": bool(tagged_instant),
                 "sort_key": sort_key((s, m)),
             })
