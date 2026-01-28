@@ -2502,9 +2502,9 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
     # In this wrapper, extras are not used (movie/series id already encodes what upstream needs).
     # Kept here for future series extras support.
     extras = None
-
-    aio_url = f"{AIO_BASE}/stream/{type_}/{id_}.json" if AIO_BASE else ""
-    prov2_url = f"{PROV2_BASE}/stream/{type_}/{id_}.json" if PROV2_BASE else ""
+    upstream_id = _canonical_id_for_upstream(id_)
+    aio_url = f"{AIO_BASE}/stream/{type_}/{upstream_id}.json" if AIO_BASE else ""
+    prov2_url = f"{PROV2_BASE}/stream/{type_}/{upstream_id}.json" if PROV2_BASE else ""
 
 
     aio_streams: List[Dict[str, Any]] = []
@@ -3143,6 +3143,69 @@ def _extract_imdbid_for_nzbgeek(id_: str) -> str:
         return ""
     return ""
 
+
+def _canonical_id_for_upstream(id_: str) -> str:
+    """Canonicalize incoming Stremio id for upstream add-ons.
+
+    Goals:
+    - Keep debrid behavior working even if clients send ids like 'imdb:tt...'
+    - Preserve series season/episode suffixes (':S:E') if present.
+    - Do NOT attempt to guess/convert TMDB ids; pass through unchanged.
+    """
+    try:
+        if not id_:
+            return ""
+        sid = str(id_).strip()
+        # Stremio iOS / some clients may prefix IMDb ids with 'imdb:'
+        if sid.startswith("imdb:"):
+            sid = sid.split(":", 1)[1].strip()
+        return sid
+    except Exception:
+        return str(id_ or "").strip()
+
+
+def _extract_tmdbid_for_lookup(id_: str) -> str:
+    """Extract TMDB numeric id from 'tmdb:<id>' (optionally with ':S:E')."""
+    try:
+        if not id_:
+            return ""
+        sid = str(id_).strip()
+        if sid.startswith("tmdb:"):
+            parts = sid.split(":")
+            if len(parts) >= 2 and parts[1].isdigit():
+                return parts[1]
+        # some callers might pass plain numeric TMDB ids
+        if sid.isdigit():
+            return sid
+    except Exception:
+        return ""
+    return ""
+
+
+@lru_cache(maxsize=2048)
+def _tmdb_external_imdb_id(type_: str, tmdb_id: str) -> str:
+    """Resolve TMDB numeric id to IMDb tt-id using TMDB external_ids.
+
+    Returns '' if unavailable or on error. Cached to avoid repeated calls.
+    """
+    try:
+        if not TMDB_API_KEY:
+            return ""
+        if not tmdb_id or not str(tmdb_id).isdigit():
+            return ""
+        endpoint = "movie" if type_ == "movie" else "tv"
+        url = f"https://api.themoviedb.org/3/{endpoint}/{tmdb_id}/external_ids?api_key={TMDB_API_KEY}"
+        # Keep this tight; this is an optional enhancement, never a blocker.
+        resp = session.get(url, timeout=min(2.0, float(TMDB_TIMEOUT or 2.0)))
+        resp.raise_for_status()
+        data = resp.json() if resp else {}
+        imdb_id = (data.get("imdb_id") or "").strip()
+        if re.match(r"^tt\d{5,10}$", imdb_id):
+            return imdb_id
+    except Exception:
+        return ""
+    return ""
+
 def check_nzbgeek_readiness(imdbid: str) -> List[str]:
     """Query NZBGeek (Newznab) and return a list of *normalized* titles we consider 'ready'.
 
@@ -3669,35 +3732,47 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     try:
         usenet_provs_set = {str(p).upper() for p in (USENET_PROVIDERS or USENET_PRIORITY or []) if p}
         usenet_provs_set.add("ND")  # Treat ND as usenet-like
-        has_usenet = any(str(m.get("provider") or "").upper().strip() in usenet_provs_set for _, m in out_pairs)
-        if has_usenet:
+        has_usenet = any(str(meta.get("provider") or "").upper().strip() in usenet_provs_set for _, meta in out_pairs)
+
+        ready_titles: List[str] = []
+        imdbid = ""
+
+        # Only call NZBGeek when we actually have Usenet streams and the API key is configured.
+        if has_usenet and NZBGEEK_APIKEY:
             imdbid = _extract_imdbid_for_nzbgeek(id_)
-            if imdbid and NZBGEEK_APIKEY:
+
+            # If request id is TMDB-based (tmdb:123), resolve to IMDb via TMDB external_ids.
+            if (not imdbid) and TMDB_API_KEY:
+                tmdb_id = _extract_tmdbid_for_lookup(id_)
+                if tmdb_id:
+                    imdbid = _tmdb_external_imdb_id(type_, tmdb_id)
+
+            if imdbid:
                 t0_ready = time.time()
                 ready_titles = check_nzbgeek_readiness(imdbid)
                 stats.ms_tb_usenet += int((time.time() - t0_ready) * 1000)
-            else:
-                ready_titles = []
 
-            if ready_titles:
-                flagged = 0
-                for s, m in out_pairs:
-                    prov_u = str(m.get("provider") or "").upper().strip()
-                    if prov_u not in usenet_provs_set:
-                        continue
-                    # Use parsed raw title if available; fall back to name/title.
-                    stream_title = normalize_label(m.get("title_raw") or s.get("title") or s.get("name") or "")
-                    stream_title = stream_title.lower().strip()
-                    if not stream_title:
-                        continue
-                    for rt in ready_titles:
-                        if difflib.SequenceMatcher(None, stream_title, rt).ratio() >= float(NZBGEEK_TITLE_MATCH_MIN_RATIO or 0.80):
-                            m["ready"] = True
-                            flagged += 1
-                            break
-                if flagged:
-                    logger.info("NZBGEEK_READY rid=%s imdb=%s ready_titles=%s flagged=%s ms_tb_usenet=%s",
-                                rid, imdbid, len(ready_titles), flagged, stats.ms_tb_usenet)
+        if ready_titles:
+            flagged = 0
+            for s, meta in out_pairs:
+                prov_u = str(meta.get("provider") or "").upper().strip()
+                if prov_u not in usenet_provs_set:
+                    continue
+                stream_title = normalize_label(meta.get("title_raw") or s.get("title") or s.get("name") or "")
+                stream_title = stream_title.lower().strip()
+                if not stream_title:
+                    continue
+                for rt in ready_titles:
+                    if difflib.SequenceMatcher(None, stream_title, rt).ratio() >= float(NZBGEEK_TITLE_MATCH_MIN_RATIO or 0.80):
+                        meta["ready"] = True
+                        flagged += 1
+                        break
+
+            if flagged:
+                logger.info(
+                    "NZBGEEK_READY rid=%s imdb=%s ready_titles=%s flagged=%s ms_tb_usenet=%s",
+                    rid, imdbid, len(ready_titles), flagged, stats.ms_tb_usenet
+                )
     except Exception as _e:
         logger.debug("NZBGEEK_READY_ERR rid=%s err=%s", rid, _e)
 
