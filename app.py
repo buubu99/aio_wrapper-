@@ -306,6 +306,8 @@ ANDROID_VERIFY_OFF = _parse_bool(os.environ.get("ANDROID_VERIFY_OFF", "false"), 
 # Force a minimum share of usenet results (if they exist)
 MIN_USENET_KEEP = _safe_int(os.environ.get('MIN_USENET_KEEP', '0'), 0)
 MIN_USENET_DELIVER = _safe_int(os.environ.get('MIN_USENET_DELIVER', '0'), 0)
+MIN_TB_DELIVER = _safe_int(os.environ.get('MIN_TB_DELIVER', '0'), 0)
+MIN_RD_DELIVER = _safe_int(os.environ.get('MIN_RD_DELIVER', '0'), 0)
 
 # Optional local/remote filtering sources
 USE_BLACKLISTS = _parse_bool(os.environ.get("USE_BLACKLISTS", "true"), True)
@@ -2410,6 +2412,11 @@ def try_fastlane(*, prov2_fut, aio_fut, aio_key: str, prov2_url: str, aio_url: s
     """Prov2-only early return. Returns (out, aio_in, prov2_in, aio_ms, p2_ms, prefiltered, stats, fetch_meta) or None."""
     if not FASTLANE_ENABLED or not prov2_fut or not prov2_url:
         return None
+
+    # Android normal path: do not fastlane-return Prov2-only; wait for AIO merge.
+    # (Android clients were getting usenet-only results when fastlane returned early.)
+    if is_android and not is_iphone:
+        return None
     # Cap how long we wait for Prov2 before deciding. We never block on AIO here.
     try:
         prov2_timeout = (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT)
@@ -2504,10 +2511,16 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
     aio_key = _aio_cache_key(type_, id_, extras)
     cached = _aio_cache_get(aio_key)
 
+    iphone_usenet_mode = bool(is_iphone and IPHONE_USENET_ONLY)
+    if iphone_usenet_mode:
+        # iOS/iphone usenet-only: do NOT use AIO cache and do NOT fetch AIO at all
+        cached = None
+        aio_meta = {'tag': AIO_TAG, 'ok': False, 'err': 'skipped_iphone_usenet_only'}
+
     aio_fut = None
     p2_fut = None
 
-    if AIO_BASE:
+    if AIO_BASE and not iphone_usenet_mode:
         aio_fut = FETCH_EXECUTOR.submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, id_, AIO_TAG, (ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT))
     if PROV2_BASE:
         p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT))
@@ -2588,31 +2601,14 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
 
     merged = aio_streams + p2_streams
 
-    # +++ New: iPhone/iPad usenet-only branch (restrict to proxied usenet from PROV2)
+    # +++ New: iPhone/iPad usenet-only branch (prov2-only; AIO is skipped above)
     if is_iphone and IPHONE_USENET_ONLY:
-        usenet_streams: List[Dict[str, Any]] = []
-        prov_tokens = [p.lower() for p in (USENET_PROVIDERS or USENET_PRIORITY or []) if p]
-        for s in p2_streams:  # PROV2 = usenet instance
-            desc = str(s.get('description', '') or '')
-            name = str(s.get('name', '') or '')
-            text = f"{name} {desc}".lower()
-            if 'usenet' not in text:
-                continue
-            if prov_tokens and not any(p in text for p in prov_tokens):
-                continue
-            # Enforce proxied playback (formatter tag)
-            if 'proxied:true' not in text and 'proxied=true' not in text:
-                continue
-            usenet_streams.append(s)
-        if usenet_streams:
-            merged = usenet_streams
-        else:
-            # Fallback: still prefer PROV2-only on iOS, even if tags aren't present
-            merged = p2_streams
+        merged = p2_streams
         try:
             logger.info('IPHONE_USENET_ONLY rid=%s p2_in=%d kept=%d', _rid(), len(p2_streams), len(merged))
         except Exception:
             pass
+
     return merged, aio_in, prov2_in, aio_ms, p2_ms, False, None, {'aio': aio_meta, 'p2': p2_meta}
 
 def hash_stats(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
@@ -2642,10 +2638,62 @@ def hash_stats(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
 def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
     """Stable dedup key.
 
-    - Prefer infohash when present (universal across providers). Keep resolution to preserve distinct encodes.
-    - If no infohash, fallback to URL (hashed) + size when available.
-    - Last resort: normalized label.
+    - Torrent/debrid: prefer infohash (strong, global) + resolution (preserve distinct encodes).
+    - Usenet: upstream "infohash" may be a placeholder shared by many results, which can collapse
+      the entire set down to a couple of items. For usenet providers, prefer URL/label+size bucketing.
     """
+    # Provider detection (best-effort)
+    try:
+        bh = (stream.get('behaviorHints') or {}) if isinstance(stream, dict) else {}
+        prov = (
+            (meta.get('provider') if isinstance(meta, dict) else None)
+            or (bh.get('provider') if isinstance(bh, dict) else None)
+            or (stream.get('prov') if isinstance(stream, dict) else None)
+            or (stream.get('provider') if isinstance(stream, dict) else None)
+            or ''
+        )
+        prov_u = str(prov).upper().strip()
+    except Exception:
+        prov_u = ''
+
+    # Common usenet set
+    usenet_provs = {str(p).upper() for p in (USENET_PROVIDERS or USENET_PRIORITY or []) if p}
+    usenet_provs.add('ND')  # Treat ND as usenet-like
+
+    # Shared fields
+    res = ((meta.get('res') if isinstance(meta, dict) else None) or 'SD').upper()
+    raw_url = (stream.get('url') or stream.get('externalUrl') or '') if isinstance(stream, dict) else ''
+    raw_url = (raw_url or '').strip()
+    size = (meta.get('size') if isinstance(meta, dict) else None) or (meta.get('bytes') if isinstance(meta, dict) else None) or (meta.get('videoSize') if isinstance(meta, dict) else None) or 0
+    try:
+        size_i = int(size or 0)
+    except Exception:
+        size_i = 0
+
+    # USENET: prefer URL-based key even if a (possibly-placeholder) infohash exists.
+    if prov_u in usenet_provs:
+        if raw_url:
+            uhash = hashlib.sha1(raw_url.encode('utf-8')).hexdigest()[:16]
+            size_bucket = int(size_i / (500 * 1024 * 1024)) if size_i else -1
+            return f"usenet:{prov_u}:u:{uhash}:{size_bucket}:{res}"
+
+        bh = (stream.get('behaviorHints') or {}) if isinstance(stream, dict) else {}
+        try:
+            normalized_label = normalize_label(
+                (bh.get('filename') if isinstance(bh, dict) else None)
+                or (bh.get('bingeGroup') if isinstance(bh, dict) else None)
+                or (stream.get('name') if isinstance(stream, dict) else None)
+                or (stream.get('description') if isinstance(stream, dict) else None)
+                or ''
+            )
+        except Exception:
+            normalized_label = ''
+
+        size_bucket = int(size_i / (500 * 1024 * 1024)) if size_i else -1
+        normalized_label = (normalized_label or '')[:80]
+        return f"usenet:{prov_u}:nohash:{normalized_label}:{size_bucket}:{res}"
+
+    # Non-usenet: prefer infohash
     infohash = (
         (meta.get('infohash') if isinstance(meta, dict) else None)
         or (meta.get('infoHash') if isinstance(meta, dict) else None)
@@ -2654,27 +2702,23 @@ def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
         or ''
     )
     infohash = (infohash or '').lower().strip()
-    res = (meta.get('res') or 'SD').upper()
-
     if infohash:
         return f"h:{infohash}:{res}"
 
-    raw_url = (stream.get('url') or stream.get('externalUrl') or '')
-    raw_url = (raw_url or '').strip()
-    size = meta.get('size') or meta.get('bytes') or meta.get('videoSize') or 0
-    try:
-        size_i = int(size or 0)
-    except Exception:
-        size_i = 0
-
+    # Fallback: URL-hash + size
     if raw_url:
         uhash = hashlib.sha1(raw_url.encode('utf-8')).hexdigest()[:16]
         return f"u:{uhash}:{size_i}:{res}"
 
-    bh = stream.get('behaviorHints') or {}
+    # Last resort: normalized label (+ size bucket)
+    bh = (stream.get('behaviorHints') or {}) if isinstance(stream, dict) else {}
     try:
         normalized_label = normalize_label(
-            bh.get('filename') or bh.get('bingeGroup') or stream.get('name', '') or stream.get('description', '')
+            (bh.get('filename') if isinstance(bh, dict) else None)
+            or (bh.get('bingeGroup') if isinstance(bh, dict) else None)
+            or (stream.get('name') if isinstance(stream, dict) else None)
+            or (stream.get('description') if isinstance(stream, dict) else None)
+            or ''
         )
     except Exception:
         normalized_label = ''
@@ -2682,6 +2726,7 @@ def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
     size_bucket = int(size_i / (500 * 1024 * 1024)) if size_i else -1
     normalized_label = (normalized_label or '')[:80]
     return f"nohash:{normalized_label}:{size_bucket}:{res}"
+
 
 
 def _drop_bad_top_n(
@@ -3075,6 +3120,48 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     stats.prov2_in = prov2_in
     stats.merged_in = len(streams)
 
+    iphone_usenet_mode = bool(is_iphone and IPHONE_USENET_ONLY)
+    usenet_priority_set = {str(p).upper() for p in (USENET_PRIORITY or []) if p}
+    if iphone_usenet_mode and usenet_priority_set:
+        _before = len(streams)
+
+        def _prov_guess(_s: Dict[str, Any]) -> str:
+            try:
+                if not isinstance(_s, dict):
+                    return "UNK"
+                bh = _s.get("behaviorHints") or {}
+                p = None
+                if isinstance(bh, dict):
+                    p = bh.get("provider") or bh.get("prov")
+                p = p or _s.get("prov") or _s.get("provider")
+                if p:
+                    return str(p).upper().strip()
+
+                txt = f"{_s.get('name','')} {_s.get('description','')}"
+                if isinstance(bh, dict):
+                    txt += f" {bh.get('filename','')}"
+                txt_u = txt.upper()
+
+                # common alias normalization
+                if re.search(r"(?<![A-Z0-9])EWEKA(?![A-Z0-9])", txt_u):
+                    return "EW"
+                if re.search(r"(?<![A-Z0-9])NZGEEK(?![A-Z0-9])", txt_u):
+                    return "NG"
+
+                for ap in usenet_priority_set:
+                    if re.search(rf"(?<![A-Z0-9]){re.escape(ap)}(?![A-Z0-9])", txt_u):
+                        return ap
+                return "UNK"
+            except Exception:
+                return "UNK"
+
+        _filtered = [s for s in streams if _prov_guess(s) in usenet_priority_set]
+        if _filtered:
+            streams = _filtered
+
+        logger.debug("IPHONE_USENET_ONLY filtered to %d usenet streams (from %d)", len(streams), _before)
+        stats.merged_in = len(streams)
+
     deliver_cap_eff = int(deliver_cap or MAX_DELIVER or 60)
 
     cached_map: Dict[str, bool] = {}
@@ -3159,25 +3246,154 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 or (bh.get("infoHash") if isinstance(bh, dict) else None)
                 or _s.get("url")
                 or _s.get("externalUrl")
-                or (bh.get("url") if isinstance(bh, dict) else None)
             )
-            if isinstance(key, str) and key:
-                if key in seen_pre:
-                    continue
-                seen_pre.add(key)
+            if not key:
+                # fallback key by name+url
+                key = f"{(_s.get('name') or '')}|{(_s.get('url') or _s.get('externalUrl') or '')}"
+            key = str(key)
+            if key in seen_pre:
+                continue
+            seen_pre.add(key)
             pre.append(_s)
 
         if len(pre) != orig_n:
             logger.info("PRE_DEDUP rid=%s before=%d after=%d", rid, orig_n, len(pre))
 
         if len(pre) > EARLY_CAP:
-            pre.sort(key=lambda _s: (
-                (999 - _provider_rank(_quick_provider(_s))),
-                _quick_res_int(_s),
-                _quick_seeders(_s),
-            ), reverse=True)
-            streams = pre[:EARLY_CAP]
-            logger.info("EARLY_CAP rid=%s capped=%d original=%d", rid, len(streams), orig_n)
+            # IMPORTANT: keep diversity across premium providers at cap-time.
+            # Otherwise, if PREMIUM_PRIORITY is [RD,TB] (or [TB,RD]) and EARLY_CAP=200,
+            # we can starve the secondary provider entirely and later stages can never "mix".
+            def _quick_provider(_s: Dict[str, Any]) -> str:
+                bh = _s.get("behaviorHints") or {}
+                prov = ""
+                if isinstance(bh, dict):
+                    prov = (bh.get("provider") or "")
+                if not prov:
+                    n = (_s.get("name") or "")
+                    nu = n.upper()
+                    # prefer formatter-injected shortName tokens; keep word boundaries to avoid HDR->RD.
+                    m_sn = re.search(r"\b(TB|TORBOX|RD|REAL[- ]?DEBRID|AD|ALLDEBRID|DL|DEBRIDLINK|ND|NZB|USENET)\b", nu)
+                    if m_sn:
+                        tok = m_sn.group(1)
+                        if tok in ("TORBOX", "TB"):
+                            prov = "TB"
+                        elif tok.startswith("REAL") or tok == "RD":
+                            prov = "RD"
+                        elif tok in ("ALLDEBRID", "AD"):
+                            prov = "AD"
+                        elif tok in ("DEBRIDLINK", "DL"):
+                            prov = "DL"
+                        elif tok in ("ND", "NZB", "USENET"):
+                            prov = "ND"
+                return (prov or "").upper() or "UNK"
+
+            def _quick_res_int(_s: Dict[str, Any]) -> int:
+                n = (_s.get("name") or "") + " " + (_s.get("description") or "")
+                nu = n.upper()
+                if "2160" in nu or "4K" in nu:
+                    return 2160
+                if "1080" in nu:
+                    return 1080
+                if "720" in nu:
+                    return 720
+                if "480" in nu:
+                    return 480
+                return 0
+
+            def _quick_seeders(_s: Dict[str, Any]) -> int:
+                n = (_s.get("name") or "") + " " + (_s.get("description") or "")
+                m2 = re.search(r"(\d{1,6})\s*(SEEDS?|SEEDERS?)\b", n, re.I)
+                if m2:
+                    try:
+                        return int(m2.group(1))
+                    except Exception:
+                        return 0
+                return 0
+
+            groups: Dict[str, List[Dict[str, Any]]] = {}
+            for _s in pre:
+                p = _quick_provider(_s)
+                groups.setdefault(p, []).append(_s)
+
+            # Sort each group by cheap quality (res, seeders).
+            for _p, _arr in groups.items():
+                _arr.sort(key=lambda _s: (_quick_res_int(_s), _quick_seeders(_s)), reverse=True)
+
+            # iPhone clients are typically usenet-only; don't waste EARLY_CAP slots on debrid providers.
+            if is_iphone and "ND" in groups and len(groups["ND"]) >= EARLY_CAP:
+                streams = groups["ND"][:EARLY_CAP]
+                logger.info(
+                    "EARLY_CAP_IPHONE rid=%s capped=%d original=%d nd=%d",
+                    rid, len(streams), orig_n, len(groups.get("ND", []))
+                )
+            else:
+                # Priority order: premium providers first (in configured order), then everything else.
+                priority_order: List[str] = [p for p in PREMIUM_PRIORITY if p in groups]
+                for p in sorted(groups.keys()):
+                    if p not in priority_order:
+                        priority_order.append(p)
+
+                present = [p for p in priority_order if groups.get(p)]
+                if len(present) <= 1:
+                    # Fallback to old behavior
+                    pre.sort(key=lambda _s: (
+                        (999 - _provider_rank(_quick_provider(_s))),
+                        _quick_res_int(_s),
+                        _quick_seeders(_s),
+                    ), reverse=True)
+                    streams = pre[:EARLY_CAP]
+                    logger.info("EARLY_CAP rid=%s capped=%d original=%d", rid, len(streams), orig_n)
+                else:
+                    cap = EARLY_CAP
+                    nprov = len(present)
+
+                    # Small floor per provider (scaled to cap) so TB/RD both survive the cap.
+                    floor = min(25, max(5, cap // max(1, nprov * 4)))
+                    quotas: Dict[str, int] = {p: min(floor, len(groups[p])) for p in present}
+                    used = sum(quotas.values())
+                    remaining = cap - used
+
+                    # Distribute remainder round-robin in priority order.
+                    while remaining > 0:
+                        progressed = False
+                        for p in present:
+                            if remaining <= 0:
+                                break
+                            if quotas[p] < len(groups[p]):
+                                quotas[p] += 1
+                                remaining -= 1
+                                progressed = True
+                        if not progressed:
+                            break
+
+                    capped: List[Dict[str, Any]] = []
+                    for p in present:
+                        capped.extend(groups[p][:quotas[p]])
+
+                    # If some providers ran out early, backfill from leftovers (still cheap-sorted).
+                    if len(capped) < cap:
+                        leftovers: List[Dict[str, Any]] = []
+                        for p in present:
+                            leftovers.extend(groups[p][quotas[p]:])
+                        for p, arr in groups.items():
+                            if p not in present:
+                                leftovers.extend(arr)
+                        leftovers.sort(key=lambda _s: (
+                            (999 - _provider_rank(_quick_provider(_s))),
+                            _quick_res_int(_s),
+                            _quick_seeders(_s),
+                        ), reverse=True)
+                        capped.extend(leftovers[:cap - len(capped)])
+
+                    streams = capped[:cap]
+                    try:
+                        gsz = {p: len(groups[p]) for p in present}
+                    except Exception:
+                        gsz = {}
+                    logger.info(
+                        "EARLY_CAP_STRAT rid=%s capped=%d original=%d groups=%s quotas=%s",
+                        rid, len(streams), orig_n, gsz, quotas
+                    )
         else:
             streams = pre
             logger.info("NO_EARLY_CAP rid=%s original=%d cap=%d", rid, orig_n, EARLY_CAP)
@@ -3366,60 +3582,13 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
         prov_idx = _provider_rank(prov)
         # Sort order: instant -> cached -> resolution -> size -> seeders -> provider rank
+        # Sort order: instant -> cached -> resolution -> size -> seeders -> provider rank
+        if iphone_usenet_mode and usenet_priority_set:
+            usenet_rank = 0 if prov in usenet_priority_set else 1
+            return (usenet_rank, instant_val, cached_val, -res, -size_b, -seeders, prov_idx)
         return (instant_val, cached_val, -res, -size_b, -seeders, prov_idx)
 
     out_pairs.sort(key=sort_key)
-
-    # Optional: force a mix of TB and RD in the *front* of the list (so top-N isn't all one provider).
-    # Controlled by env vars; defaults keep old behavior.
-    min_tb = _safe_int(os.environ.get("MIN_TB_DELIVER", "0"), 0)
-    min_rd = _safe_int(os.environ.get("MIN_RD_DELIVER", "0"), 0)
-    if (min_tb or min_rd) and (not is_iphone):
-        min_tb = max(0, int(min_tb or 0))
-        min_rd = max(0, int(min_rd or 0))
-
-        tb_pairs = [p for p in out_pairs if (p[1].get("provider") or "").upper() == "TB"]
-        rd_pairs = [p for p in out_pairs if (p[1].get("provider") or "").upper() == "RD"]
-
-        chosen: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-        chosen_keys: set = set()
-
-        def _k(pair):
-            s, m = pair
-            # Prefer stable identifiers
-            return (
-                m.get("infohash")
-                or m.get("hash")
-                or (s.get("url") or s.get("externalUrl") or "")
-                or (s.get("infoHash") or "")
-                or (m.get("name") or "")
-            )
-
-        def _take(pairs, n):
-            if n <= 0:
-                return
-            got = 0
-            for pair in pairs:
-                k = _k(pair)
-                if not k or k in chosen_keys:
-                    continue
-                chosen_keys.add(k)
-                chosen.append(pair)
-                got += 1
-                if got >= n:
-                    break
-
-        # Take the best N TB and best N RD (already globally sorted), then fill remaining by global order.
-        _take(tb_pairs, min_tb)
-        _take(rd_pairs, min_rd)
-
-        if chosen:
-            rest = [p for p in out_pairs if _k(p) not in chosen_keys]
-            out_pairs = chosen + rest
-            logger.info(
-                "MIX_TB_RD applied rid=%s deliver_cap=%s min_tb=%s min_rd=%s tb_avail=%s rd_avail=%s chosen=%s",
-                rid, deliver_cap_eff, min_tb, min_rd, len(tb_pairs), len(rd_pairs), len(chosen)
-            )
 
     # Proof log: top N after global sort (provider/supplier/res + sort signals)
     try:
@@ -3514,7 +3683,66 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         except Exception:
             pass
 
-    # Candidate pool (post-sort/post-diversity). Everything below operates on `candidates`.
+    
+    # --- Premium mix (Android/Desktop): prevent a single debrid provider from dominating the top list
+    # when multiple premium providers are present (e.g., TB + RD). This helps avoid "all green" / "all red"
+    # swings when upstream ordering/caps change.
+    if (not is_iphone) and deliver_cap_eff >= 20 and len(PREMIUM_PRIORITY) >= 2:
+        present_provs: set[str] = set()
+        for _s, _m in out_pairs:
+            pp = (_m.get("provider") or "").upper()
+            if pp:
+                present_provs.add(pp)
+
+        active: List[str] = [p for p in PREMIUM_PRIORITY if p in present_provs]
+        if len(active) >= 2:
+            min_each = max(5, min(12, deliver_cap_eff // 6))  # 60 -> 10
+            byp: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {p: [] for p in active}
+            for pair in out_pairs:
+                pp = (pair[1].get("provider") or "").upper()
+                if pp in byp:
+                    byp[pp].append(pair)
+
+            active2 = [p for p in active if byp.get(p)]
+            if len(active2) >= 2:
+                min_each_eff = min_each
+                for p in active2:
+                    if len(byp[p]) < min_each_eff:
+                        min_each_eff = max(1, len(byp[p]))
+
+                picked_stream_ids: set[int] = set()
+                head: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+                for i in range(min_each_eff):
+                    for p in active2:
+                        if i < len(byp[p]):
+                            pair = byp[p][i]
+                            head.append(pair)
+                            picked_stream_ids.add(id(pair[0]))
+
+                mixed: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+                mixed.extend(head)
+                for pair in out_pairs:
+                    if id(pair[0]) in picked_stream_ids:
+                        continue
+                    mixed.append(pair)
+
+                out_pairs = mixed
+
+                try:
+                    top_by: Dict[str, int] = {}
+                    for _s, _m in out_pairs[:deliver_cap_eff]:
+                        pp = (_m.get("provider") or "").upper() or "UNK"
+                        top_by[pp] = top_by.get(pp, 0) + 1
+                    logger.info(
+                        "PREMIUM_MIX rid=%s top=%d min_each=%d providers=%s top_by_provider=%s",
+                        rid, deliver_cap_eff, min_each_eff, active2, top_by
+                    )
+                except Exception:
+                    logger.info(
+                        "PREMIUM_MIX rid=%s top=%d min_each=%d providers=%s",
+                        rid, deliver_cap_eff, min_each_eff, active2
+                    )
+# Candidate pool (post-sort/post-diversity). Everything below operates on `candidates`.
     # NOTE: Patch3 fix — patch2 accidentally referenced `candidates` before it was initialized.
     if MAX_CANDIDATES and MAX_CANDIDATES > 0:
         candidates = out_pairs[:MAX_CANDIDATES]
@@ -3832,7 +4060,67 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                         debrid_idx += 1
                     slice_ = new_slice[:deliver_cap_eff]
             candidates = slice_ + candidates[deliver_cap_eff:]    # Android/Google TV clients can't handle magnet: links; drop them and backfill with direct URLs.
-    if is_android:
+    # Premium mix: optionally ensure TB/RD representation in the first deliver_cap_eff
+    if (MIN_TB_DELIVER or MIN_RD_DELIVER) and (not is_iphone):
+        def _prov_of(pair):
+            return (pair[1].get("provider") or "").upper()
+
+        def _key_of(pair):
+            s, m = pair
+            u = (s.get("url") or s.get("externalUrl") or "").strip()
+            ih = (m.get("infoHash") or s.get("infoHash") or "").strip().lower()
+            n = (s.get("name") or "").strip()
+            return (u, ih, n)
+
+        def _inject_min(slice_, pool, prov, need_n):
+            if need_n <= 0:
+                return slice_
+            have = sum(1 for p in slice_ if _prov_of(p) == prov)
+            if have >= need_n:
+                return slice_
+            need = need_n - have
+            used = set(_key_of(p) for p in slice_)
+            extras = []
+            for p in pool:
+                if _prov_of(p) != prov:
+                    continue
+                k = _key_of(p)
+                if k in used:
+                    continue
+                extras.append(p)
+                used.add(k)
+                if len(extras) >= need:
+                    break
+            if not extras:
+                return slice_
+            # interleave: put an extra, then 2 originals, repeat
+            out = []
+            ei = 0
+            oi = 0
+            while len(out) < len(slice_) and (ei < len(extras) or oi < len(slice_)):
+                if ei < len(extras):
+                    out.append(extras[ei]); ei += 1
+                    if len(out) >= deliver_cap_eff:
+                        break
+                # keep a couple originals for stability
+                for _ in range(2):
+                    if oi < len(slice_) and len(out) < deliver_cap_eff:
+                        out.append(slice_[oi]); oi += 1
+            # fill remainder
+            while oi < len(slice_) and len(out) < deliver_cap_eff:
+                out.append(slice_[oi]); oi += 1
+            return out[:deliver_cap_eff]
+
+        slice_ = candidates[:deliver_cap_eff]
+        pool = candidates[deliver_cap_eff:] + out_pairs  # out_pairs is already sorted; safe as a pool
+        slice_ = _inject_min(slice_, pool, "TB", int(MIN_TB_DELIVER or 0))
+        slice_ = _inject_min(slice_, pool, "RD", int(MIN_RD_DELIVER or 0))
+        # rebuild candidates with enforced slice
+        used = set(_key_of(p) for p in slice_)
+        tail = [p for p in candidates if _key_of(p) not in used]
+        candidates = slice_ + tail
+
+    if is_iphone:
         def _is_magnet(u: str) -> bool:
             return isinstance(u, str) and u.startswith("magnet:")
         magnets = sum(1 for s, _m in candidates if _is_magnet((s or {}).get("url", "")))
@@ -4112,6 +4400,7 @@ def stream(type_: str, id_: str):
             type_,
             id_,
             is_android=is_android,
+            is_iphone=is_iphone,
             client_timeout_s=(ANDROID_STREAM_TIMEOUT if (is_android or is_iphone) else DESKTOP_STREAM_TIMEOUT),
         )
 
