@@ -3742,6 +3742,97 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                         "PREMIUM_MIX rid=%s top=%d min_each=%d providers=%s",
                         rid, deliver_cap_eff, min_each_eff, active2
                     )
+
+    # --- Streak mix (Android/Desktop): break up long same-provider runs (esp. Usenet) without destroying quality order.
+    # This prevents situations where, after an initial "mix head", a long NZB/ND block pushes high-quality RD/TB items
+    # to the very end of the delivered slice.
+    if (not is_iphone) and out_pairs and deliver_cap_eff >= 20:
+        try:
+            from collections import deque
+
+            def _pair_provider(_pair):
+                try:
+                    return (_pair[1].get("provider") or "").upper().strip() or "UNK"
+                except Exception:
+                    return "UNK"
+
+            # If we only have one provider, nothing to do.
+            _top_provs = [_pair_provider(p) for p in out_pairs[:deliver_cap_eff]]
+            if len(set(_top_provs)) >= 2:
+                _usenet_set = set(
+                    (p.strip().upper() for p in (USENET_PRIORITY.split(",") if USENET_PRIORITY else []) if p.strip())
+                ) or {"ND", "EW", "NG"}
+                _premium_set = set(p.strip().upper() for p in (PREMIUM_PRIORITY or []) if str(p).strip())
+
+                # Bucketize while preserving current (quality-sorted) order inside each provider.
+                _buckets = {}
+                for _i, _pair in enumerate(out_pairs):
+                    _p = _pair_provider(_pair)
+                    _buckets.setdefault(_p, deque()).append((_i, _pair))
+
+                _out = []
+                _last = None
+                _streak = 0
+
+                # Tune: allow short runs of Usenet, but prevent massive blocks.
+                _MAX_USENET_STREAK = 6
+                _MAX_OTHER_STREAK = 12
+
+                while len(_out) < len(out_pairs):
+                    _choices = []
+                    for _p, _dq in _buckets.items():
+                        if not _dq:
+                            continue
+                        if _p == _last:
+                            _mx = _MAX_USENET_STREAK if _p in _usenet_set else _MAX_OTHER_STREAK
+                            if _streak >= _mx:
+                                continue
+                        _choices.append(_p)
+
+                    if not _choices:
+                        # Forced: only provider(s) left are the streaking one(s)
+                        for _p, _dq in _buckets.items():
+                            if _dq:
+                                _choices = [_p]
+                                break
+
+                    # Pick the provider whose next item is "best" under current ordering, with a slight preference
+                    # to premium providers when we are breaking a Usenet streak.
+                    _best_p = None
+                    _best_key = None
+                    for _p in _choices:
+                        _idx0, _ = _buckets[_p][0]
+                        _key = (_idx0,)
+                        if _best_key is None or _key < _best_key:
+                            _best_key = _key
+                            _best_p = _p
+
+                    _idx0, _pair = _buckets[_best_p].popleft()
+                    _out.append(_pair)
+
+                    if _best_p == _last:
+                        _streak += 1
+                    else:
+                        _last = _best_p
+                        _streak = 1
+
+                out_pairs = _out
+
+                try:
+                    _top_by = {}
+                    for _s, _m in out_pairs[:deliver_cap_eff]:
+                        _pp = (_m.get("provider") or "").upper() or "UNK"
+                        _top_by[_pp] = _top_by.get(_pp, 0) + 1
+                    logger.info(
+                        "STREAK_MIX rid=%s top=%d max_usenet=%d top_by_provider=%s",
+                        rid, deliver_cap_eff, _MAX_USENET_STREAK, _top_by
+                    )
+                except Exception:
+                    logger.info("STREAK_MIX rid=%s top=%d max_usenet=%d", rid, deliver_cap_eff, _MAX_USENET_STREAK)
+        except Exception:
+            # Never fail the request due to ordering tweaks.
+            pass
+
 # Candidate pool (post-sort/post-diversity). Everything below operates on `candidates`.
     # NOTE: Patch3 fix — patch2 accidentally referenced `candidates` before it was initialized.
     if MAX_CANDIDATES and MAX_CANDIDATES > 0:
