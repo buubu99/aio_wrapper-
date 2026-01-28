@@ -159,6 +159,14 @@ PROV2_URL = os.environ.get("PROV2_URL", "")
 # Robust: accepts either a base addon URL or a full manifest URL.
 # Preserves token-in-path URLs while stripping any trailing /manifest.json.
 PROV2_BASE = _normalize_base(os.environ.get("PROV2_BASE", "") or PROV2_URL)
+# Add: validate provider base URLs (avoid silent empty streams on bad env)
+if AIO_BASE and not str(AIO_BASE).startswith(("http://", "https://")):
+    logger.warning("Invalid AIO_BASE: %s - disabling provider", AIO_BASE)
+    AIO_BASE = ""
+if PROV2_BASE and not str(PROV2_BASE).startswith(("http://", "https://")):
+    logger.warning("Invalid PROV2_BASE: %s - disabling provider", PROV2_BASE)
+    PROV2_BASE = ""
+
 PROV2_AUTH = os.environ.get("PROV2_AUTH", "")  # 'user:pass' for Basic auth if needed
 PROV2_TAG = os.environ.get("PROV2_TAG", "P2")
 AIO_TAG = os.environ.get("AIO_TAG", "AIO")
@@ -237,7 +245,8 @@ PREFERRED_LANG = os.environ.get("PREFERRED_LANG", "EN").upper()
 # Premium priorities and verification
 PREMIUM_PRIORITY = _safe_csv(os.environ.get('PREMIUM_PRIORITY', 'TB,RD,AD,ND'))
 USENET_PRIORITY = _safe_csv(os.environ.get('USENET_PRIORITY', 'ND,EW,NG'))
-IPHONE_USENET_ONLY = _parse_bool(os.environ.get("IPHONE_USENET_ONLY", "true"), True)
+# Original: IPHONE_USENET_ONLY = _parse_bool(os.environ.get("IPHONE_USENET_ONLY", "true"), True)
+IPHONE_USENET_ONLY = False  # Add: Enable debrid HTTP on iPhone (short paths only, no magnets—fixes hash with cached streams)
 USENET_PROVIDERS = _safe_csv(os.environ.get("USENET_PROVIDERS", ",".join(USENET_PRIORITY) if USENET_PRIORITY else "ND,EW,NG"))
 USENET_SEEDER_BOOST = _safe_int(os.environ.get('USENET_SEEDER_BOOST', '10'), 10)
 INSTANT_BOOST_TOP_N = _safe_int(os.environ.get('INSTANT_BOOST_TOP_N', '0'), 0)  # 0=off; set in Render if wanted
@@ -736,7 +745,7 @@ def _tb_webdav_exists(url: str) -> bool:
         return False
 
 
-def tb_webdav_batch_check(hashes: List[str]) -> set:
+def tb_webdav_batch_check(hashes: List[str], stats: Optional[PipeStats] = None) -> set:
     if not hashes or not TB_WEBDAV_URL:
         return set()
     base = TB_WEBDAV_URL.rstrip('/')
@@ -756,10 +765,21 @@ def tb_webdav_batch_check(hashes: List[str]) -> set:
         if ok:
             return h
         return None
+    from concurrent.futures import as_completed
     with ThreadPoolExecutor(max_workers=max(1, TB_WEBDAV_WORKERS)) as ex:
-        for res in ex.map(worker, urls):
-            if res:
-                ok.add(res)
+        futures = [ex.submit(worker, item) for item in urls]
+        for fut in as_completed(futures):
+            try:
+                res = fut.result()
+                if res:
+                    ok.add(res)
+            except Exception as e:
+                logger.warning("WebDAV worker error: %s", e)
+                try:
+                    if stats is not None:
+                        stats.errors_api += 1
+                except Exception:
+                    pass
     return ok
 
 
@@ -948,6 +968,22 @@ def wrap_playback_url(url: str) -> str:
 
 
 app = Flask(__name__)
+
+# --- optional rate limiting ---
+# RATE_LIMIT is a config string like "60/minute". If Flask-Limiter isn't installed, we just log and continue.
+limiter = None
+if RATE_LIMIT:
+    try:
+        from flask_limiter import Limiter
+        from flask_limiter.util import get_remote_address
+        limiter = Limiter(
+            get_remote_address,
+            app=app,
+            default_limits=[RATE_LIMIT],
+            storage_uri="memory://",
+        )
+    except Exception as _e:
+        logger.warning("RATE_LIMIT enabled but flask-limiter unavailable/failed: %s", _e)
 
 
 # --- fallback cache (serves last non-empty streams during upstream flakiness) ---
@@ -1329,6 +1365,9 @@ def client_platform(is_android: bool, is_iphone: bool) -> str:
     # Safari / desktop apps
     ua = request.headers.get("User-Agent", "") if has_request_context() else ""
     ua_l = (ua or "").strip().lower()
+    if not ua_l:
+        logger.debug("EMPTY_UA rid=%s", _rid())
+        return "android" if EMPTY_UA_IS_ANDROID else "unknown"
     if "windows" in ua_l or "mac os" in ua_l or "x11" in ua_l or "linux" in ua_l:
         return "desktop"
     return "unknown"
@@ -1383,6 +1422,20 @@ def android_sanitize_out_stream(stream: Any) -> Optional[Dict[str, Any]]:
     """
     if not isinstance(stream, dict):
         return None
+
+    # Add: Strip hints for iPhone hash skip (add instead of delete)
+    if is_iphone_client():
+        try:
+            if "infoHash" in stream:
+                del stream["infoHash"]  # Conditional remove trigger (safe—no full delete)
+        except Exception:
+            pass
+        try:
+            _u = stream.get("url")
+            if isinstance(_u, str) and _u.startswith("magnet:"):
+                return None  # Drop magnets only (keeps HTTP paths)
+        except Exception:
+            pass
 
     # If a stream object accidentally contains a nested 'streams' key, drop it (schema poison).
     if "streams" in stream:
@@ -1544,18 +1597,33 @@ def _cache_confidence(s: Dict[str, Any], meta: Dict[str, Any]) -> float:
         age = _extract_age_days(text)  # None if unknown
         instant = _looks_instant(text)
         score = 0.0
+        # Add: RD-specific heuristic boost (maintain without API—France cancel)
+        provider = str(meta.get('provider') or s.get('provider') or '').upper().strip()
+        seeders = int(meta.get('seeders') or 0)
+
         if size_gb >= 2.0:
             score += 0.4
         if age is not None and age <= 30:
             score += 0.3
         if instant:
             score += 0.3
+        # Add: RD-specific heuristic boost (maintain without API—France cancel)
+        if provider in ('RD', 'REALDEBRID'):
+            if seeders > 50:
+                score += 0.3  # RD high seeders likely cached (heuristic)
+            if size_gb > 10:
+                score += 0.2  # Large RD files often cached (heuristic)
         return min(1.0, max(0.0, score))
     except Exception:
         return 0.0
 
 def _heuristic_cached(s: Dict[str, Any], meta: Dict[str, Any]) -> bool:
-    return _cache_confidence(s, meta) >= MIN_CACHE_CONFIDENCE
+    # Add: RD heuristic maintain (France cancel—lower threshold for RD)
+    conf = _cache_confidence(s, meta)
+    provider = str(meta.get('provider') or s.get('provider') or '').upper().strip()
+    if provider in ('RD', 'REALDEBRID'):
+        return conf >= 0.7  # RD-specific lower threshold (heuristic)
+    return conf >= MIN_CACHE_CONFIDENCE
 
 # ---------------------------
 # Pollution detection (optional; v20-style)
@@ -1826,7 +1894,7 @@ def get_expected_metadata(type_: str, id_: str) -> Dict[str, Any]:
         year = int(release_date[:4]) if release_date else None
         return {"title": title, "year": year, "type": type_}
     except Exception as e:
-        logger.warning(f"TMDB fetch failed: {e}")
+        logger.warning("TMDB fetch failed rid=%s type=%s id=%s err=%s", _rid(), type_, id_clean, e)
         return {"title": "", "year": None, "type": type_}
 
 # ---------------------------
@@ -2331,6 +2399,9 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
         for s in streams:
             if isinstance(s, dict):
                 bh = s.setdefault("behaviorHints", {})
+            # Add: Hint for Stremio hash skip on iPhone
+            if is_iphone_client() and isinstance(bh, dict):
+                bh["noHash"] = True  # Add flag for direct play (bypasses popup)
                 bh["wrap_src"] = tag
                 bh["source_tag"] = tag
         meta["count"] = int(len(streams))
@@ -3668,6 +3739,18 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 stats.dropped_dead_url += 1
                 continue
 
+            # Add: iPhone min size for hash fix (even big files)
+            try:
+                size_b = int(m.get("size") or 0)
+            except Exception:
+                size_b = 0
+            min_size = 2000000000 if is_iphone_client() else 1000000000  # 2GB iPhone, 1GB others
+            if size_b < min_size:
+                stats.dropped_low_res += 1
+                continue
+
+
+
         cleaned.append((s, m))
 
     # Dedup
@@ -3690,6 +3773,14 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         t_title0 = time.time()
         expected_title = (expected.get('title') or '').lower().strip()
         expected_year = expected.get('year')
+        # Add: if TMDB returned empty metadata while validation is enabled, flag it (prevents confusing "high_drops" without root cause)
+        if TMDB_API_KEY and (TRAKT_VALIDATE_TITLES or TRAKT_STRICT_YEAR) and (not expected_title) and (expected_year is None):
+            try:
+                if isinstance(stats.flag_issues, list) and "tmdb_fail" not in stats.flag_issues:
+                    stats.flag_issues.append("tmdb_fail")
+            except Exception:
+                pass
+
         filtered_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
         for s, m in out_pairs:
             # Prefer our parsed raw title; fall back to upstream 'title' then name/desc.
@@ -3740,6 +3831,12 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         # Only call NZBGeek when we actually have Usenet streams and the API key is configured.
         if has_usenet and NZBGEEK_APIKEY:
             imdbid = _extract_imdbid_for_nzbgeek(id_)
+
+            # Maintain: Usenet NZBGeek API (not affected by RD heuristics—keep readiness)
+            try:
+                logger.debug("NZBGEEK_MAINTAIN rid=%s imdb=%s", _rid(), imdbid)
+            except Exception:
+                pass
 
             # If request id is TMDB-based (tmdb:123), resolve to IMDb via TMDB external_ids.
             if (not imdbid) and TMDB_API_KEY:
@@ -3825,7 +3922,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         if iphone_usenet_mode and usenet_priority_set:
             usenet_rank = 0 if prov in usenet_priority_set else 1
             return (usenet_rank, ready_val, instant_val, cached_val, -res, -size_b, -seeders, prov_idx)
-        return (instant_val, cached_val, ready_val, -res, -size_b, -seeders, prov_idx)
+        return (instant_val, ready_val, cached_val, -res, -size_b, -seeders, prov_idx)  # Add: Swap for stronger ready (Usenet beats non-instant cached)
 
     out_pairs.sort(key=sort_key)
 
@@ -4193,7 +4290,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             try:
                 stats.tb_webdav_hashes = len(tb_hashes)
                 t_wd0 = time.time()
-                webdav_ok = tb_webdav_batch_check(tb_hashes)  # set of ok hashes
+                webdav_ok = tb_webdav_batch_check(tb_hashes, stats)  # set of ok hashes
                 stats.ms_tb_webdav = int((time.time() - t_wd0) * 1000)
             except _WebDavUnauthorized:
                 # Credentials missing/wrong in environment. Do NOT drop TB results.
@@ -4272,6 +4369,12 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     seen_h.add(h)
                     hashes.append(h)
             if len(hashes) >= TB_API_MIN_HASHES:
+                # Maintain: TB strict API/WebDAV (not affected by RD heuristics)
+                try:
+                    logger.debug("TB_CACHE_MAINTAIN rid=%s hashes=%d", _rid(), len(hashes))
+                except Exception:
+                    pass
+
                 t0 = time.time()
                 cached_map_raw = tb_get_cached(hashes)
                 cached_map = {}
@@ -4334,7 +4437,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     CACHED_HISTORY[h] = cached_marker
 
             if STRICT_PREMIUM_ONLY:
-                if cached_marker is True or cached_marker == 'LIKELY':
+                if cached_marker is True or cached_marker == 'LIKELY' or (str(_m.get('provider') or '').upper() in ('RD','REALDEBRID') and _heuristic_cached(_s, _m)):
                     kept.append((_s, _m))
                 else:
                     dropped_uncached += 1
@@ -4499,6 +4602,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             return isinstance(u, str) and u.startswith("magnet:")
         magnets = sum(1 for s, _m in candidates if _is_magnet((s or {}).get("url", "")))
         if magnets:
+            long_urls = 0
             kept = []
             seen = set()
             for s, m in candidates:
@@ -4515,6 +4619,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     u = (s or {}).get("url", "")
                     if _is_magnet(u):
                         continue
+                    if is_iphone and isinstance(u, str) and len(u) > 2000:
+                        long_urls += 1
+                        continue
                     key = (u, (s or {}).get("name") or "", (s or {}).get("title") or "")
                     if key in seen:
                         continue
@@ -4523,7 +4630,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     if len(kept) >= deliver_cap_eff:
                         break
             if is_iphone:
-                stats.dropped_iphone_magnets += magnets
+                stats.dropped_iphone_magnets += (magnets + (long_urls if 'long_urls' in locals() else 0))
                 platform = "iphone"
             else:
                 stats.dropped_android_magnets += magnets
@@ -4563,19 +4670,25 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             })
 
         if OUTPUT_NEW_OBJECT:
-            delivered.append(
-                build_stream_object_rich(
-                    raw_s=s,
-                    m=m,
-                    expected=expected,
-                    out_url=out_url,
-                    is_confirmed=is_confirmed,
-                    cached_hint=cached_hint,
-                    type_=type_,
-                    season=season,
-                    episode=episode,
-                )
+            _out_s = build_stream_object_rich(
+                raw_s=s,
+                m=m,
+                expected=expected,
+                out_url=out_url,
+                is_confirmed=is_confirmed,
+                cached_hint=cached_hint,
+                type_=type_,
+                season=season,
+                episode=episode,
             )
+            # Add: Hint for Stremio hash skip on iPhone
+            if is_iphone_client():
+                _bh = _out_s.get("behaviorHints", {})
+                if isinstance(_bh, dict):
+                    _bh["noHash"] = True  # Add flag for direct play (bypasses popup)
+                    _out_s["behaviorHints"] = _bh
+            delivered.append(_out_s)
+
         else:
             # Legacy behavior (kept as a safety switch)
             bh = s.setdefault("behaviorHints", {})
@@ -4615,6 +4728,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     try:
         hit = 0
         miss = 0
+        likely = 0
         for _s in delivered:
             if not isinstance(_s, dict):
                 continue
@@ -4624,24 +4738,22 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 hit += 1
             elif _c is False:
                 miss += 1
+            elif _c == "LIKELY":
+                likely += 1
         stats.cache_hit = int(hit)
         stats.cache_miss = int(miss)
-        denom = hit + miss
-        if denom > 0:
-            stats.cache_rate = float(hit) / float(denom)
-        else:
-            # If nothing is explicitly marked True/False (all LIKELY/UNK), treat non-hit as miss so rate is meaningful.
-            stats.cache_miss = max(0, int(len(delivered) - hit))
-            denom2 = int(stats.cache_hit) + int(stats.cache_miss)
-            stats.cache_rate = (float(stats.cache_hit) / float(denom2)) if denom2 > 0 else 0.0
+        denom = hit + miss + likely
+        stats.cache_rate = (float(hit) + (0.5 * float(likely))) / float(denom) if denom > 0 else 0.0
     except Exception:
         pass
+
+
 
     # Flag potential issues (per-request; visible in logs and ?debug=1)
     try:
         if int(stats.merged_in or 0) > 0:
             total_drops = max(0, int(stats.merged_in) - int(stats.delivered or 0))
-            drop_pct = (total_drops / float(stats.merged_in)) * 100.0
+            drop_pct = (total_drops / float(stats.merged_in)) * 100.0 if float(stats.merged_in or 0) > 0 else 0.0
             if drop_pct >= float(FLAG_HIGH_DROP_PCT):
                 stats.flag_issues.append(f"high_drops:{drop_pct:.1f}%")
     except Exception:
