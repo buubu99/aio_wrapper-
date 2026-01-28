@@ -3778,7 +3778,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # Sorting: quality-first GLOBAL sort AFTER merge/dedup.
     # Order: (iPhone usenet) ready > instant > cached > res > size > seeders > provider.
-    # (general) instant > cached > res > ready > size > seeders > provider.
+    # (general) instant > cached > ready > res > size > seeders > provider.
     # This prevents provider-append "burial" and surfaces best quality first.
     def sort_key(pair: Tuple[Dict[str, Any], Dict[str, Any]]):
         s, m = pair
@@ -3825,7 +3825,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         if iphone_usenet_mode and usenet_priority_set:
             usenet_rank = 0 if prov in usenet_priority_set else 1
             return (usenet_rank, ready_val, instant_val, cached_val, -res, -size_b, -seeders, prov_idx)
-        return (instant_val, cached_val, -res, ready_val, -size_b, -seeders, prov_idx)
+        return (instant_val, cached_val, ready_val, -res, -size_b, -seeders, prov_idx)
 
     out_pairs.sort(key=sort_key)
 
@@ -4689,7 +4689,7 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.20",
+            "version": "1.0.21",
             "name": f"AIO Wrapper (Rich Output, 2 Lines Left) 9.1 v4.4.1 [{cfg}]",
             "description": "Merges 2 providers and outputs a brand-new, strict-client-safe stream schema with rich AIOStreams-style emoji formatting (2-line left column).",
             "resources": ["stream"],
