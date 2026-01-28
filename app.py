@@ -2401,11 +2401,11 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
         streams = (data.get("streams") or [])[:INPUT_CAP]
         # Lightweight tagging for debug (does not expose tokens)
         for s in streams:
-            if isinstance(s, dict):
-                bh = s.setdefault("behaviorHints", {})
-            # Add: Hint for Stremio hash skip on iPhone
-            if is_iphone_client() and isinstance(bh, dict):
-                bh["noHash"] = True  # Add flag for direct play (bypasses popup)
+            if not isinstance(s, dict):
+                continue
+            bh = s.setdefault("behaviorHints", {})
+            if isinstance(bh, dict):
+                # Always tag supplier (AIO/P2) for downstream counters/debug.
                 bh["wrap_src"] = tag
                 bh["source_tag"] = tag
         meta["count"] = int(len(streams))
@@ -2500,6 +2500,11 @@ def try_fastlane(*, prov2_fut, aio_fut, aio_key: str, prov2_url: str, aio_url: s
     # Android normal path: do not fastlane-return Prov2-only; wait for AIO merge.
     # (Android clients were getting usenet-only results when fastlane returned early.)
     if is_android and not is_iphone:
+        return None
+
+    # iPhone mixed mode: do not fastlane-return Prov2-only; wait for AIO merge so premium/debrid streams can join.
+    # (Prov2 is often usenet-only; fastlane here would incorrectly yield 0 debrid on iPhone.)
+    if is_iphone and not IPHONE_USENET_ONLY:
         return None
     # Cap how long we wait for Prov2 before deciding. We never block on AIO here.
     try:
@@ -2606,6 +2611,11 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
 
     if AIO_BASE and not iphone_usenet_mode:
         aio_fut = FETCH_EXECUTOR.submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, upstream_id, AIO_TAG, (ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT))
+    elif iphone_usenet_mode:
+        logger.info("AIO skipped rid=%s reason=iphone_usenet_only", _rid())
+    else:
+        aio_meta = {'tag': AIO_TAG, 'ok': False, 'err': 'no_base'}
+        logger.warning("AIO disabled rid=%s reason=no_base", _rid())
     if PROV2_BASE:
         p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, upstream_id, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT))
     # Fastlane: Prov2-only early return if it's already good enough (does not wait on AIO).
@@ -3532,7 +3542,14 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 if isinstance(bh, dict):
                     prov = (bh.get("provider") or "")
                 if not prov:
-                    n = (_s.get("name") or "")
+                    n = (_s.get("name") or "") + " " + (_s.get("description") or "")
+                    # Include filename too (many formatters put provider tokens there)
+                    try:
+                        _bh2 = _s.get("behaviorHints") or {}
+                        if isinstance(_bh2, dict):
+                            n += " " + str(_bh2.get("filename") or "")
+                    except Exception:
+                        pass
                     nu = n.upper()
                     # prefer formatter-injected shortName tokens; keep word boundaries to avoid HDR->RD.
                     m_sn = re.search(r"\b(TB|TORBOX|RD|REAL[- ]?DEBRID|AD|ALLDEBRID|DL|DEBRIDLINK|ND|NZB|USENET)\b", nu)
@@ -3582,8 +3599,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             for _p, _arr in groups.items():
                 _arr.sort(key=lambda _s: (_quick_res_int(_s), _quick_seeders(_s)), reverse=True)
 
-            # iPhone clients are typically usenet-only; don't waste EARLY_CAP slots on debrid providers.
-            if is_iphone and "ND" in groups and len(groups["ND"]) >= EARLY_CAP:
+            # iPhone *usenet-only mode* (IPHONE_USENET_ONLY=true): don't waste EARLY_CAP slots on debrid providers.
+            if iphone_usenet_mode and "ND" in groups and len(groups["ND"]) >= EARLY_CAP:
                 streams = groups["ND"][:EARLY_CAP]
                 logger.info(
                     "EARLY_CAP_IPHONE rid=%s capped=%d original=%d nd=%d",
@@ -3748,7 +3765,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 size_b = int(m.get("size") or 0)
             except Exception:
                 size_b = 0
-            min_size = 2000000000 if is_iphone_client() else 1000000000  # 2GB iPhone, 1GB others
+            min_size = 2000000000 if is_iphone else 1000000000  # 2GB iPhone, 1GB others
             if size_b < min_size:
                 stats.dropped_low_res += 1
                 continue
@@ -3903,8 +3920,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         else:
             cached_val = 1.0 if (prov in usenet_provs) else 2.0
 
-        # Optional: on iPhone/iPad, prefer usenet (PROV2) slightly to avoid iOS torrent edge cases
-        if is_iphone and (prov in usenet_provs):
+        # Optional (usenet-only mode): prefer usenet slightly to avoid iOS torrent edge cases
+        if iphone_usenet_mode and (prov in usenet_provs):
             cached_val = min(cached_val, 0.1)
 
         # "Instant / ready-to-play" signal (preferred over provider priority).
@@ -4028,7 +4045,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # --- Premium mix (Android/Desktop): prevent a single debrid provider from dominating the top list
     # when multiple premium providers are present (e.g., TB + RD). This helps avoid "all green" / "all red"
     # swings when upstream ordering/caps change.
-    if (not is_iphone) and deliver_cap_eff >= 20 and len(PREMIUM_PRIORITY) >= 2:
+    if (not iphone_usenet_mode) and deliver_cap_eff >= 20 and len(PREMIUM_PRIORITY) >= 2:
         present_provs: set[str] = set()
         for _s, _m in out_pairs:
             pp = (_m.get("provider") or "").upper()
@@ -4087,7 +4104,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # --- Streak mix (Android/Desktop): break up long same-provider runs (esp. Usenet) without destroying quality order.
     # This prevents situations where, after an initial "mix head", a long NZB/ND block pushes high-quality RD/TB items
     # to the very end of the delivered slice.
-    if (not is_iphone) and out_pairs and deliver_cap_eff >= 20:
+    if (not iphone_usenet_mode) and out_pairs and deliver_cap_eff >= 20:
         try:
             from collections import deque
 
@@ -4542,7 +4559,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     slice_ = new_slice[:deliver_cap_eff]
             candidates = slice_ + candidates[deliver_cap_eff:]    # Android/Google TV clients can't handle magnet: links; drop them and backfill with direct URLs.
     # Premium mix: optionally ensure TB/RD representation in the first deliver_cap_eff
-    if (MIN_TB_DELIVER or MIN_RD_DELIVER) and (not is_iphone):
+    if (MIN_TB_DELIVER or MIN_RD_DELIVER) and (not iphone_usenet_mode):
         def _prov_of(pair):
             return (pair[1].get("provider") or "").upper()
 
@@ -4686,7 +4703,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 episode=episode,
             )
             # Add: Hint for Stremio hash skip on iPhone
-            if is_iphone_client():
+            if is_iphone:
                 _bh = _out_s.get("behaviorHints", {})
                 if isinstance(_bh, dict):
                     _bh["noHash"] = True  # Add flag for direct play (bypasses popup)
@@ -4953,7 +4970,12 @@ def stream(type_: str, id_: str):
         # Provider anomalies (useful when env changes)
         try:
             if AIO_BASE and int(stats.aio_in or 0) == 0:
-                stats.flag_issues.append("aio_empty")
+                if is_iphone and IPHONE_USENET_ONLY:
+                    stats.flag_issues.append("aio_skipped_iphone")
+                else:
+                    stats.flag_issues.append("aio_empty")
+            if not AIO_BASE:
+                stats.flag_issues.append("aio_no_base")
             if PROV2_BASE and int(stats.prov2_in or 0) == 0:
                 stats.flag_issues.append("p2_empty")
         except Exception:
