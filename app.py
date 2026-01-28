@@ -2530,9 +2530,9 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
     p2_fut = None
 
     if AIO_BASE and not iphone_usenet_mode:
-        aio_fut = FETCH_EXECUTOR.submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, id_, AIO_TAG, (ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT))
+        aio_fut = FETCH_EXECUTOR.submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, upstream_id, AIO_TAG, (ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT))
     if PROV2_BASE:
-        p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, id_, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT))
+        p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, upstream_id, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT))
     # Fastlane: Prov2-only early return if it's already good enough (does not wait on AIO).
     fl = try_fastlane(
         prov2_fut=p2_fut,
@@ -4689,8 +4689,8 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.19",
-            "name": f"AIO Wrapper (Rich Output, 2 Lines Left) 9.1 [{cfg}]",
+            "version": "1.0.20",
+            "name": f"AIO Wrapper (Rich Output, 2 Lines Left) 9.1 v4.4.1 [{cfg}]",
             "description": "Merges 2 providers and outputs a brand-new, strict-client-safe stream schema with rich AIOStreams-style emoji formatting (2-line left column).",
             "resources": ["stream"],
             "types": ["movie", "series"],
