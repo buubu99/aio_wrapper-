@@ -94,6 +94,12 @@ class PipeStats:
     error_reasons: List[str] = field(default_factory=list)
     flag_issues: List[str] = field(default_factory=list)
 
+
+    @property
+    def platform(self) -> str:
+        """Backward-compatible alias for older log strings that expect stats.platform."""
+        return self.client_platform
+
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
@@ -4018,7 +4024,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 similarity = sim_show if sim_show >= sim_ep else sim_ep
                 if similarity < TRAKT_TITLE_MIN_RATIO:
                     logger.debug(
-                        f"TITLE_MISMATCH platform={stats.platform} type={type_} id={id_} cand={cand_cmp!r} "
+                        f"TITLE_MISMATCH platform={stats.client_platform} type={type_} id={id_} cand={cand_cmp!r} "
                         f"show={show_cmp!r} ep={ep_cmp!r} sim_show={sim_show:.3f} sim_ep={sim_ep:.3f} min={TRAKT_TITLE_MIN_RATIO}"
                     )
                     stats.dropped_title_mismatch += 1
