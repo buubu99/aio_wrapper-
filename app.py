@@ -4,9 +4,6 @@ import hashlib
 import html as _html
 import json
 import logging
-
-# Pre-init logger so it is safe to use during module import (before logging config below).
-logger = logging.getLogger("aio-wrapper")
 import os
 import re
 import time
@@ -161,7 +158,7 @@ AIO_URL = os.environ.get("AIO_URL", "")
 # Preserves token-in-path URLs while stripping any trailing /manifest.json.
 AIO_BASE = _normalize_base(os.environ.get("AIO_BASE", "") or AIO_URL)
 # can be base url or .../manifest.json
-AIO_AUTH = os.environ.get("AIOSTREAMS_AUTH", os.environ.get("AIO_AUTH", ""))  # "user:pass" (accept legacy AIO_AUTH)
+AIO_AUTH = os.environ.get("AIOSTREAMS_AUTH", "")  # "user:pass"
 AIOSTREAMS_AUTH = AIO_AUTH  # backward-compat alias
 # Optional second provider (another AIOStreams-compatible addon)
 PROV2_URL = os.environ.get("PROV2_URL", "")
@@ -219,7 +216,7 @@ TB_BATCH_SIZE = _safe_int(os.environ.get('TB_BATCH_SIZE', '50'), 50)
 TB_MAX_HASHES = _safe_int(os.environ.get('TB_MAX_HASHES', '60'), 60)  # limit hashes checked per request for speed
 TB_API_MIN_HASHES = _safe_int(os.environ.get('TB_API_MIN_HASHES', '20'), 20)  # skip TorBox API calls if fewer hashes
 TB_CACHE_HINTS = _parse_bool(os.environ.get("TB_CACHE_HINTS", "true"), True)  # enable TorBox cache hint lookups
-TB_USENET_CHECK = _parse_bool(os.environ.get("TB_USENET_CHECK", os.environ.get("TB_USENET_CACHE", "false")), False)  # optional usenet cache checks (accept legacy TB_USENET_CACHE)
+TB_USENET_CHECK = _parse_bool(os.environ.get("TB_USENET_CHECK", "false"), False)  # optional usenet cache checks (requires identifiers)
 REQUEST_TIMEOUT = _safe_float(os.environ.get('REQUEST_TIMEOUT', '30'), 30.0)
 # Stream response cache TTL exposed to Stremio clients (seconds)
 CACHE_TTL = _safe_int(os.environ.get('CACHE_TTL', '600'), 600)
@@ -255,7 +252,7 @@ PREFERRED_LANG = os.environ.get("PREFERRED_LANG", "EN").upper()
 PREMIUM_PRIORITY = _safe_csv(os.environ.get('PREMIUM_PRIORITY', 'TB,RD,AD,ND'))
 USENET_PRIORITY = _safe_csv(os.environ.get('USENET_PRIORITY', 'ND,EW,NG'))
 # Original: IPHONE_USENET_ONLY = _parse_bool(os.environ.get("IPHONE_USENET_ONLY", "true"), True)
-IPHONE_USENET_ONLY = _parse_bool(os.environ.get("IPHONE_USENET_ONLY", "false"), False)  # default mixed (P1+P2); set true for usenet-only on iPhone
+IPHONE_USENET_ONLY = False  # Add: Enable debrid HTTP on iPhone (short paths only, no magnets—fixes hash with cached streams)
 USENET_PROVIDERS = _safe_csv(os.environ.get("USENET_PROVIDERS", ",".join(USENET_PRIORITY) if USENET_PRIORITY else "ND,EW,NG"))
 USENET_SEEDER_BOOST = _safe_int(os.environ.get('USENET_SEEDER_BOOST', '10'), 10)
 INSTANT_BOOST_TOP_N = _safe_int(os.environ.get('INSTANT_BOOST_TOP_N', '0'), 0)  # 0=off; set in Render if wanted
@@ -265,7 +262,7 @@ CANDIDATE_WINDOW_MULT = _safe_int(os.environ.get('CANDIDATE_WINDOW_MULT', '10'),
 DIVERSITY_THRESHOLD = _safe_float(os.environ.get('DIVERSITY_THRESHOLD', '0.85'), 0.85)  # quality guard for diversity (0.0-1.0)
 P2_SRC_BOOST = _safe_int(os.environ.get('P2_SRC_BOOST', '5'), 5)  # slight preference for P2 when diversifying
 INPUT_CAP_PER_SOURCE = _safe_int(os.environ.get('INPUT_CAP_PER_SOURCE', '0'), 0)  # 0=off; per-supplier cap if set
-DL_ASSOC_PARSE = _parse_bool(os.environ.get('DL_ASSOC_PARSE', os.environ.get('DL_ASOC_PARSE', 'true')), True)  # default true; accepts legacy DL_ASOC_PARSE
+DL_ASSOC_PARSE = _parse_bool(os.environ.get('DL_ASSOC_PARSE', 'true'), True)  # default true; set false in Render to disable
 VERIFY_PREMIUM = _parse_bool(os.environ.get("VERIFY_PREMIUM", "true"), True)
 ASSUME_PREMIUM_ON_FAIL = _parse_bool(os.environ.get("ASSUME_PREMIUM_ON_FAIL", "false"), False)
 POLL_ATTEMPTS = _safe_int(os.environ.get('POLL_ATTEMPTS', '2'), 2)
@@ -1714,7 +1711,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
 
     # Provider (prefer formatter-injected shortName tokens; keep word boundaries to avoid HDR->RD)
     provider = "UNK"
-    m_sn = re.search(r"\b(TB|TORBOX|RD|REAL[- ]?DEBRID|REALDEBRID|PM|PREMIUMIZE|AD|ALLDEBRID|DL|DEBRID[- ]?LINK|ND|NZBDAV|EW|EWEKA|NG|NZGEEK)\b", text, re.I)
+    m_sn = re.search(r"\b(TB|TORBOX|RD|REAL[- ]?DEBRID|REALDEBRID|PM|PREMIUMIZE|AD|ALLDEBRID|DEBRID[- ]?LINK|ND|NZBDAV|EW|EWEKA|NG|NZGEEK)\b", text, re.I)
     if m_sn:
         tok = m_sn.group(1).upper().replace(' ', '').replace('-', '')
         provider_map = {
@@ -1734,7 +1731,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     #   NOT from WEB-DL release tags.
     # - If Debrid-Link and a base provider token is also present, label as DL-<BASE> (e.g., DL-TB) for logging clarity.
     up = text.upper()
-    has_debridlink = bool(re.search(r"\bDEBRID[- ]?LINK\b", text, re.I) or ("🟢DL" in up))
+    has_debridlink = bool(re.search(r"\bDEBRID[- ]?LINK\b", up, re.I) or re.search(r"[🟢🟡🟠🔵🔴🟣]\s*DL\b", up))
     has_webdl = bool(re.search(r"\bWEB-?DL\b", text, re.I))
     # Detect associated base provider independently
     m_assoc = re.search(r"\b(TB|TORBOX|RD|REAL[- ]?DEBRID|REALDEBRID|AD|ALLDEBRID|ALL[- ]?DEBRID|PM|PREMIUMIZE|ND|NZBDAV|EW|EWEKA|NG|NZGEEK)\b", text, re.I)
@@ -1798,7 +1795,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
             provider = "RD"
         elif "🟢AD" in up or re.search(r"(?<![A-Z0-9])AD(?![A-Z0-9])", up):
             provider = "AD"
-        elif "🟢DL" in up or re.search(r"(?<![A-Z0-9])DL(?![A-Z0-9])", up):
+        elif re.search(r"\bDEBRID[- ]?LINK\b", up, re.I) or re.search(r"[🟢🟡🟠🔵🔴🟣]\s*DL\b", up):
             provider = "DL"
         elif "USENET" in up or "NZB" in up or "NZBDAV" in up:
             provider = "ND"
@@ -2462,7 +2459,7 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
 
 
 # ---------- FASTLANE (Patch 3): shared fetch executor + AIO cache ----------
-WRAP_FETCH_WORKERS = max(1, _safe_int(os.getenv("WRAP_FETCH_WORKERS", os.getenv("FETCH_WORKERS", "8")), 8))  # accepts legacy FETCH_WORKERS
+WRAP_FETCH_WORKERS = int(os.getenv("WRAP_FETCH_WORKERS", "8") or 8)
 FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=WRAP_FETCH_WORKERS)
 
 AIO_CACHE_TTL_S = int(os.getenv("AIO_CACHE_TTL_S", "600") or 600)   # 0 disables cache
@@ -3594,7 +3591,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                         pass
                     nu = n.upper()
                     # prefer formatter-injected shortName tokens; keep word boundaries to avoid HDR->RD.
-                    m_sn = re.search(r"\b(TB|TORBOX|RD|REAL[- ]?DEBRID|AD|ALLDEBRID|DL|DEBRIDLINK|ND|NZB|USENET)\b", nu)
+                    m_sn = re.search(r"\b(TB|TORBOX|RD|REAL[- ]?DEBRID|AD|ALLDEBRID|DEBRIDLINK|ND|NZB|USENET)\b", nu)
                     if m_sn:
                         tok = m_sn.group(1)
                         if tok in ("TORBOX", "TB"):
@@ -3603,7 +3600,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                             prov = "RD"
                         elif tok in ("ALLDEBRID", "AD"):
                             prov = "AD"
-                        elif tok in ("DEBRIDLINK", "DL"):
+                        elif tok == "DEBRIDLINK":
                             prov = "DL"
                         elif tok in ("ND", "NZB", "USENET"):
                             prov = "ND"
