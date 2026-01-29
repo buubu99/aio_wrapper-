@@ -428,6 +428,48 @@ def normalize_label(label: str) -> str:
     return s
 
 
+
+
+# --- Title normalization for mismatch checks (used by TRAKT/TMDB validation) ---
+# Keeps compare strings stable by stripping common release noise (resolution, codec, source, audio, groups, etc.)
+_TITLE_NOISE_RE = re.compile(
+    r"""(?ix)
+    \b(
+        s\d{1,2}e\d{1,2} | \d{1,2}x\d{1,2} | episode\s*\d{1,3} |
+        480p|576p|720p|1080p|1440p|2160p|4320p|4k|8k|
+        hdr10\+?|hdr|dv|dovi|dolby\s*vision|sdr|
+        bluray|blu[-\s]?ray|bdrip|bdremux|remux|web[-\s]?dl|webrip|hdtv|dvdrip|
+        x264|x265|h\.264|h\.265|hevc|avc|vp9|av1|
+        aac|ac3|eac3|ddp|dts(?:-hd)?|truehd|atmos|opus|flac|mp3|
+        2\.0|5\.1|7\.1|stereo|
+        multi|dual\s*audio|dub(?:bed)?|sub(?:bed)?|eng|english|
+        proper|repack|internal|extended|unrated|limited|imax|
+        (?:19|20)\d{2} |
+        mkv|mp4|avi
+    )\b
+    """
+)
+
+
+def clean_title_for_compare(title: str) -> str:
+    """Normalize a title string for fuzzy matching (difflib)."""
+    if not title:
+        return ""
+    t = str(title)
+    t = t.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    t = t.lower()
+    # Drop bracketed bits: [..] (..)
+    t = re.sub(r"\[[^\]]*\]", " ", t)
+    t = re.sub(r"\([^\)]*\)", " ", t)
+    # Convert punctuation/separators to spaces
+    t = re.sub(r"[\._\-/]+", " ", t)
+    # Remove known release noise tokens
+    t = _TITLE_NOISE_RE.sub(" ", t)
+    # Keep only letters/digits/spaces
+    t = re.sub(r"[^a-z0-9 ]+", " ", t)
+    # Collapse whitespace
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 def _human_size_bytes(n: int) -> str:
     try:
         n = int(n or 0)
