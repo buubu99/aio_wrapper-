@@ -205,6 +205,7 @@ NAME_SINGLE_LINE = _parse_bool(os.environ.get("NAME_SINGLE_LINE", "true"), True)
 TRAKT_VALIDATE_TITLES = _parse_bool(os.environ.get("TRAKT_VALIDATE_TITLES", "true"), True)
 TRAKT_TITLE_MIN_RATIO = _safe_float(os.environ.get('TRAKT_TITLE_MIN_RATIO', '0.65'), 0.65)
 TRAKT_STRICT_YEAR = _parse_bool(os.environ.get("TRAKT_STRICT_YEAR", "false"), False)
+TRAKT_CLIENT_ID = (os.environ.get('TRAKT_CLIENT_ID') or '').strip()
 
 # Validation/testing toggles
 VALIDATE_OFF = _parse_bool(os.environ.get("VALIDATE_OFF", "false"), False)  # pass-through for format testing
@@ -1919,77 +1920,108 @@ def api_key_for_provider(provider: str) -> str:
 # ---------------------------
 @lru_cache(maxsize=2000)
 def get_expected_metadata(type_: str, id_: str) -> dict:
-    """Fetch expected metadata from TMDB.
+    """Fetch expected metadata for title/year validation and nicer series labels.
 
-    Supports:
-      - IMDb ids: tt1234567 (movies) and tt1234567:season:episode (series)
-      - TMDB numeric ids: 12345 (movie or tv based on type_)
-      - tmdb:12345[:season:episode]
-    Returns keys: title, year, type, tmdb_id, episode_title, season, episode
+    Supports Stremio ids like:
+      - movie:  tt0111161
+      - series: tt0944947:1:1
+      - tmdb:   tmdb:1399:1:1 (optional)
+      - numeric tmdb: 1399 (optional)
+
+    Prefers Trakt (if TRAKT_CLIENT_ID set) and falls back to TMDB (/find for IMDb ids).
     """
+    if not (TRAKT_CLIENT_ID or TMDB_API_KEY):
+        return {"title": "", "year": None, "tmdb_id": None, "episode_title": "", "season": None, "episode": None, "source": ""}
+
+    parts = (id_ or "").split(":")
+    base = parts[0] if parts else ""
+    season = episode = None
+    tmdb_id = None
+    imdb_id = None
+
+    # Parse stremio id variants
+    try:
+        if base == "tmdb" and len(parts) >= 2 and str(parts[1]).isdigit():
+            tmdb_id = int(parts[1])
+            if len(parts) >= 4 and str(parts[2]).isdigit() and str(parts[3]).isdigit():
+                season, episode = int(parts[2]), int(parts[3])
+        elif str(base).isdigit():
+            tmdb_id = int(base)
+        elif str(base).startswith("tt"):
+            imdb_id = str(base)
+            if len(parts) >= 3 and str(parts[1]).isdigit() and str(parts[2]).isdigit():
+                season, episode = int(parts[1]), int(parts[2])
+    except Exception:
+        pass
+
+    # --- Prefer Trakt (VIP-friendly, no TMDB key required) ---
+    if imdb_id and TRAKT_CLIENT_ID:
+        try:
+            kind = "movie" if type_ == "movie" else "show"
+            headers = {
+                "trakt-api-version": "2",
+                "trakt-api-key": TRAKT_CLIENT_ID,
+                "Content-Type": "application/json",
+            }
+            search_url = f"https://api.trakt.tv/search/imdb/{imdb_id}?type={kind}"
+            r = session.get(search_url, headers=headers, timeout=TMDB_TIMEOUT)
+            data = r.json() if getattr(r, "ok", False) else []
+
+            if isinstance(data, list) and data:
+                obj = data[0].get(kind) if isinstance(data[0], dict) else None
+                if isinstance(obj, dict):
+                    title = (obj.get("title") or "").strip()
+                    year = obj.get("year")
+                    ids = obj.get("ids") or {}
+                    trakt_id = ids.get("trakt") or ids.get("slug")
+                    ep_title = ""
+
+                    # Pull TMDB id from Trakt ids if present (useful for fallback/telemetry)
+                    tmdb_from_trakt = ids.get("tmdb")
+                    if tmdb_id is None and tmdb_from_trakt and str(tmdb_from_trakt).isdigit():
+                        tmdb_id = int(tmdb_from_trakt)
+
+                    # Canonical EN episode title (series only)
+                    if type_ == "series" and season is not None and episode is not None and trakt_id:
+                        ep_url = f"https://api.trakt.tv/shows/{trakt_id}/seasons/{season}/episodes/{episode}"
+                        r2 = session.get(ep_url, headers=headers, timeout=TMDB_TIMEOUT)
+                        ep = r2.json() if getattr(r2, "ok", False) else {}
+                        if isinstance(ep, dict):
+                            ep_title = (ep.get("title") or "").strip()
+
+                    return {
+                        "title": title,
+                        "year": int(year) if str(year).isdigit() else year,
+                        "tmdb_id": tmdb_id,
+                        "episode_title": ep_title,
+                        "season": season,
+                        "episode": episode,
+                        "source": "trakt",
+                    }
+        except Exception as e:
+            logger.warning(f"TRAKT_EXPECTED_META_FAIL type={type_} id={id_}: {e}")
+
+    # --- TMDB fallback (handles tmdb ids and IMDb via /find) ---
     if not TMDB_API_KEY:
-        return {
-            "title": "",
-            "year": None,
-            "type": "",
-            "tmdb_id": None,
-            "episode_title": "",
-            "season": None,
-            "episode": None,
-        }
+        return {"title": "", "year": None, "tmdb_id": tmdb_id, "episode_title": "", "season": season, "episode": episode, "source": ""}
 
     try:
-        parts = (id_ or "").split(":")
-        base = parts[0] if parts else ""
-        season = episode = None
-        tmdb_id = None
-        imdb_id = None
-
-        # tmdb:12345:1:1 form
-        if base == "tmdb" and len(parts) >= 2 and parts[1].isdigit():
-            tmdb_id = int(parts[1])
-            if len(parts) >= 4 and parts[2].isdigit() and parts[3].isdigit():
-                season, episode = int(parts[2]), int(parts[3])
-
-        # raw numeric tmdb id
-        elif base.isdigit():
-            tmdb_id = int(base)
-
-        # imdb id (tt....)
-        elif base.startswith("tt"):
-            imdb_id = base
-            if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
-                season, episode = int(parts[1]), int(parts[2])
-
         # IMDb -> TMDB via /find
         if imdb_id and tmdb_id is None:
-            find_url = (
-                f"https://api.themoviedb.org/3/find/{imdb_id}"
-                f"?api_key={TMDB_API_KEY}&external_source=imdb_id"
-            )
+            find_url = f"https://api.themoviedb.org/3/find/{imdb_id}?api_key={TMDB_API_KEY}&external_source=imdb_id"
             r = session.get(find_url, timeout=TMDB_TIMEOUT)
             j = r.json() if getattr(r, "ok", False) else {}
-
             if type_ == "movie":
                 tmdb_id = (j.get("movie_results") or [{}])[0].get("id")
             else:
                 tmdb_id = (j.get("tv_results") or [{}])[0].get("id")
-
             if tmdb_id is not None and str(tmdb_id).isdigit():
                 tmdb_id = int(tmdb_id)
             else:
                 tmdb_id = None
 
         if tmdb_id is None:
-            return {
-                "title": "",
-                "year": None,
-                "type": "",
-                "tmdb_id": None,
-                "episode_title": "",
-                "season": season,
-                "episode": episode,
-            }
+            return {"title": "", "year": None, "tmdb_id": None, "episode_title": "", "season": season, "episode": episode, "source": "tmdb"}
 
         kind = "movie" if type_ == "movie" else "tv"
         meta_url = f"https://api.themoviedb.org/3/{kind}/{tmdb_id}?api_key={TMDB_API_KEY}&language=en-US"
@@ -2000,42 +2032,25 @@ def get_expected_metadata(type_: str, id_: str) -> dict:
         date_str = (j.get("release_date") if kind == "movie" else j.get("first_air_date")) or ""
         year = int(date_str[:4]) if (len(date_str) >= 4 and date_str[:4].isdigit()) else None
 
-        episode_title = ""
+        ep_title = ""
         if type_ == "series" and season is not None and episode is not None:
-            ep_url = (
-                f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}/episode/{episode}"
-                f"?api_key={TMDB_API_KEY}&language=en-US"
-            )
+            ep_url = f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}/episode/{episode}?api_key={TMDB_API_KEY}&language=en-US"
             r2 = session.get(ep_url, timeout=TMDB_TIMEOUT)
             j2 = r2.json() if getattr(r2, "ok", False) else {}
-            episode_title = (j2.get("name") or "").strip()
+            ep_title = (j2.get("name") or "").strip()
 
         return {
-            "title": title,
+            "title": str(title).strip(),
             "year": year,
-            "type": kind,
             "tmdb_id": tmdb_id,
-            "episode_title": episode_title,
+            "episode_title": ep_title,
             "season": season,
             "episode": episode,
+            "source": "tmdb",
         }
-
     except Exception as e:
         logger.warning(f"TMDB_EXPECTED_META_FAIL type={type_} id={id_}: {e}")
-        return {
-            "title": "",
-            "year": None,
-            "type": "",
-            "tmdb_id": None,
-            "episode_title": "",
-            "season": None,
-            "episode": None,
-        }
-
-
-# ---------------------------
-# Formatting: guaranteed 2-left + 3-right (title + 2 lines)
-# ---------------------------
+        return {"title": "", "year": None, "tmdb_id": tmdb_id, "episode_title": "", "season": season, "episode": episode, "source": "tmdb"}
 def format_stream_inplace(
     s: Dict[str, Any],
     m: Dict[str, Any],
@@ -2087,9 +2102,13 @@ def format_stream_inplace(
     base_title = normalize_display_title(base_title)
     year = expected.get('year')
     ep_tag = f" S{season:02d}E{episode:02d}" if season and episode else ""
-    ep_name = (expected.get('episode_title') or '').strip()
-    ep_name_suffix = f" — {ep_name}" if ep_name else ""
-    s['title'] = _truncate(f"{base_title}{ep_tag}{ep_name_suffix}" + (f" ({year})" if year else ""), MAX_TITLE_CHARS)
+    ep_title = (expected.get('episode_title') or '').strip()
+    if season and episode and ep_title:
+        # Series: Show SxxEyy — Canonical EN episode title (from Trakt/TMDB)
+        s['title'] = _truncate(f"{base_title}{ep_tag} — {ep_title}" + (f" ({year})" if year else ""), MAX_TITLE_CHARS)
+    else:
+        s['title'] = _truncate(f"{base_title}{ep_tag}" + (f" ({year})" if year else ""), MAX_TITLE_CHARS)
+
     # Description: 2 clean lines (or single line if NAME_SINGLE_LINE)
     line1_bits = [p for p in [audio, lang, codec, source] if p]
     line1 = ' • '.join(line1_bits) if line1_bits else res
@@ -3931,26 +3950,37 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     if (not fast_mode) and (not VALIDATE_OFF) and (TRAKT_VALIDATE_TITLES or TRAKT_STRICT_YEAR):
         t_title0 = time.time()
         expected_title = (expected.get('title') or '').lower().strip()
+        expected_ep_title = (expected.get('episode_title') or '').lower().strip()
         expected_year = expected.get('year')
-        # Add: if TMDB returned empty metadata while validation is enabled, flag it (prevents confusing "high_drops" without root cause)
-        if TMDB_API_KEY and (TRAKT_VALIDATE_TITLES or TRAKT_STRICT_YEAR) and (not expected_title) and (expected_year is None):
-            try:
-                if isinstance(stats.flag_issues, list) and "tmdb_fail" not in stats.flag_issues:
-                    stats.flag_issues.append("tmdb_fail")
-            except Exception:
-                pass
-
+        meta_source = (expected.get('source') or '').strip()
+        
+        # Flag empty metadata from the chosen source (helps interpret drops).
+        if (TRAKT_VALIDATE_TITLES or TRAKT_STRICT_YEAR) and (not expected_title) and (not expected_ep_title) and (expected_year is None):
+            if meta_source == 'tmdb' and TMDB_API_KEY:
+                if 'tmdb_fail' not in stats.flag_issues:
+                    stats.flag_issues.append('tmdb_fail')
+            if meta_source == 'trakt' and TRAKT_CLIENT_ID:
+                if 'trakt_fail' not in stats.flag_issues:
+                    stats.flag_issues.append('trakt_fail')
         filtered_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
         for s, m in out_pairs:
             # Prefer our parsed raw title; fall back to upstream 'title' then name/desc.
             cand_title = (m.get('title_raw') or s.get('title') or s.get('name') or '').lower().strip()
 
-            if TRAKT_VALIDATE_TITLES and expected_title and cand_title:
-                similarity = difflib.SequenceMatcher(None, cand_title, expected_title).ratio()
+            if TRAKT_VALIDATE_TITLES and (expected_title or expected_ep_title) and cand_title:
+                cand_cmp = clean_title_for_compare(cand_title)
+                show_cmp = clean_title_for_compare(expected_title) if expected_title else ''
+                ep_cmp = clean_title_for_compare(expected_ep_title) if expected_ep_title else ''
+                sim_show = difflib.SequenceMatcher(None, cand_cmp, show_cmp).ratio() if show_cmp else 0.0
+                sim_ep = difflib.SequenceMatcher(None, cand_cmp, ep_cmp).ratio() if ep_cmp else 0.0
+                similarity = sim_show if sim_show >= sim_ep else sim_ep
                 if similarity < TRAKT_TITLE_MIN_RATIO:
+                    logger.debug(
+                        f"TITLE_MISMATCH platform={stats.platform} type={type_} id={id_} cand={cand_cmp!r} "
+                        f"show={show_cmp!r} ep={ep_cmp!r} sim_show={sim_show:.3f} sim_ep={sim_ep:.3f} min={TRAKT_TITLE_MIN_RATIO}"
+                    )
                     stats.dropped_title_mismatch += 1
                     continue
-
             if TRAKT_STRICT_YEAR and expected_year:
                 stream_year = _extract_year(s.get('name') or '') or _extract_year(s.get('description') or '')
                 if stream_year and abs(int(stream_year) - int(expected_year)) > 1:
