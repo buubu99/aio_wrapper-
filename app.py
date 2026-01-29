@@ -1711,7 +1711,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
 
     # Provider (prefer formatter-injected shortName tokens; keep word boundaries to avoid HDR->RD)
     provider = "UNK"
-    m_sn = re.search(r"\b(TB|TORBOX|RD|REAL[- ]?DEBRID|REALDEBRID|PM|PREMIUMIZE|AD|ALLDEBRID|DEBRID[- ]?LINK|ND|NZBDAV|EW|EWEKA|NG|NZGEEK)\b", text, re.I)
+    m_sn = re.search(r"\b(TB|TORBOX|RD|REAL[- ]?DEBRID|REALDEBRID|PM|PREMIUMIZE|AD|ALLDEBRID|DL|DEBRID[- ]?LINK|ND|NZBDAV|EW|EWEKA|NG|NZGEEK)\b", text, re.I)
     if m_sn:
         tok = m_sn.group(1).upper().replace(' ', '').replace('-', '')
         provider_map = {
@@ -1731,7 +1731,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     #   NOT from WEB-DL release tags.
     # - If Debrid-Link and a base provider token is also present, label as DL-<BASE> (e.g., DL-TB) for logging clarity.
     up = text.upper()
-    has_debridlink = bool(re.search(r"\bDEBRID[- ]?LINK\b", up, re.I) or re.search(r"[🟢🟡🟠🔵🔴🟣]\s*DL\b", up))
+    has_debridlink = bool(re.search(r"\bDEBRID[- ]?LINK\b", text, re.I) or ("🟢DL" in up))
     has_webdl = bool(re.search(r"\bWEB-?DL\b", text, re.I))
     # Detect associated base provider independently
     m_assoc = re.search(r"\b(TB|TORBOX|RD|REAL[- ]?DEBRID|REALDEBRID|AD|ALLDEBRID|ALL[- ]?DEBRID|PM|PREMIUMIZE|ND|NZBDAV|EW|EWEKA|NG|NZGEEK)\b", text, re.I)
@@ -1795,7 +1795,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
             provider = "RD"
         elif "🟢AD" in up or re.search(r"(?<![A-Z0-9])AD(?![A-Z0-9])", up):
             provider = "AD"
-        elif re.search(r"\bDEBRID[- ]?LINK\b", up, re.I) or re.search(r"[🟢🟡🟠🔵🔴🟣]\s*DL\b", up):
+        elif "🟢DL" in up or re.search(r"(?<![A-Z0-9])DL(?![A-Z0-9])", up):
             provider = "DL"
         elif "USENET" in up or "NZB" in up or "NZBDAV" in up:
             provider = "ND"
@@ -1918,22 +1918,120 @@ def api_key_for_provider(provider: str) -> str:
 # Expected metadata (real TMDB fetch)
 # ---------------------------
 @lru_cache(maxsize=2000)
-def get_expected_metadata(type_: str, id_: str) -> Dict[str, Any]:
+def get_expected_metadata(type_: str, id_: str) -> dict:
+    """Fetch expected metadata from TMDB.
+
+    Supports:
+      - IMDb ids: tt1234567 (movies) and tt1234567:season:episode (series)
+      - TMDB numeric ids: 12345 (movie or tv based on type_)
+      - tmdb:12345[:season:episode]
+    Returns keys: title, year, type, tmdb_id, episode_title, season, episode
+    """
     if not TMDB_API_KEY:
-        return {"title": "", "year": None, "type": type_}
-    id_clean = id_.split(":")[0] if ":" in id_ else id_
-    base = f"https://api.themoviedb.org/3/{'movie' if type_ == 'movie' else 'tv'}/{id_clean}"
+        return {
+            "title": "",
+            "year": None,
+            "type": "",
+            "tmdb_id": None,
+            "episode_title": "",
+            "season": None,
+            "episode": None,
+        }
+
     try:
-        resp = session.get(f"{base}?api_key={TMDB_API_KEY}&language=en-US", timeout=TMDB_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        title = data.get("title") or data.get("name", "")
-        release_date = data.get("release_date") or data.get("first_air_date", "")
-        year = int(release_date[:4]) if release_date else None
-        return {"title": title, "year": year, "type": type_}
+        parts = (id_ or "").split(":")
+        base = parts[0] if parts else ""
+        season = episode = None
+        tmdb_id = None
+        imdb_id = None
+
+        # tmdb:12345:1:1 form
+        if base == "tmdb" and len(parts) >= 2 and parts[1].isdigit():
+            tmdb_id = int(parts[1])
+            if len(parts) >= 4 and parts[2].isdigit() and parts[3].isdigit():
+                season, episode = int(parts[2]), int(parts[3])
+
+        # raw numeric tmdb id
+        elif base.isdigit():
+            tmdb_id = int(base)
+
+        # imdb id (tt....)
+        elif base.startswith("tt"):
+            imdb_id = base
+            if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+                season, episode = int(parts[1]), int(parts[2])
+
+        # IMDb -> TMDB via /find
+        if imdb_id and tmdb_id is None:
+            find_url = (
+                f"https://api.themoviedb.org/3/find/{imdb_id}"
+                f"?api_key={TMDB_API_KEY}&external_source=imdb_id"
+            )
+            r = session.get(find_url, timeout=TMDB_TIMEOUT)
+            j = r.json() if getattr(r, "ok", False) else {}
+
+            if type_ == "movie":
+                tmdb_id = (j.get("movie_results") or [{}])[0].get("id")
+            else:
+                tmdb_id = (j.get("tv_results") or [{}])[0].get("id")
+
+            if tmdb_id is not None and str(tmdb_id).isdigit():
+                tmdb_id = int(tmdb_id)
+            else:
+                tmdb_id = None
+
+        if tmdb_id is None:
+            return {
+                "title": "",
+                "year": None,
+                "type": "",
+                "tmdb_id": None,
+                "episode_title": "",
+                "season": season,
+                "episode": episode,
+            }
+
+        kind = "movie" if type_ == "movie" else "tv"
+        meta_url = f"https://api.themoviedb.org/3/{kind}/{tmdb_id}?api_key={TMDB_API_KEY}&language=en-US"
+        r = session.get(meta_url, timeout=TMDB_TIMEOUT)
+        j = r.json() if getattr(r, "ok", False) else {}
+
+        title = (j.get("title") if kind == "movie" else j.get("name")) or ""
+        date_str = (j.get("release_date") if kind == "movie" else j.get("first_air_date")) or ""
+        year = int(date_str[:4]) if (len(date_str) >= 4 and date_str[:4].isdigit()) else None
+
+        episode_title = ""
+        if type_ == "series" and season is not None and episode is not None:
+            ep_url = (
+                f"https://api.themoviedb.org/3/tv/{tmdb_id}/season/{season}/episode/{episode}"
+                f"?api_key={TMDB_API_KEY}&language=en-US"
+            )
+            r2 = session.get(ep_url, timeout=TMDB_TIMEOUT)
+            j2 = r2.json() if getattr(r2, "ok", False) else {}
+            episode_title = (j2.get("name") or "").strip()
+
+        return {
+            "title": title,
+            "year": year,
+            "type": kind,
+            "tmdb_id": tmdb_id,
+            "episode_title": episode_title,
+            "season": season,
+            "episode": episode,
+        }
+
     except Exception as e:
-        logger.warning("TMDB fetch failed rid=%s type=%s id=%s err=%s", _rid(), type_, id_clean, e)
-        return {"title": "", "year": None, "type": type_}
+        logger.warning(f"TMDB_EXPECTED_META_FAIL type={type_} id={id_}: {e}")
+        return {
+            "title": "",
+            "year": None,
+            "type": "",
+            "tmdb_id": None,
+            "episode_title": "",
+            "season": None,
+            "episode": None,
+        }
+
 
 # ---------------------------
 # Formatting: guaranteed 2-left + 3-right (title + 2 lines)
@@ -1989,8 +2087,9 @@ def format_stream_inplace(
     base_title = normalize_display_title(base_title)
     year = expected.get('year')
     ep_tag = f" S{season:02d}E{episode:02d}" if season and episode else ""
-    s['title'] = _truncate(f"{base_title}{ep_tag}" + (f" ({year})" if year else ""), MAX_TITLE_CHARS)
-
+    ep_name = (expected.get('episode_title') or '').strip()
+    ep_name_suffix = f" — {ep_name}" if ep_name else ""
+    s['title'] = _truncate(f"{base_title}{ep_tag}{ep_name_suffix}" + (f" ({year})" if year else ""), MAX_TITLE_CHARS)
     # Description: 2 clean lines (or single line if NAME_SINGLE_LINE)
     line1_bits = [p for p in [audio, lang, codec, source] if p]
     line1 = ' • '.join(line1_bits) if line1_bits else res
@@ -3591,7 +3690,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                         pass
                     nu = n.upper()
                     # prefer formatter-injected shortName tokens; keep word boundaries to avoid HDR->RD.
-                    m_sn = re.search(r"\b(TB|TORBOX|RD|REAL[- ]?DEBRID|AD|ALLDEBRID|DEBRIDLINK|ND|NZB|USENET)\b", nu)
+                    m_sn = re.search(r"\b(TB|TORBOX|RD|REAL[- ]?DEBRID|AD|ALLDEBRID|DL|DEBRIDLINK|ND|NZB|USENET)\b", nu)
                     if m_sn:
                         tok = m_sn.group(1)
                         if tok in ("TORBOX", "TB"):
@@ -3600,7 +3699,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                             prov = "RD"
                         elif tok in ("ALLDEBRID", "AD"):
                             prov = "AD"
-                        elif tok == "DEBRIDLINK":
+                        elif tok in ("DEBRIDLINK", "DL"):
                             prov = "DL"
                         elif tok in ("ND", "NZB", "USENET"):
                             prov = "ND"
