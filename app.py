@@ -210,6 +210,13 @@ NAME_SINGLE_LINE = _parse_bool(os.environ.get("NAME_SINGLE_LINE", "true"), True)
 # Optional: title similarity drop (Trakt-like naming; works without Trakt)
 TRAKT_VALIDATE_TITLES = _parse_bool(os.environ.get("TRAKT_VALIDATE_TITLES", "true"), True)
 TRAKT_TITLE_MIN_RATIO = _safe_float(os.environ.get('TRAKT_TITLE_MIN_RATIO', '0.65'), 0.65)
+
+# Point 11 (Dedup tie-break tuning): weights are env-configurable so we can adjust without code changes.
+# Readiness is derived from flags we already compute (cached True, NZBGeek ready True, cached=='LIKELY').
+DEDUP_READINESS_TRUE = _safe_float(os.environ.get("DEDUP_READINESS_TRUE", "1.0"), 1.0)
+DEDUP_READINESS_READY = _safe_float(os.environ.get("DEDUP_READINESS_READY", "0.8"), 0.8)  # default for NZBGeek ready
+DEDUP_READINESS_LIKELY = _safe_float(os.environ.get("DEDUP_READINESS_LIKELY", "0.5"), 0.5)
+DEDUP_TITLE_WEIGHT = _safe_float(os.environ.get("DEDUP_TITLE_WEIGHT", "1.0"), 1.0)  # multiplier for title match ratio
 TRAKT_STRICT_YEAR = _parse_bool(os.environ.get("TRAKT_STRICT_YEAR", "false"), False)
 TRAKT_CLIENT_ID = (os.environ.get('TRAKT_CLIENT_ID') or '').strip()
 
@@ -3023,6 +3030,39 @@ def dedup_key(stream: Dict[str, Any], meta: Dict[str, Any]) -> str:
 
 
 
+# Point 11: Finalize dedup tie-breaks with insta score + title match ratio (from point 10)
+def _tie_break_score(m: Dict[str, Any], mismatch_ratio: float = 0.0) -> float:
+    """Higher is better.
+
+    Components:
+      - insta readiness: TB cached True (1.0) > NZB ready (0.8) > RD heuristic LIKELY (0.5)
+      - title match ratio: similarity ratio from title validation (0.0..1.0)
+    """
+    insta = 0.0
+    try:
+        cached = m.get("cached")
+    except Exception:
+        cached = None
+    try:
+        ready = bool(m.get("ready", False))
+    except Exception:
+        ready = False
+
+    if cached is True:
+        insta = DEDUP_READINESS_TRUE
+    elif ready:
+        insta = DEDUP_READINESS_READY
+    elif cached == "LIKELY":
+        insta = DEDUP_READINESS_LIKELY
+
+    try:
+        r = float(mismatch_ratio or 0.0)
+    except Exception:
+        r = 0.0
+    return insta + (r * DEDUP_TITLE_WEIGHT)
+
+
+
 def _drop_bad_top_n(
     candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]],
     top_n: int,
@@ -3979,19 +4019,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
         cleaned.append((s, m))
 
-    # Dedup
-    out_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-    if WRAPPER_DEDUP:
-        seen = set()
-        for s, m in cleaned:
-            k = dedup_key(s, m)
-            if k in seen:
-                stats.deduped += 1
-                continue
-            seen.add(k)
-            out_pairs.append((s, m))
-    else:
-        out_pairs = cleaned[:]
+    # Candidates before validation/scoring/dedup (dedup runs later with Point 11 tie-breaks)
+    out_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = cleaned[:]
 
     # Optional: title/year validation gate (local similarity; useful to drop obvious mismatches)
     # Uses parsed title from classify() when available (streams often have empty s['title']).
@@ -4022,6 +4051,11 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 sim_show = difflib.SequenceMatcher(None, cand_cmp, show_cmp).ratio() if show_cmp else 0.0
                 sim_ep = difflib.SequenceMatcher(None, cand_cmp, ep_cmp).ratio() if ep_cmp else 0.0
                 similarity = sim_show if sim_show >= sim_ep else sim_ep
+                # Point 11 tie-break input: keep similarity for later dedup/sort tie breaks
+                try:
+                    m["_mismatch_ratio"] = float(similarity)
+                except Exception:
+                    m["_mismatch_ratio"] = 0.0
                 if similarity < TRAKT_TITLE_MIN_RATIO:
                     logger.debug(
                         f"TITLE_MISMATCH platform={stats.client_platform} type={type_} id={id_} cand={cand_cmp!r} "
@@ -4117,12 +4151,86 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     except Exception as _e:
         logger.debug("NZBGEEK_READY_ERR rid=%s err=%s", rid, _e)
 
-    # MARKERS: show how many streams were validated by each "instant" mechanism.
+    
+    # Dedup (Point 11): choose best candidate per stable dedup_key using insta readiness + title match ratio.
+    # - Keeps ordering stable by preserving the first-seen index for each key.
+    # - Replaces the stored entry when a later duplicate has a higher tie-break score.
+    if WRAPPER_DEDUP and out_pairs:
+        deduped: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        best_idx: Dict[str, int] = {}
+        best_score: Dict[str, float] = {}
+        ties_resolved = 0
+
+        for s, m in out_pairs:
+            try:
+                k = dedup_key(s, m)
+            except Exception:
+                k = ""
+
+            try:
+                ratio = float(m.get("_mismatch_ratio") or 0.0)
+            except Exception:
+                ratio = 0.0
+
+            sc = _tie_break_score(m, ratio)
+
+            if k and k in best_idx:
+                stats.deduped += 1
+                i = best_idx[k]
+                _ps, _pm = deduped[i]
+                prev_sc = float(best_score.get(k, 0.0) or 0.0)
+
+                replace = False
+                if sc > prev_sc + 1e-9:
+                    replace = True
+                elif abs(sc - prev_sc) <= 1e-9:
+                    # Secondary ties: prefer larger size, then more seeders (keep stable order otherwise).
+                    try:
+                        size_b = int(m.get("size") or 0)
+                    except Exception:
+                        size_b = 0
+                    try:
+                        prev_size_b = int(_pm.get("size") or 0)
+                    except Exception:
+                        prev_size_b = 0
+
+                    if size_b > prev_size_b:
+                        replace = True
+                    elif size_b == prev_size_b:
+                        try:
+                            seeders = int(m.get("seeders") or 0)
+                        except Exception:
+                            seeders = 0
+                        try:
+                            prev_seeders = int(_pm.get("seeders") or 0)
+                        except Exception:
+                            prev_seeders = 0
+                        if seeders > prev_seeders:
+                            replace = True
+
+                if replace:
+                    ties_resolved += 1
+                    deduped[i] = (s, m)
+                    best_score[k] = sc
+                continue
+
+            # First seen (or missing key): preserve original ordering index.
+            if k:
+                best_idx[k] = len(deduped)
+                best_score[k] = sc
+            deduped.append((s, m))
+
+        out_pairs = deduped
+
+# MARKERS: show how many streams were validated by each "instant" mechanism.
     # NOTE: TB instant is NOT WebDAV here; it is usually signaled by upstream tags (CACHED:TRUE + PROXIED:TRUE)
     # that were computed from hashes upstream (or by our TorBox API hash check when VERIFY_CACHED_ONLY=true).
     try:
         from collections import Counter
         c_tot = Counter(); c_tagged = Counter(); c_cachedtag = Counter(); c_proxiedtag = Counter(); c_hash = Counter(); c_ready = Counter()
+        if ties_resolved > 0:
+            logger.info(f"DEDUP_TIES rid={_rid()} resolved={ties_resolved} policy=readiness_title")
+
         for _s, _m in out_pairs:
             prov = str(_m.get('provider') or 'UNK').upper().strip()
             c_tot[prov] += 1
@@ -4196,12 +4304,13 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
         ready_val = 0 if m.get("ready") else 1
         prov_idx = _provider_rank(prov)
+        score = _tie_break_score(m, float(m.get('_mismatch_ratio') or 0.0))
         # Sort order: instant -> cached -> resolution -> size -> seeders -> provider rank
         # Sort order: instant -> cached -> resolution -> size -> seeders -> provider rank
         if iphone_usenet_mode and usenet_priority_set:
             usenet_rank = 0 if prov in usenet_priority_set else 1
-            return (usenet_rank, ready_val, instant_val, cached_val, -res, -size_b, -seeders, prov_idx)
-        return (instant_val, ready_val, cached_val, -res, -size_b, -seeders, prov_idx)  # Add: Swap for stronger ready (Usenet beats non-instant cached)
+            return (usenet_rank, ready_val, instant_val, cached_val, -res, -size_b, -score, -seeders, prov_idx)
+        return (instant_val, ready_val, cached_val, -res, -size_b, -score, -seeders, prov_idx)  # Add: Swap for stronger ready (Usenet beats non-instant cached)
 
     out_pairs.sort(key=sort_key)
 
