@@ -252,6 +252,7 @@ TB_API_TIMEOUT = _safe_float(os.environ.get('TB_API_TIMEOUT', '8'), 8.0)
 TMDB_TIMEOUT = _safe_float(os.environ.get('TMDB_TIMEOUT', '8'), 8.0)
 # TMDB for metadata
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
+TMDB_FORCE_IMDB = _parse_bool(os.environ.get("TMDB_FORCE_IMDB", ""), False)
 # NZBGeek readiness checks (Newznab API). Optional; set NZBGEEK_APIKEY in Render to enable.
 NZBGEEK_APIKEY = os.environ.get("NZBGEEK_APIKEY", "")
 NZBGEEK_BASE = os.environ.get("NZBGEEK_BASE", "https://api.nzbgeek.info/api")
@@ -1382,6 +1383,7 @@ logging.getLogger().addHandler(handler)
 logging.getLogger().setLevel(LOG_LEVEL)
 logging.getLogger().addFilter(RequestIdFilter())
 logger = logging.getLogger("aio-wrapper")
+logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK}")
 
 @app.before_request
 def _before_request() -> None:
@@ -4266,7 +4268,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
         # Only call NZBGeek when we actually have Usenet streams and the API key is configured.
         if has_usenet and NZBGEEK_APIKEY:
-            imdbid = _extract_imdbid_for_nzbgeek(id_)
+            imdbid = _extract_imdbid_for_nzbgeek(id_, type_=type_)
 
             # Maintain: Usenet NZBGeek API (not affected by RD heuristics—keep readiness)
             try:
@@ -4280,17 +4282,54 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 if tmdb_id:
                     imdbid = _tmdb_external_imdb_id(type_, tmdb_id)
 
+            t0_ready = time.time()
+            mode = "skip"
             if imdbid:
-                t0_ready = time.time()
                 ready_titles = check_nzbgeek_readiness(imdbid)
-                stats.ms_tb_usenet += int((time.time() - t0_ready) * 1000)
-                try:
-                    logger.info(
-                        "NZBGEEK_DONE rid=%s imdb=%s ready_titles=%s ms_tb_usenet=%s",
-                        _rid(), imdbid, len(ready_titles or []), stats.ms_tb_usenet
-                    )
-                except Exception:
-                    pass
+                mode = "imdb"
+            else:
+                ready_titles = []
+                if NZBGEEK_TITLE_FALLBACK:
+                    # Title fallback for cases where we can't confidently derive an IMDb id.
+                    try:
+                        expected_meta = get_expected_metadata(type_, id_)
+                    except Exception:
+                        expected_meta = {}
+                    imdbid2 = (expected_meta.get("imdb_id") or "").strip() if isinstance(expected_meta, dict) else ""
+                    if imdbid2:
+                        imdbid = imdbid2
+                        ready_titles = check_nzbgeek_readiness(imdbid)
+                        mode = "imdb_expected"
+                    else:
+                        title_q = ""
+                        if isinstance(expected_meta, dict):
+                            title_q = ((expected_meta.get("title") or "").strip() + " " + (expected_meta.get("episode_title") or "").strip()).strip()
+                        if title_q:
+                            try:
+                                logger.debug("NZBGEEK_TITLE_FALLBACK rid=%s q=%s", _rid(), title_q)
+                            except Exception:
+                                pass
+                            ready_titles = check_nzbgeek_readiness_title(title_q)
+                            mode = "title"
+                        else:
+                            try:
+                                logger.warning("NZBGEEK_SKIP rid=%s: no imdbid and no title for fallback", _rid())
+                            except Exception:
+                                pass
+                else:
+                    try:
+                        logger.debug("NZBGEEK_SKIP rid=%s: no imdbid (fallback disabled)", _rid())
+                    except Exception:
+                        pass
+
+            stats.ms_tb_usenet += int((time.time() - t0_ready) * 1000)
+            try:
+                logger.info(
+                    "NZBGEEK_DONE rid=%s mode=%s imdb=%s ready_titles=%s ms_tb_usenet=%s",
+                    _rid(), mode, imdbid, len(ready_titles or []), stats.ms_tb_usenet
+                )
+            except Exception:
+                pass
 
         if ready_titles:
             flagged = 0
