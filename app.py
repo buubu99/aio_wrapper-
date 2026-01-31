@@ -227,9 +227,12 @@ DROP_POLLUTED = _parse_bool(os.environ.get("DROP_POLLUTED", "true"), True)  # op
 TB_API_KEY = os.environ.get("TB_API_KEY", "")
 TB_BASE = "https://api.torbox.app"
 TB_BATCH_SIZE = _safe_int(os.environ.get('TB_BATCH_SIZE', '50'), 50)
+TB_BATCH_CONCURRENCY = _safe_int(os.environ.get('TB_BATCH_CONCURRENCY', '1'), 1)  # 1=sequential; >1 parallelize TorBox batch requests
 TB_MAX_HASHES = _safe_int(os.environ.get('TB_MAX_HASHES', '60'), 60)  # limit hashes checked per request for speed
 TB_API_MIN_HASHES = _safe_int(os.environ.get('TB_API_MIN_HASHES', '20'), 20)  # skip TorBox API calls if fewer hashes
 TB_CACHE_HINTS = _parse_bool(os.environ.get("TB_CACHE_HINTS", "true"), True)  # enable TorBox cache hint lookups
+TB_EARLY_EXIT = _parse_bool(os.environ.get("TB_EARLY_EXIT", "false"), False)  # skip TorBox checks when enough cached hints already present
+TB_EARLY_EXIT_MULT = _safe_int(os.environ.get("TB_EARLY_EXIT_MULT", "2"), 2)  # lookahead multiplier for early-exit cached-hint scan
 TB_USENET_CHECK = _parse_bool(os.environ.get("TB_USENET_CHECK", "false"), False)  # optional usenet cache checks (requires identifiers)
 REQUEST_TIMEOUT = _safe_float(os.environ.get('REQUEST_TIMEOUT', '30'), 30.0)
 # Stream response cache TTL exposed to Stremio clients (seconds)
@@ -702,6 +705,10 @@ def _provider_rank(prov: str) -> int:
 
 
 def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
+    """TorBox torrent cached availability check.
+
+    Uses TorBox batch endpoint. If TB_BATCH_CONCURRENCY > 1, batches are checked in parallel.
+    """
     if not TB_API_KEY or not hashes:
         return {}
     out: Dict[str, bool] = {}
@@ -712,15 +719,27 @@ def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
     }
     # TorBox supports POST /v1/api/torrents/checkcached with a list of hashes.
     url = f'{TB_BASE}/v1/api/torrents/checkcached'
-    for i in range(0, len(hashes), max(1, TB_BATCH_SIZE)):
-        batch = hashes[i:i+TB_BATCH_SIZE]
+
+    bs = max(1, int(TB_BATCH_SIZE or 50))
+    batches = [hashes[i:i + bs] for i in range(0, len(hashes), bs)]
+
+    def _do_batch(batch: List[str]) -> Dict[str, bool]:
+        out_b: Dict[str, bool] = {}
+        if not batch:
+            return out_b
         try:
             # TorBox `format` supports "object" or "list" ("list" is fastest). Using "hash" causes a 400.
-            r = session.post(url, params={'format': 'list', 'list_files': '0'}, json={'hashes': batch}, headers=headers, timeout=TB_API_TIMEOUT)
+            r = requests.post(
+                url,
+                params={'format': 'list', 'list': 'true'},
+                json={'hashes': batch},
+                headers=headers,
+                timeout=TB_API_TIMEOUT,
+            )
             if r.status_code != 200:
-                continue
-            data = r.json()
-            # Common response style: {success: bool, data: {hash: {...}}}
+                return out_b
+            data = r.json() if r.content else {}
+            # Common response style: {success: bool, data: {hash: {...}}} OR {data: [hashes]}
             d = data.get('data') if isinstance(data, dict) else None
             if isinstance(d, dict):
                 cached = {str(k).lower().strip() for k in d.keys() if k}
@@ -742,17 +761,34 @@ def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
             cached_norm = {norm_infohash(x) for x in cached if x}
             for h in batch:
                 hh = norm_infohash(h)
-                out[hh] = hh in cached_norm
+                if hh:
+                    out_b[hh] = hh in cached_norm
         except Exception:
-            continue
-    return out
+            return out_b
+        return out_b
 
+    bc = max(1, int(TB_BATCH_CONCURRENCY or 1))
+    if bc > 1 and len(batches) > 1:
+        with ThreadPoolExecutor(max_workers=min(bc, len(batches))) as ex:
+            futs = [ex.submit(_do_batch, b) for b in batches]
+            for fut in as_completed(futs):
+                try:
+                    out.update(fut.result() or {})
+                except Exception:
+                    continue
+    else:
+        for b in batches:
+            out.update(_do_batch(b))
+
+    return out
 
 def tb_get_usenet_cached(hashes: List[str]) -> Dict[str, bool]:
     """Optional TorBox Usenet cached availability check.
 
     TorBox exposes a separate usenet endpoint. Many Stremio streams do not carry a usable usenet identifier,
     so this is only used when we can collect identifiers (stored in meta['usenet_hash']).
+
+    If TB_BATCH_CONCURRENCY > 1, batches are checked in parallel.
     """
     if not TB_API_KEY or not hashes:
         return {}
@@ -763,29 +799,59 @@ def tb_get_usenet_cached(hashes: List[str]) -> Dict[str, bool]:
         'Accept': 'application/json',
     }
     url = f'{TB_BASE}/v1/api/usenet/checkcached'
-    for i in range(0, len(hashes), max(1, TB_BATCH_SIZE)):
-        batch = hashes[i:i+TB_BATCH_SIZE]
+
+    bs = max(1, int(TB_BATCH_SIZE or 50))
+    batches = [hashes[i:i + bs] for i in range(0, len(hashes), bs)]
+
+    def _do_batch(batch: List[str]) -> Dict[str, bool]:
+        out_b: Dict[str, bool] = {}
+        if not batch:
+            return out_b
         try:
             # Swagger/Postman show `hash` as the repeated query parameter; `format=list` returns the cached hashes.
             params = [('format', 'list')]
             params.extend([('hash', h) for h in batch])
-            r = session.get(url, params=params, headers=headers, timeout=TB_API_TIMEOUT)
+            r = requests.get(url, params=params, headers=headers, timeout=TB_API_TIMEOUT)
             if r.status_code != 200:
-                continue
+                return out_b
             data = r.json() if r.content else {}
             d = data.get('data') if isinstance(data, dict) else None
             if isinstance(d, dict):
                 cached = {str(k).lower().strip() for k in d.keys() if k}
             elif isinstance(d, list):
-                cached = set([x for x in d if isinstance(x, str)])
+                cached = set()
+                for x in d:
+                    if isinstance(x, str):
+                        cached.add(x.lower().strip())
+                    elif isinstance(x, dict):
+                        hx = x.get('hash') or x.get('usenet_hash')
+                        if isinstance(hx, str):
+                            cached.add(hx.lower().strip())
             else:
                 cached = set()
+            cached_norm = {str(x).lower().strip() for x in cached if x}
             for h in batch:
-                out[h] = h in cached
+                hh = str(h).lower().strip()
+                if hh:
+                    out_b[hh] = hh in cached_norm
         except Exception:
-            continue
-    return out
+            return out_b
+        return out_b
 
+    bc = max(1, int(TB_BATCH_CONCURRENCY or 1))
+    if bc > 1 and len(batches) > 1:
+        with ThreadPoolExecutor(max_workers=min(bc, len(batches))) as ex:
+            futs = [ex.submit(_do_batch, b) for b in batches]
+            for fut in as_completed(futs):
+                try:
+                    out.update(fut.result() or {})
+                except Exception:
+                    continue
+    else:
+        for b in batches:
+            out.update(_do_batch(b))
+
+    return out
 
 class _WebDavUnauthorized(RuntimeError):
     """Raised when TorBox WebDAV returns 401 (bad/missing credentials)."""
@@ -1000,19 +1066,25 @@ def _wrap_url_load(token: str) -> Optional[str]:
             return None
         return url
 
-def wrap_playback_url(url: str) -> str:
+def wrap_playback_url(url: str, _base: Optional[str] = None) -> str:
     """Wrap outbound http(s) URLs behind our HEAD-friendly redirector.
 
     For Android/Google TV Stremio, keep WRAP_URL_SHORT=true so emitted URLs stay short.
+    `_base` may be supplied to avoid repeated header lookups (compute once per request).
     """
     if not url or not WRAP_PLAYBACK_URLS:
         return url
     u = str(url)
 
+    # Compute base once (or accept a caller-provided base)
+    try:
+        base = (_base or _public_base_url()).rstrip('/')
+    except Exception:
+        base = (_base or "").rstrip('/')
+
     # Avoid double-wrapping (if stream already points at our redirector)
     try:
-        base = _public_base_url().rstrip('/')
-        if u.startswith(base + '/r/'):
+        if base and u.startswith(base + '/r/'):
             return u
     except Exception:
         pass
@@ -1030,7 +1102,9 @@ def wrap_playback_url(url: str) -> str:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("WRAP_EMIT short=False restart_safe=%s tok_len=%d", restart_safe, len(tok or ""))
 
-        wrapped = _public_base_url().rstrip('/') + '/r/' + tok
+        if not base:
+            base = _public_base_url().rstrip('/')
+        wrapped = base + '/r/' + tok
         if WRAP_DEBUG:
             logging.getLogger('aio-wrapper').info(f'WRAP_URL -> {wrapped}')
         return wrapped
@@ -1829,7 +1903,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     #   NOT from WEB-DL release tags.
     # - If Debrid-Link and a base provider token is also present, label as DL-<BASE> (e.g., DL-TB) for logging clarity.
     up = text.upper()
-    has_debridlink = bool(re.search(r"\bDEBRID[- ]?LINK\b", text, re.I) or ("🟢DL" in up))
+    has_debridlink = bool(re.search(r"\bDEBRID[- ]?LINK\b", text, re.I) or ("🟢DL" in up) or ("DL⚡" in up))
     has_webdl = bool(re.search(r"\bWEB-?DL\b", text, re.I))
     # Detect associated base provider independently
     m_assoc = re.search(r"\b(TB|TORBOX|RD|REAL[- ]?DEBRID|REALDEBRID|AD|ALLDEBRID|ALL[- ]?DEBRID|PM|PREMIUMIZE|ND|NZBDAV|EW|EWEKA|NG|NZGEEK)\b", text, re.I)
@@ -2727,7 +2801,7 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
 
 
 # ---------- FASTLANE (Patch 3): shared fetch executor + AIO cache ----------
-WRAP_FETCH_WORKERS = int(os.getenv("WRAP_FETCH_WORKERS", "8") or 8)
+WRAP_FETCH_WORKERS = int(os.getenv("WRAP_FETCH_WORKERS") or os.getenv("FETCH_WORKERS") or "8")
 FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=WRAP_FETCH_WORKERS)
 
 AIO_CACHE_TTL_S = int(os.getenv("AIO_CACHE_TTL_S", "600") or 600)   # 0 disables cache
@@ -3889,7 +3963,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     cached_map: Dict[str, bool] = {}
 
-    if fast_mode:
+    if tb_skip_checks:
+        tb_api_reason = tb_skip_reason
+    elif fast_mode:
         expected = {}
         stats.ms_tmdb = 0
     else:
@@ -3924,7 +4000,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             return "RD"
         if re.search(r"(?<![A-Z0-9])ALL[- ]?DEBRID(?![A-Z0-9])", txt) or re.search(r"(?<![A-Z0-9])AD(?![A-Z0-9])", txt):
             return "AD"
-        if re.search(r"(?<![A-Z0-9])DEBRID[- ]?LINK(?![A-Z0-9])", txt) or re.search(r"(?<![A-Z0-9])DL(?![A-Z0-9])", txt):
+        # Debrid-Link (DL) provider clarity: do NOT treat WEB-DL or ".DL." release tokens as provider.
+        # Only classify as DL when Debrid-Link is explicitly mentioned or a deliberate marker is present.
+        if re.search(r"(?<![A-Z0-9])DEBRID[- ]?LINK(?![A-Z0-9])", txt) or ("🟢DL" in txt) or ("DL⚡" in txt):
             return "DL"
         # Usenet-ish
         if "USENET" in txt or "NZB" in txt or "NZBDAV" in txt or re.search(r"(?<![A-Z0-9])ND(?![A-Z0-9])", txt):
@@ -4942,6 +5020,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # Optional: TorBox Usenet cache checks (only when we can extract a usenet identifier).
     usenet_cached_map: Dict[str, bool] = {}
+    tb_usenet_should_run = False
+    tb_usenet_hashes_list: List[str] = []
     if (not fast_mode) and TB_USENET_CHECK and TB_API_KEY and candidates:
         uhashes: List[str] = []
         seen_u: set[str] = set()
@@ -4952,9 +5032,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 uhashes.append(uh)
         stats.tb_usenet_hashes = len(uhashes)
         if uhashes:
-            t_u0 = time.time()
-            usenet_cached_map = tb_get_usenet_cached(uhashes)
-            stats.ms_tb_usenet = int((time.time() - t_u0) * 1000)
+            # Defer the API call so we can run it concurrently with TB torrent cached checks when both are needed.
+            tb_usenet_should_run = True
+            tb_usenet_hashes_list = uhashes
 
     # Optional: cached/instant-only enforcement across providers.
     # - TB: requires TB_CACHE_HINTS + TB_API_KEY (otherwise we can't confirm)
@@ -4966,6 +5046,37 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     tb_api_ran = False
     tb_api_reason = ""
     tb_hashes: List[str] = []
+    tb_skip_checks = False
+    tb_skip_reason = ""
+    # Optional early-exit: if enough cached hints already exist in the top slice, skip TorBox API calls.
+    # This never skips URL wrapping (/r/<token>) — it only skips expensive TorBox checks.
+    if TB_EARLY_EXIT and (not VERIFY_CACHED_ONLY) and candidates:
+        try:
+            lookahead = min(
+                len(candidates),
+                max(int(TB_MAX_HASHES or 0) * int(TB_EARLY_EXIT_MULT or 2), int(deliver_cap_eff or MAX_DELIVER or 60)),
+            )
+            insta_count = 0
+            for _s, _m in candidates[:lookahead]:
+                bh = (_s.get('behaviorHints') or {})
+                c_m = _m.get('cached')
+                c_bh = bh.get('cached')
+                if c_m is True or c_bh is True:
+                    insta_count += 1
+                    continue
+                if isinstance(c_m, str) and c_m.upper() == "LIKELY":
+                    insta_count += 1
+                    continue
+                if isinstance(c_bh, str) and c_bh.upper() == "LIKELY":
+                    insta_count += 1
+                    continue
+            if insta_count >= int(deliver_cap_eff or MAX_DELIVER or 60):
+                tb_skip_checks = True
+                tb_skip_reason = f"early_exit_cached_hints={insta_count}"
+                # If we're skipping TorBox checks, also skip deferred usenet cached calls.
+                tb_usenet_should_run = False
+        except Exception:
+            pass
     if fast_mode:
         tb_api_reason = "fast_mode"
     elif VALIDATE_OFF:
@@ -4993,7 +5104,21 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         else:
             try:
                 t0 = time.time()
-                cached_map_raw = tb_get_cached(tb_hashes)
+                # If both TorBox torrent and TorBox usenet checks are queued, run them concurrently.
+                if tb_usenet_should_run and tb_usenet_hashes_list:
+                    t_u0 = time.time()
+                    try:
+                        with ThreadPoolExecutor(max_workers=2) as _ex:
+                            _f_t = _ex.submit(tb_get_cached, tb_hashes)
+                            _f_u = _ex.submit(tb_get_usenet_cached, tb_usenet_hashes_list)
+                            cached_map_raw = _f_t.result()
+                            usenet_cached_map = _f_u.result() or {}
+                        stats.ms_tb_usenet = int((time.time() - t_u0) * 1000)
+                        tb_usenet_should_run = False
+                    except Exception:
+                        cached_map_raw = tb_get_cached(tb_hashes)
+                else:
+                    cached_map_raw = tb_get_cached(tb_hashes)
                 cached_map = {}
                 for _k, _v in (cached_map_raw or {}).items():
                     _nk = norm_infohash(_k)
@@ -5028,6 +5153,16 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     except Exception:
         pass
 
+
+    # If TorBox usenet cached check was deferred and not executed alongside TB torrent cached checks, run it now.
+    if tb_usenet_should_run and tb_usenet_hashes_list:
+        try:
+            t_u0 = time.time()
+            usenet_cached_map = tb_get_usenet_cached(tb_usenet_hashes_list)
+            stats.ms_tb_usenet = int((time.time() - t_u0) * 1000)
+        except Exception:
+            pass
+        tb_usenet_should_run = False
 
     # Point 3 clarity: always log whether "uncached" enforcement actually ran,
     # and whether it was only marking (KEEP) vs hard dropping (DROP).
@@ -5370,6 +5505,22 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # Format (last step)
     delivered: List[Dict[str, Any]] = []
     delivered_dbg: List[Dict[str, Any]] = []  # debug-only (not returned)
+    _wrap_base = None
+    _wrapped_url_map: Dict[str, str] = {}
+    if WRAP_PLAYBACK_URLS:
+        try:
+            _wrap_base = _public_base_url().rstrip('/')
+        except Exception:
+            _wrap_base = None
+        try:
+            _seen_u: set[str] = set()
+            for _s, _m in candidates[:deliver_cap_eff]:
+                _u = _s.get("url") or _s.get("externalUrl") or ""
+                if isinstance(_u, str) and _u and (_u not in _seen_u):
+                    _seen_u.add(_u)
+                    _wrapped_url_map[_u] = wrap_playback_url(_u, _base=_wrap_base)
+        except Exception:
+            _wrapped_url_map = {}
     for s, m in candidates[:deliver_cap_eff]:
         h = (m.get("infohash") or "").lower().strip()
         cached_marker = m.get("cached")
@@ -5383,7 +5534,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         raw_url = s.get("url") or s.get("externalUrl") or ""
         out_url = raw_url
         if WRAP_PLAYBACK_URLS and isinstance(raw_url, str) and raw_url:
-            out_url = wrap_playback_url(raw_url)
+            out_url = _wrapped_url_map.get(raw_url) or wrap_playback_url(raw_url, _base=_wrap_base)
 
         if logger.isEnabledFor(logging.DEBUG):
             delivered_dbg.append({
