@@ -257,6 +257,8 @@ NZBGEEK_APIKEY = os.environ.get("NZBGEEK_APIKEY", "")
 NZBGEEK_BASE = os.environ.get("NZBGEEK_BASE", "https://api.nzbgeek.info/api")
 NZBGEEK_TIMEOUT = _safe_float(os.environ.get("NZBGEEK_TIMEOUT", "5"), 5.0)
 NZBGEEK_TITLE_MATCH_MIN_RATIO = _safe_float(os.environ.get("NZBGEEK_TITLE_MATCH_MIN_RATIO", "0.80"), 0.80)
+NZBGEEK_TITLE_FALLBACK = _parse_bool(os.environ.get('NZBGEEK_TITLE_FALLBACK', 'false'))
+
 
 BUILD_ID = os.environ.get("BUILD_ID", "1.0")
 # Additional filters
@@ -1984,9 +1986,21 @@ def get_expected_metadata(type_: str, id_: str) -> dict:
       - numeric tmdb: 1399 (optional)
 
     Prefers Trakt (if TRAKT_CLIENT_ID set) and falls back to TMDB (/find for IMDb ids).
+
+    Returns:
+      title, year, tmdb_id, episode_title, season, episode, source, imdb_id
     """
     if not (TRAKT_CLIENT_ID or TMDB_API_KEY):
-        return {"title": "", "year": None, "tmdb_id": None, "episode_title": "", "season": None, "episode": None, "source": ""}
+        return {
+            "title": "",
+            "year": None,
+            "tmdb_id": None,
+            "episode_title": "",
+            "season": None,
+            "episode": None,
+            "source": "",
+            "imdb_id": "",
+        }
 
     parts = (id_ or "").split(":")
     base = parts[0] if parts else ""
@@ -2010,7 +2024,7 @@ def get_expected_metadata(type_: str, id_: str) -> dict:
         pass
 
     # --- Prefer Trakt (VIP-friendly, no TMDB key required) ---
-    if imdb_id and TRAKT_CLIENT_ID:
+    if imdb_id and TRAKT_CLIENT_ID and not TMDB_FORCE_IMDB:
         try:
             kind = "movie" if type_ == "movie" else "show"
             headers = {
@@ -2044,6 +2058,13 @@ def get_expected_metadata(type_: str, id_: str) -> dict:
                         if isinstance(ep, dict):
                             ep_title = (ep.get("title") or "").strip()
 
+                    # Ensure IMDb id (prefer Trakt ids, else TMDB external_ids)
+                    imdb_from_trakt = (ids.get("imdb") or "").strip()
+                    if (not imdb_from_trakt) and TMDB_API_KEY:
+                        tmdb_id_fallback = tmdb_from_trakt or tmdb_id
+                        if tmdb_id_fallback:
+                            imdb_from_trakt = _tmdb_external_imdb_id(type_, str(tmdb_id_fallback)) or ""
+
                     return {
                         "title": title,
                         "year": int(year) if str(year).isdigit() else year,
@@ -2052,13 +2073,23 @@ def get_expected_metadata(type_: str, id_: str) -> dict:
                         "season": season,
                         "episode": episode,
                         "source": "trakt",
+                        "imdb_id": imdb_from_trakt or "",
                     }
         except Exception as e:
             logger.warning(f"TRAKT_EXPECTED_META_FAIL type={type_} id={id_}: {e}")
 
     # --- TMDB fallback (handles tmdb ids and IMDb via /find) ---
     if not TMDB_API_KEY:
-        return {"title": "", "year": None, "tmdb_id": tmdb_id, "episode_title": "", "season": season, "episode": episode, "source": ""}
+        return {
+            "title": "",
+            "year": None,
+            "tmdb_id": tmdb_id,
+            "episode_title": "",
+            "season": season,
+            "episode": episode,
+            "source": "",
+            "imdb_id": imdb_id or "",
+        }
 
     try:
         # IMDb -> TMDB via /find
@@ -2076,7 +2107,17 @@ def get_expected_metadata(type_: str, id_: str) -> dict:
                 tmdb_id = None
 
         if tmdb_id is None:
-            return {"title": "", "year": None, "tmdb_id": None, "episode_title": "", "season": season, "episode": episode, "source": "tmdb"}
+            logger.debug(f"EXPECTED_META_BLANK type={type_} id={id_}: no tmdb id")
+            return {
+                "title": "",
+                "year": None,
+                "tmdb_id": None,
+                "episode_title": "",
+                "season": season,
+                "episode": episode,
+                "source": "tmdb",
+                "imdb_id": imdb_id or "",
+            }
 
         kind = "movie" if type_ == "movie" else "tv"
         meta_url = f"https://api.themoviedb.org/3/{kind}/{tmdb_id}?api_key={TMDB_API_KEY}&language=en-US"
@@ -2094,6 +2135,9 @@ def get_expected_metadata(type_: str, id_: str) -> dict:
             j2 = r2.json() if getattr(r2, "ok", False) else {}
             ep_title = (j2.get("name") or "").strip()
 
+        # Ensure IMDb from TMDB external_ids
+        imdb_from_tmdb = _tmdb_external_imdb_id(type_, str(tmdb_id)) or ""
+
         return {
             "title": str(title).strip(),
             "year": year,
@@ -2102,10 +2146,21 @@ def get_expected_metadata(type_: str, id_: str) -> dict:
             "season": season,
             "episode": episode,
             "source": "tmdb",
+            "imdb_id": imdb_from_tmdb,
         }
     except Exception as e:
         logger.warning(f"TMDB_EXPECTED_META_FAIL type={type_} id={id_}: {e}")
-        return {"title": "", "year": None, "tmdb_id": tmdb_id, "episode_title": "", "season": season, "episode": episode, "source": "tmdb"}
+        return {
+            "title": "",
+            "year": None,
+            "tmdb_id": tmdb_id,
+            "episode_title": "",
+            "season": season,
+            "episode": episode,
+            "source": "tmdb",
+            "imdb_id": imdb_id or "",
+        }
+
 def format_stream_inplace(
     s: Dict[str, Any],
     m: Dict[str, Any],
@@ -3453,21 +3508,46 @@ def _diversify_by_quality_bucket(
 
 _NZB_NEWZNAB_NS = "http://www.newznab.com/DTD/2010/feeds/attributes/"
 
-def _extract_imdbid_for_nzbgeek(id_: str) -> str:
-    """Return imdb id like 'tt1234567' from 'imdb:tt...' or raw 'tt...' ids."""
+def _extract_imdbid_for_nzbgeek(id_: str, type_: str = "") -> str:
+    """Return imdb id like 'tt1234567' from 'imdb:tt...' or raw 'tt...' ids.
+    Also supports Stremio/tmdb ids and will resolve via TMDB external_ids when possible.
+    """
     try:
         if not id_:
             return ""
         sid = str(id_).strip()
+        if not sid:
+            logger.debug(f"IMDB_BLANK id={id_}: empty")
+            return ""
+
+        # Allow "imdb:tt0123456"
         if sid.startswith("imdb:"):
             sid = sid.split(":", 1)[1].strip()
-        # Some callers pass plain tt0123456
-        if re.match(r"^tt\d{5,10}$", sid):
-            return sid
-    except Exception:
-        return ""
-    return ""
 
+        # For series ids like "tt0944947:1:1" keep base
+        base = sid.split(":", 1)[0].strip()
+
+        # Direct IMDb id
+        if re.match(r"^tt\d{5,10}$", base):
+            return base
+
+        # Try TMDB forms: "tmdb:1399:1:1", "tmdb:1399", or plain "1399"
+        tmdb_id = _extract_tmdbid_for_lookup(sid) or _extract_tmdbid_for_lookup(base)
+        if tmdb_id:
+            # If type_ is unknown, try tv first (common for series) then movie
+            try_order = [type_] if type_ in ("movie", "series") else ["series", "movie"]
+            for t in try_order:
+                imdb_from_tmdb = _tmdb_external_imdb_id(t, tmdb_id)
+                if imdb_from_tmdb:
+                    return imdb_from_tmdb
+            logger.warning(f"TMDB_IMDB_RESOLVE_FAIL id={sid} tmdb_id={tmdb_id}: no IMDb found")
+            return ""
+
+        logger.debug(f"IMDB_BLANK id={id_}: no match/resolution")
+        return ""
+    except Exception as e:
+        logger.warning(f"IMDB_EXTRACT_FAIL id={id_}: {e}")
+        return ""
 
 def _canonical_id_for_upstream(id_: str) -> str:
     """Canonicalize incoming Stremio id for upstream add-ons.
@@ -3532,63 +3612,67 @@ def _tmdb_external_imdb_id(type_: str, tmdb_id: str) -> str:
     return ""
 
 def check_nzbgeek_readiness(imdbid: str) -> List[str]:
-    """Query NZBGeek (Newznab) and return a list of *normalized* titles we consider 'ready'.
-
-    Notes from your real response:
-    - NZBGeek returns NEWZNAB attrs like grabs/password/size/usenetdate, but **not** 'age' or 'completion'.
-    - The response may include multiple category attrs and sometimes 'XXX' categories; we skip those.
-    """
+    """Query NZBGeek (Newznab) and return a list of *normalized* titles we consider 'ready'."""
     ready_titles: List[str] = []
     if not NZBGEEK_APIKEY:
         return ready_titles
 
     try:
-        # IMPORTANT: do not log this URL (it contains the apikey)
-        url = f"{NZBGEEK_BASE}?t=search&imdbid={imdbid}&apikey={NZBGEEK_APIKEY}&extended=1"
-        r = requests.get(url, timeout=5)
+        if not imdbid:
+            logger.debug("NZBGEEK_SKIP_NO_IMDB")
+            return ready_titles
+
+        # IMPORTANT: do not log params (contains apikey)
+        params = {
+            "t": "search",
+            "imdbid": imdbid,
+            "apikey": NZBGEEK_APIKEY,
+            "extended": "1",
+        }
+        r = requests.get(NZBGEEK_BASE, params=params, timeout=NZBGEEK_TIMEOUT)
         if r.status_code != 200:
             return ready_titles
 
         root = ET.fromstring(r.content)
-        ns = {'newznab': 'http://www.newznab.com/DTD/2010/feeds/attributes/'}
+        ns = {"newznab": "http://www.newznab.com/DTD/2010/feeds/attributes/"}
         now_utc = datetime.now(timezone.utc)
 
-        for item in root.findall('./channel/item'):
-            title = (item.findtext('title') or '').strip()
+        for item in root.findall("./channel/item"):
+            title = (item.findtext("title") or "").strip()
             if not title:
                 continue
 
             # Fast category guards (avoid accidental adult results)
-            cat_text = (item.findtext('category') or '')
-            if 'XXX' in cat_text.upper():
+            cat_text = (item.findtext("category") or "")
+            if "XXX" in cat_text.upper():
                 continue
 
             # Collect all newznab attrs (some names appear multiple times, e.g., category)
             attrs = defaultdict(list)
-            for a in item.findall('newznab:attr', ns):
-                n = (a.get('name') or '').strip()
-                v = (a.get('value') or '').strip()
+            for a in item.findall("newznab:attr", ns):
+                n = (a.get("name") or "").strip()
+                v = (a.get("value") or "").strip()
                 if n:
                     attrs[n].append(v)
 
-            cat_ids = attrs.get('category') or []
-            # NZBGeek uses 6000+ for XXX categories (e.g., 6000/6040 in your sample)
-            if any(v.startswith('6') for v in cat_ids if v):
+            cat_ids = attrs.get("category") or []
+            # NZBGeek uses 6000+ for XXX categories (e.g., 6000/6040)
+            if any(v.startswith("6") for v in cat_ids if v):
                 continue
 
             # Pull the fields we actually have in the real feed
             try:
-                grabs = int((attrs.get('grabs') or ['0'])[0] or 0)
+                grabs = int((attrs.get("grabs") or ["0"])[0] or 0)
             except Exception:
                 grabs = 0
             try:
-                size_bytes = int((attrs.get('size') or ['0'])[0] or 0)
+                size_bytes = int((attrs.get("size") or ["0"])[0] or 0)
             except Exception:
                 size_bytes = 0
-            password = ((attrs.get('password') or ['0'])[0] or '0').strip()
+            password = ((attrs.get("password") or ["0"])[0] or "0").strip()
 
-            # Age: NZBGeek does not provide 'age' attr in your output, so compute from usenetdate/pubDate.
-            date_str = ((attrs.get('usenetdate') or [''])[0] or '').strip() or (item.findtext('pubDate') or '').strip()
+            # Age: compute from usenetdate/pubDate.
+            date_str = ((attrs.get("usenetdate") or [""])[0] or "").strip() or (item.findtext("pubDate") or "").strip()
             age_days: Optional[int] = None
             if date_str:
                 try:
@@ -3601,16 +3685,11 @@ def check_nzbgeek_readiness(imdbid: str) -> List[str]:
                     age_days = None
 
             # Readiness heuristic (conservative):
-            # - password-protected posts often fail instant play
-            # - require decent size (filters tiny junk)
-            # - require some grabs (filters dead/obscure)
-            # - require "recent enough" as a reliability proxy (usenet retention/fills)
             is_ready = (
                 grabs >= 20 and
-                password != '1' and
+                password != "1" and
                 size_bytes > 1_000_000_000
             )
-            # If we can compute age, apply a recency gate (default 180d so older movies can still get 'ready').
             if age_days is not None:
                 is_ready = is_ready and (age_days <= 180)
 
@@ -3622,7 +3701,93 @@ def check_nzbgeek_readiness(imdbid: str) -> List[str]:
                 break
 
     except Exception as e:
-        logging.warning(f"NZBGeek readiness check failed: {e}")
+        logger.warning(f"NZBGeek readiness check failed: {e}")
+
+    return ready_titles
+
+
+
+def check_nzbgeek_readiness_title(title_query: str) -> List[str]:
+    """Optional fallback: query NZBGeek by title (when no IMDb id is available)."""
+    ready_titles: List[str] = []
+    if not NZBGEEK_APIKEY:
+        return ready_titles
+    tq = (title_query or "").strip()
+    if not tq:
+        return ready_titles
+
+    try:
+        params = {
+            "t": "search",
+            "q": tq,
+            "apikey": NZBGEEK_APIKEY,
+            "extended": "1",
+        }
+        r = requests.get(NZBGEEK_BASE, params=params, timeout=NZBGEEK_TIMEOUT)
+        if r.status_code != 200:
+            return ready_titles
+
+        root = ET.fromstring(r.content)
+        ns = {"newznab": "http://www.newznab.com/DTD/2010/feeds/attributes/"}
+        now_utc = datetime.now(timezone.utc)
+
+        for item in root.findall("./channel/item"):
+            title = (item.findtext("title") or "").strip()
+            if not title:
+                continue
+
+            cat_text = (item.findtext("category") or "")
+            if "XXX" in cat_text.upper():
+                continue
+
+            attrs = defaultdict(list)
+            for a in item.findall("newznab:attr", ns):
+                n = (a.get("name") or "").strip()
+                v = (a.get("value") or "").strip()
+                if n:
+                    attrs[n].append(v)
+
+            cat_ids = attrs.get("category") or []
+            if any(v.startswith("6") for v in cat_ids if v):
+                continue
+
+            try:
+                grabs = int((attrs.get("grabs") or ["0"])[0] or 0)
+            except Exception:
+                grabs = 0
+            try:
+                size_bytes = int((attrs.get("size") or ["0"])[0] or 0)
+            except Exception:
+                size_bytes = 0
+            password = ((attrs.get("password") or ["0"])[0] or "0").strip()
+
+            date_str = ((attrs.get("usenetdate") or [""])[0] or "").strip() or (item.findtext("pubDate") or "").strip()
+            age_days: Optional[int] = None
+            if date_str:
+                try:
+                    dt = parsedate_to_datetime(date_str)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    dt = dt.astimezone(timezone.utc)
+                    age_days = int((now_utc - dt).total_seconds() // 86400)
+                except Exception:
+                    age_days = None
+
+            is_ready = (
+                grabs >= 20 and
+                password != "1" and
+                size_bytes > 1_000_000_000
+            )
+            if age_days is not None:
+                is_ready = is_ready and (age_days <= 180)
+
+            if is_ready:
+                ready_titles.append(normalize_label(title))
+
+            if len(ready_titles) >= 200:
+                break
+    except Exception as e:
+        logger.warning(f"NZBGeek title readiness check failed: {e}")
 
     return ready_titles
 
