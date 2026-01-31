@@ -3961,17 +3961,15 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     deliver_cap_eff = int(deliver_cap or MAX_DELIVER or 60)
 
-    cached_map: Dict[str, bool] = {}
-
-    if tb_skip_checks:
-        tb_api_reason = tb_skip_reason
-    elif fast_mode:
+    # Expected metadata (TMDB); independent of TorBox checks.
+    if fast_mode:
         expected = {}
         stats.ms_tmdb = 0
     else:
         t_tmdb0 = time.time()
         expected = get_expected_metadata(type_, id_)
         stats.ms_tmdb = int((time.time() - t_tmdb0) * 1000)
+
 
     # parse season/episode from id for series (tmdb:123:1:3 or tt..:1:3)
     season = episode = None
