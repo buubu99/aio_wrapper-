@@ -888,6 +888,8 @@ WRAP_PLAYBACK_URLS = _parse_bool(os.environ.get("WRAP_PLAYBACK_URLS", "true"), T
 USENET_PSEUDO_INFOHASH = os.getenv("USENET_PSEUDO_INFOHASH", "1").strip() not in ("0", "false", "False")
 WRAP_DEBUG = os.getenv("WRAP_DEBUG", "0").strip() in ("1", "true", "True")
 
+DEBUG_LOG_FULL_STREAMS = _parse_bool(os.getenv("DEBUG_LOG_FULL_STREAMS", "false"), False)
+
 def _pseudo_infohash_usenet(usenet_hash: str) -> str:
     """Create a deterministic 40-hex pseudo-infohash for Usenet items.
 
@@ -1384,6 +1386,42 @@ logging.getLogger().setLevel(LOG_LEVEL)
 logging.getLogger().addFilter(RequestIdFilter())
 logger = logging.getLogger("aio-wrapper")
 logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK}")
+
+
+def _debug_log_full_streams(type_: str, id_: str, platform: str, out_for_client: Optional[List[Dict[str, Any]]]) -> None:
+    """DEBUG-only: log the full, final stream list (URLs + cached + prov + name).
+
+    This intentionally logs short /r/<token> URLs so you can copy/paste and validate instant-play behavior.
+    It is gated by logger DEBUG level to avoid noise/leakage in normal INFO deployments.
+    """
+    if not DEBUG_LOG_FULL_STREAMS:
+        return
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+
+    streams: List[Dict[str, Any]] = []
+    try:
+        streams = [s for s in (out_for_client or []) if isinstance(s, dict)]
+    except Exception:
+        streams = []
+
+    rid = _rid()
+    logger.debug("FULL_STREAMS rid=%s type=%s id=%s platform=%s count=%d", rid, type_, id_, platform, len(streams))
+
+    for i, s in enumerate(streams):
+        try:
+            bh = s.get("behaviorHints") or {}
+            logger.debug(
+                "STREAM_%d rid=%s url=%s cached=%s prov=%s name=%s",
+                i,
+                rid,
+                s.get("url"),
+                bh.get("cached"),
+                (s.get("prov") or s.get("provider") or bh.get("prov") or bh.get("provider")),
+                (s.get("name") or s.get("title")),
+            )
+        except Exception:
+            logger.debug("STREAM_%d rid=%s <log-failed>", i, rid, exc_info=True)
 
 @app.before_request
 def _before_request() -> None:
@@ -5752,6 +5790,7 @@ def stream(type_: str, id_: str):
                 "flags": list(stats.flag_issues)[:12],
             }
 
+        _debug_log_full_streams(type_, id_, platform, out_for_client)
         return jsonify(payload), 200
 
     except Exception as e:
@@ -5828,6 +5867,7 @@ def stream(type_: str, id_: str):
                 "errors": list(stats.error_reasons)[:8],
                 "flags": list(stats.flag_issues)[:12],
             }
+        _debug_log_full_streams(type_, id_, platform, out_for_client)
         return jsonify(payload), 200
 
     finally:
@@ -5982,6 +6022,7 @@ def handle_unhandled_exception(e):
                 "errors": [f"unhandled:{type(e).__name__}"],
                 "flags": ["unhandled_exception"],
             }
+        _debug_log_full_streams(type_, id_, platform, out_for_client)
         return jsonify(payload), 200
 
     return ("Internal Server Error", 500)
