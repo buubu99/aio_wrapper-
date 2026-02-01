@@ -1,7 +1,7 @@
 {
   "id": "org.jason.wrapper",
   "version": "1.1.0",
-  "name": "AIO Wrapper",
+  "name": "Buubuu Wrapper",
   "description": "Wraps AIOStreams to filter and format streams w usenet",
   "resources": ["stream"],
   "types": ["movie", "series"],
