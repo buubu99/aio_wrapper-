@@ -334,6 +334,8 @@ VERIFY_TB_CACHE_OFF = _parse_bool(os.environ.get("VERIFY_TB_CACHE_OFF", "false")
 WRAP_URL_SHORT = _parse_bool(os.environ.get("WRAP_URL_SHORT", "true"), True)
 WRAP_URL_TTL = _safe_int(os.environ.get('WRAP_URL_TTL', '3600'), 3600)  # seconds
 WRAP_HEAD_MODE = (os.environ.get("WRAP_HEAD_MODE", "200_noloc") or "200_noloc").strip().lower()
+RANGE_PROBE_GUARD = _parse_bool(os.environ.get("RANGE_PROBE_GUARD", "true"), True)
+RANGE_PROBE_MAX_BYTES = _safe_int(os.environ.get("RANGE_PROBE_MAX_BYTES", "1024"), 1024)
 WRAPPER_DEDUP = _parse_bool(os.environ.get("WRAPPER_DEDUP", "true"), True)
 
 VERIFY_STREAM = _parse_bool(os.environ.get("VERIFY_STREAM", "true"), True)
@@ -613,6 +615,21 @@ def _load_fakes_db() -> set:
         _fakes_cache['hashes'] = set(hashes)
         _fakes_cache['ts'] = now
     return hashes
+
+def _parse_http_range(rng: str):
+    """
+    Parse a simple single-range header like 'bytes=0-0' or 'bytes=0-1023'.
+    Returns (start, end_or_None). If unparsable, returns (None, None).
+    """
+    if not rng:
+        return (None, None)
+    m = re.match(r"^bytes=(\d+)-(\d*)$", (rng or "").strip())
+    if not m:
+        return (None, None)
+    start = int(m.group(1))
+    end_s = m.group(2)
+    end = int(end_s) if end_s != "" else None
+    return (start, end)
 
 def _parse_content_range_total(cr: Optional[str]) -> Optional[int]:
     # Example: "bytes 0-0/16440"
@@ -1423,17 +1440,59 @@ def redirect_stream_url(token: str):
                 resp.headers["X-Copy-Page"] = _public_base_url().rstrip("/") + "/copy/" + str(token)
         except Exception:
             pass
+
     else:
-        # GET: real playback
-        resp = make_response("", 302)
-        resp.headers["Location"] = url
-        resp = _base(resp)
-        # Convenience: expose a human-friendly copy page for the underlying URL
-        try:
-            if _is_true(os.environ.get("COPY_PAGE_ENABLED", "false")):
-                resp.headers["X-Copy-Page"] = _public_base_url().rstrip("/") + "/copy/" + str(token)
-        except Exception:
-            pass
+        # GET: real playback. Normally we redirect to the upstream proxy URL.
+        #
+        # Some upstream proxies ignore tiny Range probes (e.g. "bytes=0-0") and start streaming a lot of data
+        # while still reporting a 206 response. iPhone / Android TV Stremio clients can interpret that as
+        # "not ready" (or stall). For probe-sized ranges, we answer locally with a tiny 206 so the client
+        # can move on to the real playback request.
+        rng = request.headers.get("Range", "")
+        platform = "iphone" if is_iphone_client() else ("android_tv" if is_android_tv_client() else "")
+        start_b, end_b = _parse_http_range(rng) if rng else (None, None)
+        is_probe = (
+            RANGE_PROBE_GUARD
+            and platform
+            and start_b == 0
+            and end_b is not None
+            and end_b >= 0
+            and (end_b - start_b + 1) <= max(1, RANGE_PROBE_MAX_BYTES)
+        )
+        if is_probe:
+            total = int((_tok_meta or {}).get("size") or 0)
+            if total <= 0:
+                total = int(end_b) + 1
+            n = int(end_b - start_b + 1)
+            body = b"\0" * n
+            resp = make_response(body, 206)
+            resp = _base(resp)
+            resp.headers["Content-Type"] = "application/octet-stream"
+            resp.headers["Accept-Ranges"] = "bytes"
+            resp.headers["Content-Range"] = f"bytes {start_b}-{end_b}/{total}"
+            resp.headers["Content-Length"] = str(n)
+            resp.headers["X-Range-Guard"] = "1"
+            # Convenience: expose a human-friendly copy page for the underlying URL
+            try:
+                if _is_true(os.environ.get("COPY_PAGE_ENABLED", "false")):
+                    resp.headers["X-Copy-Page"] = _public_base_url().rstrip("/") + "/copy/" + str(token)
+            except Exception:
+                pass
+            try:
+                logger.info("RANGE_GUARD rid=%s tok=%s plat=%s range=%s total=%s", _rid(), str(token)[:8], platform, rng, total)
+            except Exception:
+                pass
+        else:
+            resp = make_response("", 302)
+            resp.headers["Location"] = url
+            resp = _base(resp)
+            # Convenience: expose a human-friendly copy page for the underlying URL
+            try:
+                if _is_true(os.environ.get("COPY_PAGE_ENABLED", "false")):
+                    resp.headers["X-Copy-Page"] = _public_base_url().rstrip("/") + "/copy/" + str(token)
+            except Exception:
+                pass
+
 
     # High-signal debug
     try:
@@ -6282,8 +6341,8 @@ def manifest():
     return jsonify(
         {
             "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.21",
-            "name": f"AIO Wrapper (Rich Output, 2 Lines Left) 9.1 v4.4.1 [{cfg}]",
+            "version": "1.0.22",
+            "name": f"AIO Wrapper (Rich Output, 2 Lines Left) 9.1 v4.4.2 [{cfg}]",
             "description": "Merges 2 providers and outputs a brand-new, strict-client-safe stream schema with rich AIOStreams-style emoji formatting (2-line left column).",
             "resources": ["stream"],
             "types": ["movie", "series"],
