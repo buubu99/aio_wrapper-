@@ -10,6 +10,7 @@ import time
 import unicodedata
 import uuid
 import difflib
+import random
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from xml.etree import ElementTree as ET  # NZBGeek (Newznab) readiness checks
@@ -44,6 +45,7 @@ class PipeStats:
     dropped_uncached_tb: int = 0
     dropped_android_magnets: int = 0
     dropped_iphone_magnets: int = 0
+    dropped_low_size_iphone: int = 0  # iPhone size gate drops (min size)
     dropped_platform_specific: int = 0  # Total platform-specific drops (android+iphone)
     client_platform: str = ""
     deduped: int = 0
@@ -1011,8 +1013,9 @@ def _zurl_decode(token: str) -> str:
 _WRAP_URL_MAP = {}  # token -> (url, expires_epoch)
 _WRAP_URL_HASH_TO_TOKEN = {}  # sha256(url) -> token (best-effort dedup)
 _WRAP_URL_LOCK = threading.Lock()
+_WRAP_URL_META = {}  # token -> (meta_dict, expires_epoch)
 
-def _wrap_url_store(url: str) -> str:
+def _wrap_url_store(url: str, meta: Optional[Dict[str, Any]] = None) -> str:
     """Store a playback URL and return an opaque short token.
 
     This is an in-memory map per-process. If you rely on these tokens, keep GUNICORN_CONCURRENCY=1.
@@ -1031,6 +1034,8 @@ def _wrap_url_store(url: str) -> str:
                     old_url, old_exp = val
                     if old_url == url and (not old_exp or time.time() <= old_exp):
                         _WRAP_URL_MAP[tok] = (url, exp)  # refresh TTL
+                        if meta is not None:
+                            _WRAP_URL_META[tok] = (meta, exp)
                         if logger.isEnabledFor(logging.DEBUG):
                             logger.debug("REUSED_TOKEN len=%d", len(tok))
                         return tok
@@ -1039,6 +1044,8 @@ def _wrap_url_store(url: str) -> str:
         # 16 hex chars; stays well under Android URL limits
         token = uuid.uuid4().hex[:16]  # 16 hex chars (Android-safe)
         _WRAP_URL_MAP[token] = (url, exp)
+        if meta is not None:
+            _WRAP_URL_META[token] = (meta, exp)
         if WRAPPER_DEDUP:
             _WRAP_URL_HASH_TO_TOKEN[h] = token
         if logger.isEnabledFor(logging.DEBUG):
@@ -1056,6 +1063,7 @@ def _wrap_url_load(token: str) -> Optional[str]:
         url, exp = val
         if exp and now > exp:
             _WRAP_URL_MAP.pop(token, None)
+            _WRAP_URL_META.pop(token, None)
             if WRAPPER_DEDUP:
                 try:
                     h = hashlib.sha256(url.encode("utf-8")).hexdigest()
@@ -1066,7 +1074,54 @@ def _wrap_url_load(token: str) -> Optional[str]:
             return None
         return url
 
-def wrap_playback_url(url: str, _base: Optional[str] = None) -> str:
+
+def _wrap_url_meta_load(token: str) -> Optional[Dict[str, Any]]:
+    """Load stored metadata for a short token (best-effort)."""
+    try:
+        now = time.time()
+        with _WRAP_URL_LOCK:
+            v = _WRAP_URL_META.get(token)
+            if not v:
+                return None
+            meta, exp = v
+            if exp and now > exp:
+                _WRAP_URL_META.pop(token, None)
+                return None
+            return meta if isinstance(meta, dict) else None
+    except Exception:
+        return None
+
+
+def _wrap_url_meta_update(token: str, meta: Dict[str, Any]) -> None:
+    """Update metadata for an existing short token (best-effort)."""
+    if not (token and isinstance(meta, dict)):
+        return
+    try:
+        now = time.time()
+        with _WRAP_URL_LOCK:
+            v = _WRAP_URL_MAP.get(token)
+            if not v:
+                return
+            _url, exp = v
+            if exp and now > exp:
+                return
+            _WRAP_URL_META[token] = (meta, exp)
+    except Exception:
+        return
+
+
+def _safe_url_host(u: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(u)
+        host = (p.netloc or "").lower()
+        scheme = (p.scheme or "").lower()
+        return f"{scheme}://{host}" if host else scheme
+    except Exception:
+        return ""
+
+
+def wrap_playback_url(url: str, _base: Optional[str] = None, meta: Optional[Dict[str, Any]] = None) -> str:
     """Wrap outbound http(s) URLs behind our HEAD-friendly redirector.
 
     For Android/Google TV Stremio, keep WRAP_URL_SHORT=true so emitted URLs stay short.
@@ -1093,7 +1148,7 @@ def wrap_playback_url(url: str, _base: Optional[str] = None) -> str:
         if WRAP_URL_SHORT:
             # Strict clients (Android/TV, some web/iphone builds) need short URLs.
             # Always emit a short token; we can still *accept* long tokens in the redirector.
-            tok = _wrap_url_store(u)
+            tok = _wrap_url_store(u, meta=meta)
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("WRAP_EMIT short=True tok_len=%d", len(tok or ""))
         else:
@@ -1105,6 +1160,25 @@ def wrap_playback_url(url: str, _base: Optional[str] = None) -> str:
         if not base:
             base = _public_base_url().rstrip('/')
         wrapped = base + '/r/' + tok
+        try:
+            if _is_true(os.environ.get("WRAP_LOG_TOKEN_EMIT", "false")):
+                _tok_disp = tok if _is_true(os.environ.get("WRAP_LOG_TOKEN_FULL", "false")) else (tok[:4] + "…" + tok[-4:] if len(tok) > 10 else tok)
+                _m = meta if isinstance(meta, dict) else {}
+                logger.info(
+                    "TOKEN_EMIT rid=%s tok=%s host=%s prov=%s tag=%s res=%s seeders=%s cached=%s ready=%s",
+                    _rid(),
+                    _tok_disp,
+                    _safe_url_host(u),
+                    (_m.get("provider") or ""),
+                    (_m.get("tag") or ""),
+                    (_m.get("res") or ""),
+                    (_m.get("seeders") or ""),
+                    (_m.get("cached") or ""),
+                    (_m.get("ready") or ""),
+                )
+        except Exception:
+            pass
+
         if WRAP_DEBUG:
             logging.getLogger('aio-wrapper').info(f'WRAP_URL -> {wrapped}')
         return wrapped
@@ -1269,6 +1343,45 @@ def redirect_stream_url(token: str):
     if not url:
         return ("", 404)
 
+    # Best-effort: attach stored token metadata for correlation (especially iPhone "not ready" cases)
+    _tok_meta = None
+    try:
+        if WRAP_URL_SHORT and token and (not token.startswith("z")):
+            _tok_meta = _wrap_url_meta_load(token)
+    except Exception:
+        _tok_meta = None
+
+    try:
+        if _is_true(os.environ.get("WRAP_LOG_TOKEN_HIT", "false")):
+            # Sampling (percent)
+            try:
+                pct = float(os.environ.get("WRAP_LOG_TOKEN_SAMPLE_PCT", "100") or "100")
+            except Exception:
+                pct = 100.0
+            if pct >= 100.0 or (random.random() * 100.0) <= pct:
+                _tok_disp = token if _is_true(os.environ.get("WRAP_LOG_TOKEN_FULL", "false")) else (token[:4] + "…" + token[-4:] if len(token) > 10 else token)
+                _rng = request.headers.get("Range", "")
+                logger.info(
+                    "TOKEN_HIT rid=%s tok=%s method=%s platform=%s ua=%s range=%s host=%s emit_rid=%s prov=%s tag=%s res=%s seeders=%s cached=%s ready=%s",
+                    _rid(),
+                    _tok_disp,
+                    request.method,
+                    client_platform(is_android=is_android_client(), is_iphone=is_iphone_client()),
+                    (request.headers.get("User-Agent", "") or "")[:80],
+                    _rng[:64],
+                    _safe_url_host(url),
+                    (_tok_meta or {}).get("emit_rid", ""),
+                    (_tok_meta or {}).get("provider", ""),
+                    (_tok_meta or {}).get("tag", ""),
+                    (_tok_meta or {}).get("res", ""),
+                    (_tok_meta or {}).get("seeders", ""),
+                    (_tok_meta or {}).get("cached", ""),
+                    (_tok_meta or {}).get("ready", ""),
+                )
+    except Exception:
+        pass
+
+
     if request.method == "OPTIONS":
         resp = make_response("", 204)
         resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -1306,7 +1419,8 @@ def redirect_stream_url(token: str):
         resp = _base(resp)
         # Convenience: expose a human-friendly copy page for the underlying URL
         try:
-            resp.headers["X-Copy-Page"] = _public_base_url().rstrip("/") + "/copy/" + str(token)
+            if _is_true(os.environ.get("COPY_PAGE_ENABLED", "false")):
+                resp.headers["X-Copy-Page"] = _public_base_url().rstrip("/") + "/copy/" + str(token)
         except Exception:
             pass
     else:
@@ -1316,7 +1430,8 @@ def redirect_stream_url(token: str):
         resp = _base(resp)
         # Convenience: expose a human-friendly copy page for the underlying URL
         try:
-            resp.headers["X-Copy-Page"] = _public_base_url().rstrip("/") + "/copy/" + str(token)
+            if _is_true(os.environ.get("COPY_PAGE_ENABLED", "false")):
+                resp.headers["X-Copy-Page"] = _public_base_url().rstrip("/") + "/copy/" + str(token)
         except Exception:
             pass
 
@@ -1329,6 +1444,105 @@ def redirect_stream_url(token: str):
         )
     except Exception:
         pass
+    return resp
+
+
+@app.route("/copy/<path:token>", methods=["GET"])
+def copy_page(token: str):
+    """Human-friendly page to copy the underlying upstream URL for a /r/<token>.
+    Disabled by default; enable with COPY_PAGE_ENABLED=true.
+    """
+    if not _is_true(os.environ.get("COPY_PAGE_ENABLED", "false")):
+        return ("", 404)
+
+    # Resolve token the same way redirect_stream_url does
+    url = None
+    if WRAP_URL_SHORT:
+        url = _wrap_url_load(token)
+    if not url and token.startswith("z"):
+        try:
+            url = _zurl_decode(token)
+        except Exception:
+            url = None
+    if not url:
+        try:
+            url = _b64u_decode(token)
+        except Exception:
+            url = None
+    if not url:
+        return ("", 404)
+
+    meta = None
+    try:
+        if WRAP_URL_SHORT and token and not token.startswith("z"):
+            meta = _wrap_url_meta_load(token)
+    except Exception:
+        meta = None
+
+    from html import escape
+    url_esc = escape(url)
+    meta_txt = ""
+    try:
+        if isinstance(meta, dict) and meta:
+            keys = ["emit_rid", "provider", "tag", "res", "seeders", "cached", "ready", "has_hash", "name"]
+            parts = []
+            for k in keys:
+                if k in meta:
+                    parts.append(f"{k}={escape(str(meta.get(k)))}")
+            if parts:
+                meta_txt = "<div style='margin-top:10px;color:#555;font-size:13px;word-break:break-word;'>" + " | ".join(parts) + "</div>"
+    except Exception:
+        meta_txt = ""
+
+    html = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Copy Stream URL</title>
+  <style>
+    body {{ font-family: -apple-system, system-ui, Segoe UI, Roboto, Arial, sans-serif; padding: 18px; }}
+    .box {{ padding: 12px; border: 1px solid #ddd; border-radius: 10px; background: #fafafa; }}
+    button {{ padding: 10px 14px; border-radius: 10px; border: 0; cursor: pointer; }}
+    textarea {{ width: 100%; height: 110px; margin-top: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+    .small {{ margin-top: 10px; color: #666; font-size: 13px; }}
+  </style>
+</head>
+<body>
+  <h2>Copy playback URL</h2>
+  <div class="box">
+    <button id="copyBtn">Copy</button>
+    <textarea id="u" readonly>{url_esc}</textarea>
+    {meta_txt}
+    <div class="small">If iPhone says “try again later”, paste this URL into a browser/curl and check the upstream response.</div>
+  </div>
+<script>
+  const btn = document.getElementById('copyBtn');
+  const ta = document.getElementById('u');
+  btn.addEventListener('click', async () => {{
+    ta.select();
+    ta.setSelectionRange(0, 999999);
+    try {{
+      await navigator.clipboard.writeText(ta.value);
+      btn.textContent = "Copied!";
+      setTimeout(() => btn.textContent = "Copy", 1200);
+    }} catch(e) {{
+      document.execCommand('copy');
+      btn.textContent = "Copied!";
+      setTimeout(() => btn.textContent = "Copy", 1200);
+    }}
+  }});
+</script>
+</body>
+</html>"""
+    try:
+        logger.info("COPY_PAGE rid=%s tok_len=%d host=%s", _rid(), len(token or ""), _safe_url_host(url))
+    except Exception:
+        pass
+    resp = make_response(html, 200)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
 
@@ -1376,6 +1590,44 @@ def copy_stream_url(token: str):
 
     if not url:
         return ("", 404)
+
+    # Best-effort: attach stored token metadata for correlation (especially iPhone "not ready" cases)
+    _tok_meta = None
+    try:
+        if WRAP_URL_SHORT and token and (not token.startswith("z")):
+            _tok_meta = _wrap_url_meta_load(token)
+    except Exception:
+        _tok_meta = None
+
+    try:
+        if _is_true(os.environ.get("WRAP_LOG_TOKEN_HIT", "false")):
+            # Sampling (percent)
+            try:
+                pct = float(os.environ.get("WRAP_LOG_TOKEN_SAMPLE_PCT", "100") or "100")
+            except Exception:
+                pct = 100.0
+            if pct >= 100.0 or (random.random() * 100.0) <= pct:
+                _tok_disp = token if _is_true(os.environ.get("WRAP_LOG_TOKEN_FULL", "false")) else (token[:4] + "…" + token[-4:] if len(token) > 10 else token)
+                _rng = request.headers.get("Range", "")
+                logger.info(
+                    "TOKEN_HIT rid=%s tok=%s method=%s platform=%s ua=%s range=%s host=%s emit_rid=%s prov=%s tag=%s res=%s seeders=%s cached=%s ready=%s",
+                    _rid(),
+                    _tok_disp,
+                    request.method,
+                    client_platform(is_android=is_android_client(), is_iphone=is_iphone_client()),
+                    _rng[:64],
+                    _safe_url_host(url),
+                    (_tok_meta or {}).get("emit_rid", ""),
+                    (_tok_meta or {}).get("provider", ""),
+                    (_tok_meta or {}).get("tag", ""),
+                    (_tok_meta or {}).get("res", ""),
+                    (_tok_meta or {}).get("seeders", ""),
+                    (_tok_meta or {}).get("cached", ""),
+                    (_tok_meta or {}).get("ready", ""),
+                )
+    except Exception:
+        pass
+
 
     esc = _html.escape
     upstream = str(url)
@@ -1533,6 +1785,29 @@ def is_android_client() -> bool:
     )
 
 
+def is_android_tv_client() -> bool:
+    """Detect Android TV / Google TV / Fire TV-ish clients.
+
+    Used only for labeling (logs/stats) and optional platform-specific policies.
+    """
+    ua = request.headers.get("User-Agent", "") if has_request_context() else ""
+    ua_l = (ua or "").strip().lower()
+    if not ua_l:
+        return False
+    # TV-oriented indicators (keep conservative to avoid mislabeling phones)
+    return (
+        ("android tv" in ua_l)
+        or ("google tv" in ua_l)
+        or ("fire tv" in ua_l)
+        or ("aft" in ua_l)  # Amazon Fire TV device codes often include 'AFT'
+        or ("shield" in ua_l)  # NVIDIA Shield
+        or ("bravia" in ua_l)
+        or ("smart-tv" in ua_l)
+        or ("smarttv" in ua_l)
+        or ("stremio" in ua_l and "tv" in ua_l)
+    )
+
+
 def is_iphone_client() -> bool:
     """Best-effort detection of iPhone/iOS-ish clients.
 
@@ -1549,7 +1824,13 @@ def is_iphone_client() -> bool:
 def client_platform(is_android: bool, is_iphone: bool) -> str:
     if is_iphone:
         return "iphone"
-    if is_android or is_iphone:
+    if is_android:
+        # Distinguish Android TV / Google TV for clearer logs & debugging.
+        try:
+            if is_android_tv_client():
+                return "androidtv"
+        except Exception:
+            pass
         return "android"
     # Safari / desktop apps
     ua = request.headers.get("User-Agent", "") if has_request_context() else ""
@@ -1694,6 +1975,31 @@ def android_sanitize_out_stream(stream: Any) -> Optional[Dict[str, Any]]:
             # invalid behaviorHints is poison; drop it rather than poisoning the whole stream
             pass
 
+    # NEW: Optional player hints (match frame rate / resolution) to reduce buffering on strict clients.
+    MATCH_FRAME_RES = _parse_bool(os.environ.get("MATCH_FRAME_RES", "0"))
+    if MATCH_FRAME_RES:
+        try:
+            bh2 = out.get("behaviorHints")
+            if not isinstance(bh2, dict):
+                bh2 = {}
+            nm = str(out.get("name") or stream.get("name") or "").lower()
+
+            # Resolution hints
+            if ("2160p" in nm) or ("4k" in nm):
+                bh2.setdefault("resolution", "2160p")
+            elif "1080p" in nm:
+                bh2.setdefault("resolution", "1080p")
+            elif "720p" in nm:
+                bh2.setdefault("resolution", "720p")
+
+            # Frame rate hints
+            if ("60fps" in nm) or ("60 fps" in nm):
+                bh2.setdefault("frameRate", 60)
+
+            out["behaviorHints"] = bh2
+        except Exception:
+            pass
+
     # Copy through a small allowlist of common Stremio keys safely.
     # (Avoid copying arbitrary nested objects that can break strict parsers.)
     for k in ("title", "infoHash", "availability", "seeders"):
@@ -1807,37 +2113,131 @@ def _cache_confidence(s: Dict[str, Any], meta: Dict[str, Any]) -> float:
         return 0.0
 
 def _heuristic_cached(s: Dict[str, Any], meta: Dict[str, Any]) -> bool:
-    """Heuristic cache signal.
+    """Heuristic guess for whether a premium/debrid stream is effectively cached/ready.
 
-    For RD we maintain a lower threshold (no API checks) and we also record a per-request marker
-    so logs can prove the heuristic actually ran.
+    This should be *cheap* and must never throw; it is used as a fallback when a provider
+    doesn't explicitly mark cached readiness.
     """
-    conf = _cache_confidence(s, meta)
-    provider = str(meta.get('provider') or s.get('provider') or '').upper().strip()
+    try:
+        info_hash = (meta.get("infohash") or s.get("infoHash") or "").strip().lower()
+    except Exception:
+        info_hash = ""
 
-    # RD-specific lower threshold (heuristic; no API checks)
-    if provider in ('RD', 'REALDEBRID'):
-        thr = 0.7
-        ok = conf >= thr
-        try:
-            st = getattr(_TLS, "stats", None)
-            if st is not None:
-                st.rd_heur_calls += 1
-                st.rd_heur_conf_sum += float(conf or 0.0)
-                if ok:
-                    st.rd_heur_true += 1
-                else:
-                    st.rd_heur_false += 1
-        except Exception:
-            pass
-        return ok
+    # Require a valid 40-hex infohash for debrid-style heuristics
+    if not (isinstance(info_hash, str) and re.fullmatch(r"[0-9a-f]{40}", info_hash or "")):
+        return False
 
-    return conf >= MIN_CACHE_CONFIDENCE
+    # Grab request-local stats if available (set in filter_and_format/get_streams)
+    stats = getattr(_TLS, "stats", None)
 
+    try:
+        provider = str(meta.get("provider") or "").upper().strip()
+        seeders = int(meta.get("seeders") or 0)
+        size_b = int(meta.get("size") or 0)
+        size_gb = float(size_b) / float(1024 ** 3) if size_b > 0 else 0.0
+        title = str(meta.get("title_raw") or s.get("name") or "")
+        desc = str(s.get("description") or "")
+        text = f"{title} {desc}"
+    except Exception:
+        provider = str(meta.get("provider") or "").upper().strip()
+        seeders, size_gb, title, text = 0, 0.0, "", ""
 
-# ---------------------------
-# Pollution detection (optional; v20-style)
-# ---------------------------
+    # --- confidence scoring (keeps prior intent, adds episode/completion/tiny-size signals) ---
+    conf = 0.0
+
+    # Original-ish rules (kept conceptually; weights tuned to stay in 0..1 range)
+    try:
+        # Seeders tiers
+        if seeders >= 50:
+            conf += 0.30
+        elif seeders >= 20:
+            conf += 0.20
+
+        # Size tiers
+        if size_gb >= 2.0:
+            conf += 0.20
+        elif size_gb >= 1.0:
+            conf += 0.10
+
+        # Freshness proxy (age parsed from name/desc when present)
+        age_days = _extract_age_days(text)
+        if age_days is not None and age_days <= 30:
+            conf += 0.20
+
+        # Instant keywords ("instant", "cached", etc.)
+        if _looks_instant(text):
+            conf += 0.20
+
+        # Resolution keywords
+        tl = title.lower()
+        if ("2160p" in tl) or ("4k" in tl):
+            conf += 0.15
+        elif "1080p" in tl:
+            conf += 0.10
+
+        # Episode-specific proxy (helps series links)
+        if re.search(r"\bS\d{1,2}E\d{1,2}\b", text, re.I) or re.search(r"\bepisode\b", text, re.I):
+            conf += 0.10
+
+        # Completion proxy (avoid tiny/partial results)
+        if size_gb > 0.50:
+            conf += 0.15
+        if size_gb > 0 and size_gb < 0.10:
+            conf -= 0.20
+
+        # Provider-specific tiny tweaks (keep prior behavior without changing thresholds)
+        if provider == "TB" and size_gb >= 10.0:
+            conf += 0.05
+
+    except Exception:
+        pass
+
+    # Clamp to sane range
+    if conf < 0.0:
+        conf = 0.0
+    if conf > 1.0:
+        conf = 1.0
+
+    # Provider-specific thresholds (unchanged)
+    ok = False
+    try:
+        if provider == "RD":
+            ok = conf >= 0.70
+        elif provider == "AD":
+            ok = conf >= 0.65
+        else:
+            ok = conf >= float(MIN_CACHE_CONFIDENCE or 0.60)
+    except Exception:
+        ok = False
+
+    # Stats bookkeeping + occasional structured logging
+    try:
+        if stats is not None:
+            stats.rd_heur_calls += 1
+            if ok:
+                stats.rd_heur_true += 1
+            else:
+                stats.rd_heur_false += 1
+            stats.rd_heur_conf_sum += float(conf)
+
+            # Log occasionally to avoid spam; keep it tuneable.
+            try:
+                log_every = int(os.environ.get("RD_HEUR_LOG_EVERY", "25") or 25)
+            except Exception:
+                log_every = 25
+            if log_every <= 0:
+                log_every = 25
+
+            if stats.rd_heur_calls == 1 or (stats.rd_heur_calls % log_every == 0):
+                logger.info(
+                    "RD_HEUR rid=%s provider=%s calls=%s true=%s false=%s conf_sum=%.2f",
+                    _rid(), provider, stats.rd_heur_calls, stats.rd_heur_true, stats.rd_heur_false, float(stats.rd_heur_conf_sum),
+                )
+    except Exception:
+        pass
+
+    return ok
+
 def is_polluted(s: Dict[str, Any], type_: str, season: Optional[int], episode: Optional[int]) -> bool:
     name = (s.get("name") or "").lower()
     desc = (s.get("description") or "").lower()
@@ -3071,6 +3471,47 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
 
     merged = aio_streams + p2_streams
 
+
+    # NEW: Optional debrid redundancy re-ordering (keeps a bit of each debrid early for uptime).
+    # This only reorders; it does not drop streams.
+    DEBRID_REDUNDANCY = _parse_bool(os.environ.get("DEBRID_REDUNDANCY", "0"))
+    if DEBRID_REDUNDANCY and merged and not (is_iphone and IPHONE_USENET_ONLY):
+        try:
+            from collections import defaultdict as _dd
+
+            scored: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
+            for i, st in enumerate(merged):
+                if not isinstance(st, dict):
+                    continue
+                try:
+                    mt = classify(st)
+                except Exception:
+                    mt = {}
+                scored.append((i, st, mt))
+
+            debrid_tags = {"RD", "TB", "AD", "PM"}
+            groups = _dd(list)
+            for i, st, mt in scored:
+                tag = str(mt.get("provider") or "").upper().strip()
+                if tag in debrid_tags:
+                    groups[tag].append((i, st, mt))
+
+            take_idxs: List[int] = []
+            taken: set[int] = set()
+            for tag, arr in groups.items():
+                arr = sorted(arr, key=lambda t: (-int(t[2].get("seeders") or 0), -int(t[2].get("size") or 0)))
+                for i, _, _ in arr[:2]:
+                    if i not in taken:
+                        take_idxs.append(i)
+                        taken.add(i)
+
+            if take_idxs:
+                merged = [merged[i] for i in take_idxs] + [st for j, st in enumerate(merged) if j not in taken]
+        except Exception as e:
+            try:
+                logger.debug("DEBRID_REDUNDANCY_ERR rid=%s err=%s", _rid(), e)
+            except Exception:
+                pass
     # +++ New: iPhone/iPad usenet-only branch (prov2-only; AIO is skipped above)
     if is_iphone and IPHONE_USENET_ONLY:
         merged = p2_streams
@@ -4200,6 +4641,24 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                         "EARLY_CAP_STRAT rid=%s capped=%d original=%d groups=%s quotas=%s",
                         rid, len(streams), orig_n, gsz, quotas
                     )
+
+                # NEW: For iPhone (even when not in usenet-only mode), keep at least one top ND stream if available.
+                if is_iphone and (not iphone_usenet_mode):
+                    try:
+                        nd_top = None
+                        try:
+                            nd_arr = groups.get("ND", [])
+                            if isinstance(nd_arr, list) and nd_arr:
+                                nd_top = nd_arr[0]
+                        except Exception:
+                            nd_top = None
+                        if nd_top and (nd_top not in streams):
+                            streams = [nd_top] + [x for x in streams if x is not nd_top]
+                            streams = streams[:EARLY_CAP]
+                            logger.info("IPHONE_ND_DIVERSITY rid=%s included_nd=1 capped=%d", rid, len(streams))
+                    except Exception:
+                        pass
+
         else:
             streams = pre
             logger.info("NO_EARLY_CAP rid=%s original=%d cap=%d", rid, orig_n, EARLY_CAP)
@@ -4291,9 +4750,11 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 size_b = int(m.get("size") or 0)
             except Exception:
                 size_b = 0
-            min_size = 2000000000 if is_iphone else 1000000000  # 2GB iPhone, 1GB others
-            if size_b < min_size:
-                stats.dropped_low_res += 1
+            min_size = 500 * 1024 * 1024 if is_iphone else 0  # 500MB min for iPhone
+            if min_size and size_b < min_size:
+                # Dedicated counter for accuracy + per-drop log (mobile debugging)
+                stats.dropped_low_size_iphone += 1
+                logger.info("DROP_IPHONE_SIZE rid=%s dropped_low_size_iphone=%s", rid, stats.dropped_low_size_iphone)
                 continue
 
 
@@ -4343,11 +4804,19 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                         f"show={show_cmp!r} ep={ep_cmp!r} sim_show={sim_show:.3f} sim_ep={sim_ep:.3f} min={TRAKT_TITLE_MIN_RATIO}"
                     )
                     stats.dropped_title_mismatch += 1
+                    try:
+                        logger.info("DROP_TITLE_MISMATCH rid=%s name=%s expected_title=%s dropped_title_mismatch=%s", rid, s.get("name"), expected_title, stats.dropped_title_mismatch)
+                    except Exception:
+                        pass
                     continue
             if TRAKT_STRICT_YEAR and expected_year:
                 stream_year = _extract_year(s.get('name') or '') or _extract_year(s.get('description') or '')
                 if stream_year and abs(int(stream_year) - int(expected_year)) > 1:
                     stats.dropped_title_mismatch += 1
+                    try:
+                        logger.info("DROP_TITLE_MISMATCH rid=%s name=%s expected_title=%s dropped_title_mismatch=%s", rid, s.get("name"), expected_title, stats.dropped_title_mismatch)
+                    except Exception:
+                        pass
                     continue
 
             filtered_pairs.append((s, m))
@@ -5516,7 +5985,19 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 _u = _s.get("url") or _s.get("externalUrl") or ""
                 if isinstance(_u, str) and _u and (_u not in _seen_u):
                     _seen_u.add(_u)
-                    _wrapped_url_map[_u] = wrap_playback_url(_u, _base=_wrap_base)
+                    _wrapped_url_map[_u] = wrap_playback_url(_u, _base=_wrap_base, meta={
+    "emit_rid": _rid(),
+    "provider": (_m.get("provider") or "UNK"),
+    "tag": (_m.get("tag") or ""),
+    "res": (_m.get("res") or "SD"),
+    "seeders": int(_m.get("seeders") or 0),
+    "size": int(_m.get("size") or 0),
+    "cached": (_m.get("cached") if _m.get("cached") is not None else ""),
+    "ready": bool(_m.get("ready") or False),
+    "has_hash": bool((_m.get("infohash") or "").strip() or _s.get("infoHash") or _s.get("infohash")),
+    "name": (_s.get("name") or ""),
+    "platform": client_platform(is_android=is_android, is_iphone=is_iphone),
+})
         except Exception:
             _wrapped_url_map = {}
     for s, m in candidates[:deliver_cap_eff]:
@@ -5532,7 +6013,41 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         raw_url = s.get("url") or s.get("externalUrl") or ""
         out_url = raw_url
         if WRAP_PLAYBACK_URLS and isinstance(raw_url, str) and raw_url:
-            out_url = _wrapped_url_map.get(raw_url) or wrap_playback_url(raw_url, _base=_wrap_base)
+            out_url = _wrapped_url_map.get(raw_url)
+            if out_url:
+                # Best-effort: enrich token metadata for debugging
+                try:
+                    if WRAP_URL_SHORT and _wrap_base and isinstance(out_url, str) and out_url.startswith(_wrap_base + "/r/"):
+                        _tok = out_url.split("/r/", 1)[1]
+                        _wrap_url_meta_update(_tok, {
+                            "emit_rid": _rid(),
+                            "provider": (m.get("provider") or "UNK"),
+                            "tag": (m.get("tag") or ""),
+                            "res": (m.get("res") or "SD"),
+                            "seeders": int(m.get("seeders") or 0),
+                            "size": int(m.get("size") or 0),
+                            "name": (s.get("name") or ""),
+                            "cached": (cached_marker if cached_marker is not None else (cached_hint or "")),
+                            "ready": bool(m.get("ready") or False),
+                            "has_hash": bool(h or s.get("infoHash") or s.get("infohash")),
+                            "platform": client_platform(is_android=is_android, is_iphone=is_iphone),
+                        })
+                except Exception:
+                    pass
+            else:
+                out_url = wrap_playback_url(raw_url, _base=_wrap_base, meta={
+                    "emit_rid": _rid(),
+                    "provider": (m.get("provider") or "UNK"),
+                    "tag": (m.get("tag") or ""),
+                    "res": (m.get("res") or "SD"),
+                    "seeders": int(m.get("seeders") or 0),
+                    "size": int(m.get("size") or 0),
+                    "name": (s.get("name") or ""),
+                    "cached": (cached_marker if cached_marker is not None else (cached_hint or "")),
+                    "ready": bool(m.get("ready") or False),
+                    "has_hash": bool(h or s.get("infoHash") or s.get("infohash")),
+                    "platform": client_platform(is_android=is_android, is_iphone=is_iphone),
+                })
 
         if logger.isEnabledFor(logging.DEBUG):
             delivered_dbg.append({
@@ -6089,8 +6604,21 @@ def stream(type_: str, id_: str):
             int(stats.errors_timeout or 0), int(stats.errors_parse or 0), int(stats.errors_api or 0),
             ms_total,
         )
-
-        if WRAP_LOG_COUNTS:
+        # NEW: Flag slow fetches with high seeders (diagnose buffering despite peers)
+        try:
+            ms_fetch_aio = int(getattr(stats, "ms_fetch_aio", 0) or 0)
+            if ms_fetch_aio > 5000 and any(int(s.get("seeders", 0) or 0) > 50 for s in (out_for_client or [])):
+                if isinstance(stats.flag_issues, list):
+                    stats.flag_issues.append("slow_high_seeders")
+                logger.info(
+                    "FLAG_SLOW_HIGH_SEEDERS rid=%s ms_fetch_aio=%s high_seeders_delivered=%s",
+                    _rid(),
+                    ms_fetch_aio,
+                    sum(1 for s in (out_for_client or []) if int(s.get("seeders", 0) or 0) > 50),
+                )
+        except Exception:
+            pass
+if WRAP_LOG_COUNTS:
             try:
                 logger.info(
                     "WRAP_COUNTS rid=%s type=%s id=%s fetch_aio=%s fetch_p2=%s in=%s out=%s",
