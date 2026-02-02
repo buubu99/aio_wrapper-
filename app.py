@@ -346,6 +346,8 @@ VERIFY_RANGE = _parse_bool(os.environ.get("VERIFY_RANGE", "true"), True)
 VERIFY_DROP_STATIC_500 = _parse_bool(os.environ.get("VERIFY_DROP_STATIC_500", "false"), False)
 VERIFY_MIN_TOTAL_BYTES = _safe_int(os.environ.get('VERIFY_MIN_TOTAL_BYTES', '5000000'), 5000000)  # 5MB floor
 ANDROID_VERIFY_TOP_N = _safe_int(os.environ.get('ANDROID_VERIFY_TOP_N', '6'), 6)
+VERIFY_DESKTOP_TOP_N = _safe_int(os.environ.get('VERIFY_DESKTOP_TOP_N', '20'), 20)
+VERIFY_MAX_WORKERS = _safe_int(os.environ.get('VERIFY_MAX_WORKERS', '8'), 8)
 ANDROID_VERIFY_TIMEOUT = _safe_float(os.environ.get('ANDROID_VERIFY_TIMEOUT', '3.0'), 3.0)
 ANDROID_VERIFY_OFF = _parse_bool(os.environ.get("ANDROID_VERIFY_OFF", "false"), False)
 
@@ -658,7 +660,7 @@ def _verify_stream_url(s: Dict[str, Any], timeout: Optional[float] = None, range
         return True
 
     t = VERIFY_STREAM_TIMEOUT if timeout is None else timeout
-    rm = VERIFY_RANGE if range_mode is None else range_mode
+    rm = True if range_mode is None else range_mode
 
     try:
         if rm:
@@ -669,19 +671,36 @@ def _verify_stream_url(s: Dict[str, Any], timeout: Optional[float] = None, range
                 allow_redirects=True,
                 stream=True,
             )
-            final_url = getattr(r, 'url', '') or ''
-            if _looks_like_static_500(final_url) or _looks_like_static_500(r.headers.get('Location','') or ''):
-                return False
-            total = _parse_content_range_total(r.headers.get('Content-Range'))
-            if total is not None and total < VERIFY_MIN_TOTAL_BYTES:
-                return False
-            # Status & content-type sanity (drop obvious non-video placeholders).
-            if r.status_code not in (200, 206):
-                return False
-            ct = (r.headers.get('Content-Type','') or '').lower()
-            if ct and not (ct.startswith('video/') or ('octet-stream' in ct) or ('mpegurl' in ct) or ('dash' in ct)):
-                return False
-            return True
+            try:
+                final_url = getattr(r, 'url', '') or ''
+                if _looks_like_static_500(final_url) or _looks_like_static_500(r.headers.get('Location','') or ''):
+                    return False
+                total = _parse_content_range_total(r.headers.get('Content-Range'))
+                if total is not None and total < VERIFY_MIN_TOTAL_BYTES:
+                    return False
+                # Status & content-type sanity (drop obvious non-video placeholders).
+                if r.status_code not in (200, 206):
+                    return False
+                ct = (r.headers.get('Content-Type','') or '').lower()
+                if ct and not (ct.startswith('video/') or ('octet-stream' in ct) or ('mpegurl' in ct) or ('dash' in ct)):
+                    return False
+
+                # Leak guard: if a server ignores Range and starts sending a lot of data,
+                # bail quickly and close the connection.
+                downloaded = 0
+                for chunk in r.iter_content(chunk_size=1024):
+                    if not chunk:
+                        break
+                    downloaded += len(chunk)
+                    if downloaded > 5120:  # >5KB on a 0-0 probe is suspicious
+                        return False
+                return True
+            finally:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+
 
         r = fast_session.head(url, timeout=t, allow_redirects=True, headers={'User-Agent': ''})
         if r.status_code in (405, 403, 401):
@@ -3736,6 +3755,7 @@ def _drop_bad_top_n(
     candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]],
     top_n: int,
     timeout: float,
+    range_mode: Optional[bool] = None,
     stats: Optional["PipeStats"] = None,
     rid: Optional[str] = None,
 ) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
@@ -3749,6 +3769,7 @@ def _drop_bad_top_n(
 
     rid = rid or _rid()
     to_verify = candidates[:top_n]
+    rm = True if range_mode is None else range_mode
     if not to_verify:
         return candidates
 
@@ -3757,7 +3778,7 @@ def _drop_bad_top_n(
 
     def verify_worker(idx: int, s: Dict[str, Any]) -> bool:
         try:
-            ok = _verify_stream_url(s, timeout=timeout, range_mode=True)
+            ok = _verify_stream_url(s, timeout=timeout, range_mode=rm)
             logger.debug(
                 "VERIFY rid=%s idx=%s ok=%s url_head=%s",
                 rid,
@@ -3772,7 +3793,8 @@ def _drop_bad_top_n(
 
     t0 = time.time()
     # Cap workers so we don't stampede the upstream on small instances.
-    max_workers = min(len(to_verify), max(1, top_n), 8)
+    cap_workers = max(1, int(VERIFY_MAX_WORKERS or 8))
+    max_workers = min(len(to_verify), max(1, top_n), cap_workers)
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = []
@@ -3809,8 +3831,7 @@ def _drop_bad_top_n(
         len(kept),
         ms,
     )
-    return kept
-
+    return kept + candidates[top_n:]
 def _res_to_int(res: str) -> int:
     """Normalize resolution strings into an integer height.
     Handles common variants + some non-Latin lookalikes (e.g., Cyrillic 'К').
@@ -4798,11 +4819,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 if h and h in bad_hashes:
                     stats.dropped_fakes_db += 1
                     continue
-
-            # Optional URL verification (expensive)
-            if (not fast_mode) and VERIFY_STREAM and not _verify_stream_url(s):
-                stats.dropped_dead_url += 1
-                continue
+            # Optional URL verification moved to batched/parallel top-N pass (see below)
 
             # Add: iPhone min size for hash fix (even big files)
             try:
@@ -5159,6 +5176,16 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         return (instant_val, ready_val, cached_val, -res, -size_b, -score, -seeders, prov_idx)  # Add: Swap for stronger ready (Usenet beats non-instant cached)
 
     out_pairs.sort(key=sort_key)
+
+    # Parallel verification (batched for speed; only verify top-N after global sort)
+    if (not fast_mode) and VERIFY_STREAM:
+        try:
+            top_n = ANDROID_VERIFY_TOP_N if (is_android or is_iphone) else VERIFY_DESKTOP_TOP_N
+            timeout = ANDROID_VERIFY_TIMEOUT if (is_android or is_iphone) else VERIFY_STREAM_TIMEOUT
+            out_pairs = _drop_bad_top_n(out_pairs, int(top_n or 0), float(timeout or VERIFY_STREAM_TIMEOUT), stats=stats, rid=rid, range_mode=VERIFY_RANGE)
+        except Exception as e:
+            logger.debug("VERIFY_PARALLEL_SKIPPED rid=%s err=%s", rid, e)
+
 
     # Proof log: top N after global sort (provider/supplier/res + sort signals)
     try:
