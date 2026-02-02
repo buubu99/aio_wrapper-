@@ -652,6 +652,34 @@ def _looks_like_static_500(url: str) -> bool:
 def _verify_stream_url(s: Dict[str, Any], timeout: Optional[float] = None, range_mode: Optional[bool] = None) -> bool:
     # Keep this cheap: allow magnets and stremio://
     url = (s.get('url') or '').strip()
+    # If this is a wrapped /r/<token> URL, unwrap in-process to avoid:
+    # - verifying the wrapper redirect itself (302/HEAD modes)
+    # - cross-worker 404s when WEB_CONCURRENCY>1
+    try:
+        from urllib.parse import urlparse
+        pu = urlparse(url)
+        path = pu.path or ""
+        if path.startswith("/r/") or url.startswith("/r/"):
+            tok = (path.split("/r/", 1)[1].split("/", 1)[0] if path.startswith("/r/") else url.split("/r/", 1)[1].split("/", 1)[0])
+            upstream = None
+            try:
+                if WRAP_URL_SHORT:
+                    upstream = _wrap_url_load(tok)
+            except Exception:
+                upstream = None
+            if (not upstream) and tok.startswith("z"):
+                try:
+                    upstream = _zurl_decode(tok)
+                except Exception:
+                    upstream = None
+            # If we can't resolve the token, don't drop the stream here.
+            if upstream:
+                url = upstream
+            else:
+                return True
+    except Exception:
+        pass
+
     if not url:
         return False
     if url.startswith('magnet:') or url.startswith('stremio:'):
@@ -694,6 +722,7 @@ def _verify_stream_url(s: Dict[str, Any], timeout: Optional[float] = None, range
                     downloaded += len(chunk)
                     if downloaded > 5120:  # >5KB on a 0-0 probe is suspicious
                         return False
+                    break  # only need first chunk
                 return True
             finally:
                 try:
@@ -703,17 +732,27 @@ def _verify_stream_url(s: Dict[str, Any], timeout: Optional[float] = None, range
 
 
         r = fast_session.head(url, timeout=t, allow_redirects=True, headers={'User-Agent': ''})
-        if r.status_code in (405, 403, 401):
-            r = fast_session.get(url, timeout=t, stream=True, allow_redirects=True, headers={'User-Agent': ''})
-        final_url = getattr(r, 'url', '') or ''
-        if _looks_like_static_500(final_url) or _looks_like_static_500(r.headers.get('Location','') or ''):
-            return False
-        ct = (r.headers.get('Content-Type','') or '').lower()
-        if ct and not (ct.startswith('video/') or ('octet-stream' in ct) or ('mpegurl' in ct) or ('dash' in ct)):
-            return False
-        return 200 <= r.status_code < 400
+        try:
+            if r.status_code in (405, 403, 401):
+                try:
+                    r.close()
+                except Exception:
+                    pass
+                r = fast_session.get(url, timeout=t, stream=True, allow_redirects=True, headers={'User-Agent': ''})
+            final_url = getattr(r, 'url', '') or ''
+            if _looks_like_static_500(final_url) or _looks_like_static_500(r.headers.get('Location','') or ''):
+                return False
+            ct = (r.headers.get('Content-Type','') or '').lower()
+            if ct and not (ct.startswith('video/') or ('octet-stream' in ct) or ('mpegurl' in ct) or ('dash' in ct)):
+                return False
+            return 200 <= r.status_code < 400
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
     except Exception:
-        return False
+        return True if ASSUME_PREMIUM_ON_FAIL else False
 
 
 def _provider_rank(prov: str) -> int:
@@ -3831,7 +3870,7 @@ def _drop_bad_top_n(
         len(kept),
         ms,
     )
-    return kept + candidates[top_n:]
+    return kept
 def _res_to_int(res: str) -> int:
     """Normalize resolution strings into an integer height.
     Handles common variants + some non-Latin lookalikes (e.g., Cyrillic 'К').
@@ -5175,14 +5214,16 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             return (usenet_rank, ready_val, instant_val, cached_val, -res, -size_b, -score, -seeders, prov_idx)
         return (instant_val, ready_val, cached_val, -res, -size_b, -score, -seeders, prov_idx)  # Add: Swap for stronger ready (Usenet beats non-instant cached)
 
+    did_verify = False
     out_pairs.sort(key=sort_key)
 
     # Parallel verification (batched for speed; only verify top-N after global sort)
-    if (not fast_mode) and VERIFY_STREAM:
+    if (not fast_mode) and VERIFY_STREAM and (not (is_android and ANDROID_VERIFY_OFF)):
         try:
             top_n = ANDROID_VERIFY_TOP_N if (is_android or is_iphone) else VERIFY_DESKTOP_TOP_N
             timeout = ANDROID_VERIFY_TIMEOUT if (is_android or is_iphone) else VERIFY_STREAM_TIMEOUT
             out_pairs = _drop_bad_top_n(out_pairs, int(top_n or 0), float(timeout or VERIFY_STREAM_TIMEOUT), stats=stats, rid=rid, range_mode=VERIFY_RANGE)
+            did_verify = True
         except Exception as e:
             logger.debug("VERIFY_PARALLEL_SKIPPED rid=%s err=%s", rid, e)
 
@@ -5519,16 +5560,19 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # Android/TV: remove streams that resolve to known error placeholders (e.g., /static/500.mp4)
     if is_android and not ANDROID_VERIFY_OFF:
         if VERIFY_STREAM:
-            try:
-                candidates = _drop_bad_top_n(
-                    candidates,
-                    ANDROID_VERIFY_TOP_N,
-                    ANDROID_VERIFY_TIMEOUT,
-                    stats=stats,
-                    rid=rid,
-                )
-            except Exception as e:
-                logger.debug("ANDROID_VERIFY_SKIPPED rid=%s err=%s", rid, e)
+            if did_verify:
+                logger.debug("ANDROID_VERIFY_SKIP rid=%s reason=already_verified", rid)
+            else:
+                try:
+                    candidates = _drop_bad_top_n(
+                        candidates,
+                        ANDROID_VERIFY_TOP_N,
+                        ANDROID_VERIFY_TIMEOUT,
+                        stats=stats,
+                        rid=rid,
+                    )
+                except Exception as e:
+                    logger.debug("ANDROID_VERIFY_SKIPPED rid=%s err=%s", rid, e)
         else:
             logger.info("VERIFY_SKIP rid=%s reason=VERIFY_STREAM=false", rid)
 
