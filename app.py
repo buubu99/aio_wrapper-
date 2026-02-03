@@ -649,110 +649,356 @@ def _looks_like_static_500(url: str) -> bool:
     return "500.mp4" in u and "/static/" in u
 
 
-def _verify_stream_url(s: Dict[str, Any], timeout: Optional[float] = None, range_mode: Optional[bool] = None) -> bool:
-    # Keep this cheap: allow magnets and stremio://
-    url = (s.get('url') or '').strip()
-    # If this is a wrapped /r/<token> URL, unwrap in-process to avoid:
-    # - verifying the wrapper redirect itself (302/HEAD modes)
-    # - cross-worker 404s when WEB_CONCURRENCY>1
+def _verify_stream_url(
+    url: str,
+    session: Optional["requests.Session"] = None,
+    *,
+    timeout_s: Optional[float] = None,
+    range_mode: Optional[bool] = None,
+    req_headers: Optional[Dict[str, str]] = None,
+) -> Tuple[bool, int, str]:
+    """
+    Verify an upstream stream URL is plausibly playable and safe to probe.
+
+    Returns: (keep, penalty, classification)
+      - keep False => drop (unsafe / not playable / text error / probe unsafe)
+      - keep True  => keep, possibly with penalty (risky / stub / weak signals)
+
+    Implements the "7 rules" sanity layer with conservative, low-byte probing.
+    """
+    # Defaults / knobs
+    sniff_bytes = max(256, _safe_int(os.environ.get("VERIFY_SNIFF_BYTES", "2048"), 2048))
+    leak_limit = max(1024, _safe_int(os.environ.get("LEAK_GUARD_BYTES", "8192"), 8192))
+    max_redirects = max(0, _safe_int(os.environ.get("VERIFY_MAX_REDIRECTS", "4"), 4))
+    pen_risky = _safe_int(os.environ.get("VERIFY_PEN_RISKY", "20"), 20)
+    pen_stub = _safe_int(os.environ.get("VERIFY_PEN_STUB", "120"), 120)
+    pen_atoms_bad = _safe_int(os.environ.get("VERIFY_PEN_MP4_ATOMS_BAD", "60"), 60)
+
+    # STUB threshold: default 2MB unless overridden (tune later)
+    stub_max = _safe_int(os.environ.get("VERIFY_STUB_MAX_BYTES", "2097152"), 2097152)
+    drop_stubs = str(os.environ.get("VERIFY_DROP_STUBS", "0")).strip() in {"1", "true", "yes", "on"}
+
+    risky_servers = [
+        t.strip().lower()
+        for t in str(os.environ.get("VERIFY_RISKY_SERVERS", "lity,nexus")).split(",")
+        if t.strip()
+    ]
+    risky_cts = {"application/octet-stream", "application/force-download"}
+
+    # Resolve short /r token if needed
+    if not url:
+        return (False, 0, "EMPTY_URL")
+    if url.startswith("/r/"):
+        u2 = _unwrap_short_url(url)
+        if u2:
+            url = u2
+
+    # Skip non-http(s)
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return (True, 0, "SKIP_NONHTTP")
+
+    # Host cache (avoid repeated probes)
     try:
         from urllib.parse import urlparse
-        pu = urlparse(url)
-        path = pu.path or ""
-        if path.startswith("/r/") or url.startswith("/r/"):
-            tok = (path.split("/r/", 1)[1].split("/", 1)[0] if path.startswith("/r/") else url.split("/r/", 1)[1].split("/", 1)[0])
-            upstream = None
-            try:
-                if WRAP_URL_SHORT:
-                    upstream = _wrap_url_load(tok)
-            except Exception:
-                upstream = None
-            if (not upstream) and tok.startswith("z"):
-                try:
-                    upstream = _zurl_decode(tok)
-                except Exception:
-                    upstream = None
-            # If we can't resolve the token, don't drop the stream here.
-            if upstream:
-                url = upstream
-            else:
-                return True
+        h0 = (urlparse(url).netloc or "").split("@")[-1]
+        h0 = h0.split(":")[0].lower().strip()
     except Exception:
-        pass
+        h0 = ""
+    cached = _verify_host_cache_get(h0) if h0 else None
+    if cached:
+        level, reason = cached
+        if level == "unsafe":
+            return (False, 0, "HOST_CACHED_UNSAFE")
+        if level == "risky":
+            return (True, pen_risky, "HOST_CACHED_RISKY")
 
-    if not url:
-        return False
-    if url.startswith('magnet:') or url.startswith('stremio:'):
-        return True
-    if not (url.startswith('http://') or url.startswith('https://')):
-        return True
+    prefer_range = True if range_mode is None else bool(range_mode)
+    if timeout_s is None:
+        timeout_s = float(os.environ.get("VERIFY_TIMEOUT_S", "6.0") or 6.0)
+    timeout = (min(3.0, timeout_s), timeout_s)  # connect, read
 
-    t = VERIFY_STREAM_TIMEOUT if timeout is None else timeout
-    rm = True if range_mode is None else range_mode
+    sess = session or requests.Session()
 
-    try:
-        if rm:
-            r = fast_session.get(
-                url,
-                headers={'Range': 'bytes=0-0', 'User-Agent': ''},
-                timeout=t,
-                allow_redirects=True,
-                stream=True,
-            )
-            try:
-                final_url = getattr(r, 'url', '') or ''
-                if _looks_like_static_500(final_url) or _looks_like_static_500(r.headers.get('Location','') or ''):
-                    return False
-                total = _parse_content_range_total(r.headers.get('Content-Range'))
-                if total is not None and total < VERIFY_MIN_TOTAL_BYTES:
-                    return False
-                # Status & content-type sanity (drop obvious non-video placeholders).
-                if r.status_code not in (200, 206):
-                    return False
-                ct = (r.headers.get('Content-Type','') or '').lower()
-                if ct and not (ct.startswith('video/') or ('octet-stream' in ct) or ('mpegurl' in ct) or ('dash' in ct)):
-                    return False
+    # Base headers
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*",
+        "Connection": "close",
+    }
+    if req_headers:
+        headers.update({k: v for k, v in req_headers.items() if k and v})
 
-                # Leak guard: if a server ignores Range and starts sending a lot of data,
-                # bail quickly and close the connection.
-                downloaded = 0
-                for chunk in r.iter_content(chunk_size=1024):
-                    if not chunk:
-                        break
-                    downloaded += len(chunk)
-                    if downloaded > 5120:  # >5KB on a 0-0 probe is suspicious
-                        return False
-                    break  # only need first chunk
-                return True
-            finally:
-                try:
-                    r.close()
-                except Exception:
-                    pass
-
-
-        r = fast_session.head(url, timeout=t, allow_redirects=True, headers={'User-Agent': ''})
+    def _parse_int(hv: Optional[str]) -> Optional[int]:
         try:
-            if r.status_code in (405, 403, 401):
-                try:
-                    r.close()
-                except Exception:
-                    pass
-                r = fast_session.get(url, timeout=t, stream=True, allow_redirects=True, headers={'User-Agent': ''})
-            final_url = getattr(r, 'url', '') or ''
-            if _looks_like_static_500(final_url) or _looks_like_static_500(r.headers.get('Location','') or ''):
-                return False
-            ct = (r.headers.get('Content-Type','') or '').lower()
-            if ct and not (ct.startswith('video/') or ('octet-stream' in ct) or ('mpegurl' in ct) or ('dash' in ct)):
-                return False
-            return 200 <= r.status_code < 400
-        finally:
+            if hv is None:
+                return None
+            hv = hv.strip()
+            if not hv:
+                return None
+            return int(hv)
+        except Exception:
+            return None
+
+    def _parse_content_range(cr: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+        # "bytes 0-0/12345" or "bytes 0-2047/12345"
+        try:
+            cr = (cr or "").strip().lower()
+            if not cr.startswith("bytes"):
+                return (None, None, None)
+            _, rest = cr.split(" ", 1)
+            span, total = rest.split("/", 1)
+            if "-" in span:
+                a, b = span.split("-", 1)
+                start = int(a)
+                end = int(b)
+            else:
+                return (None, None, None)
+            total_i = None if total == "*" else int(total)
+            return (start, end, total_i)
+        except Exception:
+            return (None, None, None)
+
+    def _looks_texty(ct: str) -> bool:
+        ct = (ct or "").split(";", 1)[0].strip().lower()
+        if ct.startswith("text/"):
+            return True
+        if ct in {"application/json", "application/xml"}:
+            return True
+        if ct in {"text/html", "application/xhtml+xml"}:
+            return True
+        return False
+
+    def _sig_classify(buf: bytes) -> str:
+        """Return best-effort signature label for first bytes."""
+        if not buf:
+            return ""
+        b0 = buf[:16].lstrip()
+        if b0.startswith(b"{") or b0.startswith(b"["):
+            return "JSON"
+        if b0.startswith(b"<") or b"<html" in buf[:256].lower() or b"<!doctype" in buf[:256].lower():
+            return "HTML"
+        # MKV EBML magic
+        if buf[:4] == b"\x1a\x45\xdf\xa3":
+            return "MKV"
+        # MP4-ish atoms
+        if b"ftyp" in buf[:1024] or b"moov" in buf[:2048] or b"moof" in buf[:2048]:
+            return "MP4"
+        return ""
+
+    def _mp4_atoms_ok(buf: bytes) -> Tuple[bool, bool, bool]:
+        """Return (mp4ish, has_ftyp, has_moov_or_moof)."""
+        if not buf:
+            return (False, False, False)
+        low = buf[:4096]
+        has_ftyp = b"ftyp" in low[:1024]
+        has_moov = b"moov" in low
+        has_moof = b"moof" in low
+        mp4ish = has_ftyp or has_moov or has_moof
+        return (mp4ish, has_ftyp, (has_moov or has_moof))
+
+    # --- Probe step 1: Range 0-0 (safest) ---
+    cur = url
+    visited = set()
+    last_headers: Dict[str, str] = {}
+    last_status: Optional[int] = None
+    final_url = None
+    got0 = b""
+    total_size: Optional[int] = None
+    server_hdr = ""
+    ct = ""
+
+    def _do_get_range(cur_url: str, range_header: str) -> "requests.Response":
+        hh = dict(headers)
+        if prefer_range:
+            hh["Range"] = range_header
+        return sess.get(cur_url, headers=hh, timeout=timeout, stream=True, allow_redirects=False)
+
+    for hop in range(max_redirects + 1):
+        if cur in visited:
+            return (False, 0, "REDIRECT_LOOP")
+        visited.add(cur)
+        try:
+            r = _do_get_range(cur, "bytes=0-0")
+        except Exception as e:
+            return (False, 0, "VERIFY_GET_ERR")
+        last_status = r.status_code
+        last_headers = {k: v for k, v in (r.headers or {}).items()}
+
+        # Redirect handling
+        if last_status in (301, 302, 303, 307, 308):
+            loc = (r.headers or {}).get("Location")
+            if not loc:
+                return (False, 0, "REDIRECT_NO_LOCATION")
             try:
-                r.close()
+                from urllib.parse import urljoin
+                cur = urljoin(cur, loc)
+                continue
             except Exception:
-                pass
-    except Exception:
-        return True if ASSUME_PREMIUM_ON_FAIL else False
+                cur = loc
+                continue
+
+        # Final response
+        final_url = cur
+        ct = (r.headers or {}).get("Content-Type", "") or ""
+        server_hdr = (r.headers or {}).get("Server", "") or ""
+        cr = (r.headers or {}).get("Content-Range", "") or ""
+        cl = _parse_int((r.headers or {}).get("Content-Length"))
+        s0, e0, t0 = _parse_content_range(cr)
+        if t0 is not None:
+            total_size = t0
+        elif cl is not None:
+            total_size = cl
+
+        # PROBE_UNSAFE (2b): 206 + 0-0 but content-length not 1
+        if last_status == 206 and s0 == 0 and e0 == 0 and cl is not None and cl not in (0, 1):
+            if h0:
+                _verify_host_cache_set(h0, "unsafe", "PROBE_UNSAFE_CL_MISMATCH")
+            return (False, 0, "PROBE_UNSAFE_CL_MISMATCH")
+
+        # Read tiny amount and detect leak
+        downloaded = 0
+        try:
+            for chunk in r.iter_content(chunk_size=1024):
+                if not chunk:
+                    continue
+                got0 += chunk
+                downloaded += len(chunk)
+                if downloaded > leak_limit:
+                    if h0:
+                        _verify_host_cache_set(h0, "unsafe", "PROBE_UNSAFE_LEAK")
+                    return (False, 0, "PROBE_UNSAFE_LEAK")
+                if len(got0) >= 8:  # enough to spot obvious text/html/json markers
+                    break
+        except Exception:
+            # Ignore read error; continue with what we got
+            pass
+
+        # If server ignored Range (status 200 on range request), treat unsafe if it looks big or leaky.
+        if prefer_range and last_status == 200:
+            # If it already leaked beyond a few KB, mark unsafe.
+            if len(got0) > 1024 or (cl is not None and cl > sniff_bytes):
+                if h0:
+                    _verify_host_cache_set(h0, "unsafe", "PROBE_UNSAFE_RANGE_IGNORED")
+                return (False, 0, "PROBE_UNSAFE_RANGE_IGNORED")
+
+        break
+
+    if final_url is None or last_status is None:
+        return (False, 0, "VERIFY_NO_RESPONSE")
+
+    if last_status not in (200, 206):
+        if h0:
+            _verify_host_cache_set(h0, "unsafe", "FINAL_NOT_PLAYABLE")
+        return (False, 0, "FINAL_NOT_PLAYABLE")
+
+    # Quick reject: obvious upstream error text types or signatures.
+    sig0 = _sig_classify(got0)
+    if _looks_texty(ct) or sig0 in {"HTML", "JSON"}:
+        if h0:
+            _verify_host_cache_set(h0, "unsafe", "UPSTREAM_ERROR_TEXT")
+        return (False, 0, "UPSTREAM_ERROR_TEXT")
+
+    # --- Probe step 2: read first N bytes for signatures / MP4 atoms (still guarded) ---
+    got = got0
+    if prefer_range and len(got) < min(256, sniff_bytes):
+        try:
+            # Re-probe with a slightly wider range for signature checks.
+            r2 = _do_get_range(final_url, f"bytes=0-{sniff_bytes-1}")
+            sc2 = r2.status_code
+            cr2 = (r2.headers or {}).get("Content-Range", "") or ""
+            cl2 = _parse_int((r2.headers or {}).get("Content-Length"))
+            s2, e2, t2 = _parse_content_range(cr2)
+            if t2 is not None:
+                total_size = t2
+
+            # PROBE_UNSAFE (2b): 206 + 0-0/total but Content-Length huge (some servers lie)
+            if sc2 == 206 and s2 == 0 and e2 == 0 and cl2 is not None and cl2 not in (0, 1):
+                if h0:
+                    _verify_host_cache_set(h0, "unsafe", "PROBE_UNSAFE_CL_MISMATCH")
+                return (False, 0, "PROBE_UNSAFE_CL_MISMATCH")
+
+            # Read up to sniff_bytes but hard stop on leak_limit
+            downloaded = 0
+            got = b""
+            for chunk in r2.iter_content(chunk_size=4096):
+                if not chunk:
+                    continue
+                got += chunk
+                downloaded += len(chunk)
+                if downloaded > leak_limit:
+                    if h0:
+                        _verify_host_cache_set(h0, "unsafe", "PROBE_UNSAFE_LEAK")
+                    return (False, 0, "PROBE_UNSAFE_LEAK")
+                if len(got) >= sniff_bytes:
+                    break
+
+            # If range ignored, treat unsafe.
+            if prefer_range and sc2 == 200:
+                if downloaded > 1024 or (cl2 is not None and cl2 > sniff_bytes):
+                    if h0:
+                        _verify_host_cache_set(h0, "unsafe", "PROBE_UNSAFE_RANGE_IGNORED")
+                    return (False, 0, "PROBE_UNSAFE_RANGE_IGNORED")
+
+            # Header mismatch: Content-Length much bigger than Content-Range span
+            if sc2 == 206 and s2 is not None and e2 is not None and cl2 is not None:
+                span = (e2 - s2 + 1)
+                if cl2 > (span + 1024):
+                    if h0:
+                        _verify_host_cache_set(h0, "unsafe", "PROBE_UNSAFE_CL_MISMATCH")
+                    return (False, 0, "PROBE_UNSAFE_CL_MISMATCH")
+
+            # Re-check text signatures using richer bytes.
+            sig = _sig_classify(got)
+            if _looks_texty(ct) or sig in {"HTML", "JSON"}:
+                if h0:
+                    _verify_host_cache_set(h0, "unsafe", "UPSTREAM_ERROR_TEXT")
+                return (False, 0, "UPSTREAM_ERROR_TEXT")
+        except Exception:
+            # If sniff probe fails, don't drop; fall back to weak confidence.
+            got = got0
+
+    # Determine kind from headers/signatures
+    ct_low = (ct or "").split(";", 1)[0].strip().lower()
+    sig = _sig_classify(got)
+    kind = ""
+    if "video/mp4" in ct_low:
+        kind = "MP4"
+    elif "matroska" in ct_low or "x-matroska" in ct_low or "video/webm" in ct_low:
+        kind = "MKV"
+    elif sig in {"MP4", "MKV"}:
+        kind = sig
+
+    # Content signature mismatch (7a)
+    if kind and sig and kind != sig and sig in {"MP4", "MKV", "HTML", "JSON"}:
+        if h0:
+            _verify_host_cache_set(h0, "unsafe", "CT_SIGNATURE_MISMATCH")
+        return (False, 0, "CT_SIGNATURE_MISMATCH")
+
+    # MP4 atoms sanity (7b)
+    mp4ish, has_ftyp, has_moov_or_moof = _mp4_atoms_ok(got)
+    if kind == "MP4" or mp4ish:
+        if not has_ftyp or not has_moov_or_moof:
+            # Penalize (do not drop) – some mp4s have moov late, but placeholders often fail this.
+            return (True, pen_atoms_bad, "MP4_ATOMS_BAD")
+
+    # STUBS (tiny mp4 total) (1)
+    if stub_max and total_size is not None and total_size <= stub_max:
+        if kind == "MP4" or mp4ish:
+            if drop_stubs:
+                return (False, 0, "STUB_MP4_TINY_TOTAL")
+            return (True, pen_stub, "STUB_MP4_TINY_TOTAL")
+
+    # RISKY CT / SERVER (4)
+    srv_low = (server_hdr or "").lower()
+    is_server_risky = any(tok in srv_low for tok in risky_servers) if risky_servers else False
+    is_ct_risky = ct_low in risky_cts
+    if (is_server_risky or is_ct_risky) and (total_size is None or total_size > stub_max):
+        # Slight penalty; keep visible but don't let it beat clean sources.
+        if h0:
+            _verify_host_cache_set(h0, "risky", "RISKY_CT_OR_SERVER", ttl_s=_safe_int(os.environ.get("VERIFY_HOST_CACHE_TTL_RISKY", "300"), 300))
+        return (True, pen_risky, "RISKY_CT_OR_SERVER")
+
+    return (True, 0, "OK")
 
 
 def _provider_rank(prov: str) -> int:
@@ -1088,6 +1334,46 @@ def _zurl_decode(token: str) -> str:
 _WRAP_URL_MAP = {}  # token -> (url, expires_epoch)
 _WRAP_URL_HASH_TO_TOKEN = {}  # sha256(url) -> token (best-effort dedup)
 _WRAP_URL_LOCK = threading.Lock()
+
+# --- Verify host cache (short-lived) ---
+# Used to avoid repeatedly probing hosts that have already proven unsafe/risky.
+# host -> (expires_ts, level, reason) where level in {"unsafe","risky"}
+_VERIFY_HOST_CACHE_LOCK = threading.Lock()
+_VERIFY_HOST_CACHE: Dict[str, Tuple[float, str, str]] = {}
+
+def _verify_host_cache_get(host: str) -> Optional[Tuple[str, str]]:
+    """Return (level, reason) if host cache entry is valid."""
+    try:
+        h = (host or "").strip().lower()
+        if not h:
+            return None
+        now = time.time()
+        with _VERIFY_HOST_CACHE_LOCK:
+            ent = _VERIFY_HOST_CACHE.get(h)
+            if not ent:
+                return None
+            exp, level, reason = ent
+            if exp <= now:
+                _VERIFY_HOST_CACHE.pop(h, None)
+                return None
+            return (level, reason)
+    except Exception:
+        return None
+
+def _verify_host_cache_set(host: str, level: str, reason: str, ttl_s: Optional[int] = None) -> None:
+    """Cache host classification for a short time."""
+    try:
+        h = (host or "").strip().lower()
+        if not h:
+            return
+        if ttl_s is None:
+            ttl_s = _safe_int(os.environ.get("VERIFY_HOST_CACHE_TTL", "300"), 300)
+        ttl_s = max(30, int(ttl_s))
+        exp = time.time() + ttl_s
+        with _VERIFY_HOST_CACHE_LOCK:
+            _VERIFY_HOST_CACHE[h] = (exp, str(level or ""), str(reason or ""))
+    except Exception:
+        return
 _WRAP_URL_META = {}  # token -> (meta_dict, expires_epoch)
 
 def _wrap_url_store(url: str, meta: Optional[Dict[str, Any]] = None) -> str:
@@ -1110,6 +1396,12 @@ def _wrap_url_store(url: str, meta: Optional[Dict[str, Any]] = None) -> str:
                     if old_url == url and (not old_exp or time.time() <= old_exp):
                         _WRAP_URL_MAP[tok] = (url, exp)  # refresh TTL
                         if meta is not None:
+                            try:
+                                from urllib.parse import urlparse
+                                if isinstance(meta, dict) and "up_host" not in meta:
+                                    meta["up_host"] = (urlparse(url).netloc or "").lower()
+                            except Exception:
+                                pass
                             _WRAP_URL_META[tok] = (meta, exp)
                         if logger.isEnabledFor(logging.DEBUG):
                             logger.debug("REUSED_TOKEN len=%d", len(tok))
@@ -1120,6 +1412,12 @@ def _wrap_url_store(url: str, meta: Optional[Dict[str, Any]] = None) -> str:
         token = uuid.uuid4().hex[:16]  # 16 hex chars (Android-safe)
         _WRAP_URL_MAP[token] = (url, exp)
         if meta is not None:
+            try:
+                from urllib.parse import urlparse
+                if isinstance(meta, dict) and "up_host" not in meta:
+                    meta["up_host"] = (urlparse(url).netloc or "").lower()
+            except Exception:
+                pass
             _WRAP_URL_META[token] = (meta, exp)
         if WRAPPER_DEDUP:
             _WRAP_URL_HASH_TO_TOKEN[h] = token
@@ -2564,7 +2862,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
             break
     # Fallback: extract a Usenet identifier from the playback URL if present (e.g. TorBox hash/guid)
     if not usenet_hash and url:
-        m2 = re.search(r'\"hash\"\s*:\s*\"([0-9a-fA-F]{8,64})\"', url)
+        m2 = re.search(r'"hash"\s*:\s*"([0-9a-fA-F]{8,64})"', url)
         if not m2:
             m2 = re.search(r'/download/\d+/([0-9a-fA-F]{8,64})', url)
         if m2:
@@ -3791,86 +4089,188 @@ def _tie_break_score(m: Dict[str, Any], mismatch_ratio: float = 0.0) -> float:
 
 
 def _drop_bad_top_n(
-    candidates: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+    pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+    *,
     top_n: int,
-    timeout: float,
-    range_mode: Optional[bool] = None,
-    stats: Optional["PipeStats"] = None,
-    rid: Optional[str] = None,
+    timeout_s: Optional[float] = None,
+    deliver_cap: Optional[int] = None,
+    sort_buffer: Optional[int] = None,
+    base_sort_key: Optional[Callable[[Tuple[Dict[str, Any], Dict[str, Any]]], Any]] = None,
 ) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
-    """Verify the top-N candidates and drop obviously broken placeholders (e.g., /static/500.mp4).
-
-    IMPORTANT: This is called on Android (empty UA) and must be fast.
-    We run the N verifications concurrently to avoid Gunicorn worker timeouts.
     """
-    if top_n <= 0 or not candidates:
-        return candidates
+    Verify the top-N (and optionally refill) streams in sorted order, then:
+      - hard-drop unsafe/non-playable items
+      - host-propagate unsafe classifications across the whole candidate buffer
+      - rank-down risky sources (server/content-type, tiny stub mp4, etc.)
+    """
+    if not pairs or top_n <= 0:
+        return pairs
 
-    rid = rid or _rid()
-    to_verify = candidates[:top_n]
-    rm = True if range_mode is None else range_mode
-    if not to_verify:
-        return candidates
+    n_total = len(pairs)
+    deliver_cap_eff = max(0, int(deliver_cap or 0))
+    sort_buffer_eff = max(0, int(sort_buffer or 0))
 
-    # Keep ordering stable: results are stored by original index.
-    results: List[bool] = [False] * len(to_verify)
+    # How deep do we "look" for candidates to verify
+    scan_n = min(n_total, max(sort_buffer_eff, top_n))
+    # Refill logic: if drops happen, verify deeper until we have enough "kept" verified items.
+    refill = _safe_int(os.environ.get("VERIFY_REFILL_BUFFER", "0"), 0)
+    target_kept = top_n
+    if deliver_cap_eff > 0:
+        target_kept = max(top_n, min(scan_n, min(deliver_cap_eff, top_n + max(0, refill))))
+    max_total = _safe_int(os.environ.get("VERIFY_MAX_TOTAL", str(min(scan_n, max(target_kept + 20, top_n)))), min(scan_n, max(target_kept + 20, top_n)))
+    max_total = max(top_n, min(scan_n, max_total))
 
-    def verify_worker(idx: int, s: Dict[str, Any]) -> bool:
+    # Build ordered list of unique-URL indices within scan window
+    idxs: List[int] = []
+    seen_urls: set = set()
+    for i in range(scan_n):
+        s, _m = pairs[i]
+        u = s.get("url") or s.get("externalUrl") or ""
+        if not u:
+            continue
+        if u in seen_urls:
+            continue
+        seen_urls.add(u)
+        idxs.append(i)
+
+    if not idxs:
+        return pairs
+
+    unsafe_hosts: set = set()
+    risky_host_pen: Dict[str, int] = {}
+    to_drop_idx: set = set()
+    results: Dict[int, Tuple[bool, int, str]] = {}
+
+    def _host_key(s: Dict[str, Any], m: Dict[str, Any]) -> str:
+        # Prefer upstream host captured at wrap-time (pre /r token).
         try:
-            ok = _verify_stream_url(s, timeout=timeout, range_mode=rm)
-            logger.debug(
-                "VERIFY rid=%s idx=%s ok=%s url_head=%s",
-                rid,
-                idx,
-                ok,
-                ((s.get("url") or "")[:80]),
-            )
-            return bool(ok)
-        except Exception as e:
-            logger.debug("VERIFY_ERR rid=%s idx=%s err=%s", rid, idx, e)
+            h = (m.get("up_host") or "").strip().lower()
+            if h:
+                return h
+        except Exception:
+            pass
+        u = (s.get("url") or s.get("externalUrl") or "")
+        if not u:
+            return ""
+        try:
+            from urllib.parse import urlparse
+            net = (urlparse(u).netloc or "").lower()
+            net = net.split("@")[-1]
+            return net.split(":")[0]
+        except Exception:
+            return ""
+
+    def _is_host_unsafe(vcls: str) -> bool:
+        if not vcls:
             return False
+        if vcls.startswith("PROBE_UNSAFE_"):
+            return True
+        return vcls in {
+            "FINAL_NOT_PLAYABLE",
+            "UPSTREAM_ERROR_TEXT",
+            "CT_SIGNATURE_MISMATCH",
+            "REDIRECT_LOOP",
+            "REDIRECT_NO_LOCATION",
+            "PROBE_UNSAFE_LEAK",
+            "PROBE_UNSAFE_CL_MISMATCH",
+            "PROBE_UNSAFE_RANGE_IGNORED",
+            "HOST_CACHED_UNSAFE",
+        }
 
-    t0 = time.time()
-    # Cap workers so we don't stampede the upstream on small instances.
-    cap_workers = max(1, int(VERIFY_MAX_WORKERS or 8))
-    max_workers = min(len(to_verify), max(1, top_n), cap_workers)
+    def _is_host_risky(vcls: str) -> bool:
+        if not vcls:
+            return False
+        if vcls.startswith("RISKY_"):
+            return True
+        return vcls in {"RISKY_SERVER_HEADER", "RISKY_CT_OR_SERVER", "RISKY_CT", "STUB_MP4_TINY_TOTAL"}
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = []
-        for i, (s, _m) in enumerate(to_verify):
-            futs.append((i, ex.submit(verify_worker, i, s)))
+    # Parallel worker
+    max_workers = min(_safe_int(os.environ.get("VERIFY_MAX_WORKERS", "12"), 12), max(1, len(idxs)))
+    sess = requests.Session()
+    if timeout_s is None:
+        timeout_s = float(os.environ.get("VERIFY_TIMEOUT_S", "6.0") or 6.0)
 
-        for i, fut in futs:
-            try:
-                results[i] = bool(fut.result())
-            except Exception:
-                results[i] = False
+    def _worker(idx: int) -> Tuple[int, Tuple[bool, int, str, str]]:
+        s, m = pairs[idx]
+        hk = _host_key(s, m)
+        if hk in unsafe_hosts:
+            return (idx, (False, 0, "HOST_ALREADY_UNSAFE", hk))
+        u = s.get("url") or s.get("externalUrl") or ""
+        keep, pen, cls = _verify_stream_url(u, sess, timeout_s=timeout_s)
+        return (idx, (keep, pen, cls, hk))
 
-    kept: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-    dropped = 0
-    for i, pair in enumerate(to_verify):
-        if results[i]:
-            kept.append(pair)
-        else:
-            dropped += 1
+    # Progressive verify: batches until we have enough kept verified items
+    kept_ok = 0
+    total_done = 0
+    ptr = 0
+    batch_size = max(4, _safe_int(os.environ.get("VERIFY_BATCH_SIZE", str(min(10, top_n))), min(10, top_n)))
+    while ptr < len(idxs) and total_done < max_total and kept_ok < target_kept:
+        batch = idxs[ptr : ptr + batch_size]
+        ptr += len(batch)
 
-    # Append the rest unverified (same behavior as before, just faster for the top slice).
-    kept.extend(candidates[top_n:])
+        try:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futs = {ex.submit(_worker, i): i for i in batch}
+                for fut in as_completed(futs):
+                    idx, (keep, pen, cls, hk) = fut.result()
+                    results[idx] = (keep, pen, cls)
+                    total_done += 1
 
-    if stats is not None:
-        stats.dropped_dead_url += dropped
+                    # Host-level side effects
+                    if hk:
+                        if _is_host_unsafe(cls):
+                            unsafe_hosts.add(hk)
+                            _verify_host_cache_set(hk, "unsafe", cls)
+                        elif _is_host_risky(cls):
+                            # Keep the *largest* penalty for that host
+                            prev = risky_host_pen.get(hk, 0)
+                            if pen > prev:
+                                risky_host_pen[hk] = pen
+                            _verify_host_cache_set(hk, "risky", cls, ttl_s=_safe_int(os.environ.get("VERIFY_HOST_CACHE_TTL_RISKY", "300"), 300))
 
-    ms = int((time.time() - t0) * 1000)
-    logger.info(
-        "VERIFY_PARALLEL rid=%s top_n=%s workers=%s dropped=%s kept=%s ms=%s",
-        rid,
-        top_n,
-        max_workers,
-        dropped,
-        len(kept),
-        ms,
-    )
-    return kept
+                    # Stream-level drops
+                    if not keep:
+                        to_drop_idx.add(idx)
+                    else:
+                        kept_ok += 1
+        except Exception:
+            # If verification machinery fails, fall back to no-op (keep original ordering).
+            return pairs
+
+    # Apply results to metadata for logging/ranking
+    for i, (s, m) in enumerate(pairs[:scan_n]):
+        if i in results:
+            keep, pen, cls = results[i]
+            m["verify_cls"] = cls
+            if pen:
+                m["verify_rank"] = pen
+
+    # Propagate host risk penalties across the full candidate set
+    if risky_host_pen:
+        for s, m in pairs:
+            hk = _host_key(s, m)
+            if hk and hk in risky_host_pen:
+                m["verify_cls"] = m.get("verify_cls") or "HOST_RISKY_PROPAGATED"
+                m["verify_rank"] = max(int(m.get("verify_rank") or 0), int(risky_host_pen[hk]))
+
+    # Drop anything flagged unsafe explicitly, plus anything from unsafe hosts
+    filtered: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for i, (s, m) in enumerate(pairs):
+        hk = _host_key(s, m)
+        vcls = (m.get("verify_cls") or "")
+        if i in to_drop_idx:
+            continue
+        if hk and hk in unsafe_hosts:
+            continue
+        # If the stream itself has unsafe class, drop it too
+        if _is_host_unsafe(vcls):
+            continue
+        filtered.append((s, m))
+
+    return filtered
+
+
 def _res_to_int(res: str) -> int:
     """Normalize resolution strings into an integer height.
     Handles common variants + some non-Latin lookalikes (e.g., Cyrillic 'К').
@@ -4134,12 +4534,12 @@ def _diversify_by_quality_bucket(
                 if min_size > 0.0 and size > 0.0 and size < (threshold * min_size):
                     continue
 
-                base = sort_key(cand)  # ( -res, -size, -seeders, cached_val, prov_idx )
+                base = sort_key(cand)
                 penalty = (prov_ct[prov] * 0.12) + (sup_ct[sup] * 0.18)
                 if sup == "P2":
                     penalty = penalty - p2_bonus
 
-                k = (base[0], base[1], base[2], base[3] + penalty, base[4])
+                k = (penalty,) + tuple(base)
                 if best_k is None or k < best_k:
                     best_k = k
                     best_pair = cand
@@ -4155,7 +4555,7 @@ def _diversify_by_quality_bucket(
                     penalty = (prov_ct[prov] * 0.12) + (sup_ct[sup] * 0.18)
                     if sup == "P2":
                         penalty = penalty - p2_bonus
-                    k = (base[0], base[1], base[2], base[3] + penalty, base[4])
+                    k = (penalty,) + tuple(base)
                     if best_k is None or k < best_k:
                         best_k = k
                         best_pair = cand
@@ -4547,6 +4947,19 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # Early cap & cheap pre-dedup: large merged inputs can dominate CPU time (drops/dedup/sort).
     EARLY_CAP = _safe_int(os.environ.get("EARLY_CAP", "250"), 250)
     MAX_CANDIDATES = _safe_int(os.environ.get("MAX_CANDIDATES", "250"), 250)
+
+    # Headroom: verification can hard-drop some top-N entries. Ensure we keep enough candidates to still fill deliver_cap_eff.
+    VERIFY_REFILL_BUFFER = _safe_int(os.environ.get("VERIFY_REFILL_BUFFER", "40"), 40)
+    VERIFY_SORT_BUFFER = _safe_int(os.environ.get("VERIFY_SORT_BUFFER", "140"), 140)
+    try:
+        MAX_CANDIDATES = max(int(MAX_CANDIDATES or 0), int(deliver_cap_eff or 0) + max(10, int(VERIFY_REFILL_BUFFER or 0)), int(VERIFY_SORT_BUFFER or 0))
+    except Exception:
+        pass
+    try:
+        if EARLY_CAP and EARLY_CAP > 0:
+            EARLY_CAP = max(int(EARLY_CAP), int(MAX_CANDIDATES or 0))
+    except Exception:
+        pass
 
     def _quick_provider(_s: Dict[str, Any]) -> str:
         bh = (_s.get("behaviorHints") or {})
@@ -5205,14 +5618,15 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         instant_val = 0 if is_instant else 1
 
         ready_val = 0 if m.get("ready") else 1
+        verify_rank = int(m.get("verify_rank") or 0)
         prov_idx = _provider_rank(prov)
         score = _tie_break_score(m, float(m.get('_mismatch_ratio') or 0.0))
         # Sort order: instant -> cached -> resolution -> size -> seeders -> provider rank
         # Sort order: instant -> cached -> resolution -> size -> seeders -> provider rank
         if iphone_usenet_mode and usenet_priority_set:
             usenet_rank = 0 if prov in usenet_priority_set else 1
-            return (usenet_rank, ready_val, instant_val, cached_val, -res, -size_b, -score, -seeders, prov_idx)
-        return (instant_val, ready_val, cached_val, -res, -size_b, -score, -seeders, prov_idx)  # Add: Swap for stronger ready (Usenet beats non-instant cached)
+            return (usenet_rank, ready_val, instant_val, cached_val, verify_rank, -res, -size_b, -score, -seeders, prov_idx)
+        return (instant_val, ready_val, cached_val, verify_rank, -res, -size_b, -score, -seeders, prov_idx)  # Add: Swap for stronger ready (Usenet beats non-instant cached)
 
     did_verify = False
     out_pairs.sort(key=sort_key)
@@ -5222,7 +5636,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         try:
             top_n = ANDROID_VERIFY_TOP_N if (is_android or is_iphone) else VERIFY_DESKTOP_TOP_N
             timeout = ANDROID_VERIFY_TIMEOUT if (is_android or is_iphone) else VERIFY_STREAM_TIMEOUT
-            out_pairs = _drop_bad_top_n(out_pairs, int(top_n or 0), float(timeout or VERIFY_STREAM_TIMEOUT), stats=stats, rid=rid, range_mode=VERIFY_RANGE)
+            out_pairs = _drop_bad_top_n(out_pairs, top_n=int(top_n or 0), timeout_s=float(timeout or VERIFY_STREAM_TIMEOUT), stats=stats, rid=rid, range_mode=VERIFY_RANGE, deliver_cap=deliver_cap_eff, sort_buffer=VERIFY_SORT_BUFFER)
+            out_pairs.sort(key=sort_key)
             did_verify = True
         except Exception as e:
             logger.debug("VERIFY_PARALLEL_SKIPPED rid=%s err=%s", rid, e)
@@ -5564,13 +5979,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 logger.debug("ANDROID_VERIFY_SKIP rid=%s reason=already_verified", rid)
             else:
                 try:
-                    candidates = _drop_bad_top_n(
-                        candidates,
-                        ANDROID_VERIFY_TOP_N,
-                        ANDROID_VERIFY_TIMEOUT,
-                        stats=stats,
-                        rid=rid,
-                    )
+                    candidates = _drop_bad_top_n(candidates, top_n=int(ANDROID_VERIFY_TOP_N or 0), timeout_s=float(ANDROID_VERIFY_TIMEOUT or 0.0) or None, deliver_cap=deliver_cap_eff, sort_buffer=VERIFY_SORT_BUFFER)
                 except Exception as e:
                     logger.debug("ANDROID_VERIFY_SKIPPED rid=%s err=%s", rid, e)
         else:
