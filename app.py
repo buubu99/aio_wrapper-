@@ -3517,7 +3517,7 @@ AIO_SOFT_TIMEOUT_S = float(os.getenv("AIO_SOFT_TIMEOUT_S", "0") or 0)   # only u
 FASTLANE_ENABLED = _parse_bool(os.getenv("FASTLANE_ENABLED", "false"), False)
 FASTLANE_MIN_STREAMS = _safe_int(os.getenv("FASTLANE_MIN_STREAMS", "8"), 8)
 
-_AIO_CACHE = {}  # key -> (ts_monotonic, streams, count)
+_AIO_CACHE = {}  # key -> (ts_monotonic, streams, count, ms)
 _AIO_CACHE_LOCK = threading.Lock()
 
 def _aio_cache_get(key: str):
@@ -3528,18 +3528,26 @@ def _aio_cache_get(key: str):
         v = _AIO_CACHE.get(key)
         if not v:
             return None
-        ts, streams, count = v
+        # Backward compatible with older 3-tuple cache entries
+        try:
+            ts, streams, count, ms = v
+        except Exception:
+            try:
+                ts, streams, count = v
+                ms = 0
+            except Exception:
+                return None
         if (now - ts) > AIO_CACHE_TTL_S:
             _AIO_CACHE.pop(key, None)
             return None
-        return streams, count
+        return streams, count, int(ms or 0)
 
-def _aio_cache_set(key: str, streams: list, count: int):
+def _aio_cache_set(key: str, streams: list, count: int, ms: int = 0):
     if AIO_CACHE_TTL_S <= 0:
         return
     now = time.monotonic()
     with _AIO_CACHE_LOCK:
-        _AIO_CACHE[key] = (now, streams, count)
+        _AIO_CACHE[key] = (now, streams, count, int(ms or 0))
         # evict oldest entries if over cap
         while len(_AIO_CACHE) > AIO_CACHE_MAX:
             oldest = next(iter(_AIO_CACHE))
@@ -3552,7 +3560,7 @@ def _make_aio_cache_update_cb(aio_key: str):
         try:
             s, cnt, _ms, _meta = fut.result()
             if s:
-                _aio_cache_set(aio_key, s, cnt)
+                _aio_cache_set(aio_key, s, cnt, int(_ms or 0))
         except Exception:
             pass
     return _cb
@@ -3731,8 +3739,9 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
 
     if mode == "swr" and cached is not None:
         # Use cached AIO instantly; refresh in background
-        aio_streams, aio_in = cached
-        aio_ms = 0
+        aio_streams, aio_in, cached_ms = cached
+        aio_ms = int(cached_ms or 0)
+        aio_meta = {'tag': AIO_TAG, 'ok': True, 'err': 'cache_hit', 'count': int(aio_in or 0), 'ms': int(aio_ms or 0)}
 
         if aio_fut:
             aio_fut.add_done_callback(_make_aio_cache_update_cb(aio_key))
@@ -3749,10 +3758,14 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
             aio_streams, aio_in, aio_ms, aio_meta = aio_fut.result(timeout=min(soft, max(0.05, deadline - time.monotonic())))
         except FuturesTimeoutError:
             if cached is not None:
-                aio_streams, aio_in = cached
+                aio_streams, aio_in, cached_ms = cached
+                aio_ms = int(cached_ms or 0)
+                aio_meta = {'tag': AIO_TAG, 'ok': True, 'err': 'soft_timeout_cache' if float(soft or 0) > 0 else 'cache_hit', 'count': int(aio_in or 0), 'ms': int(aio_ms or 0), 'soft_timeout_ms': int(float(soft or 0) * 1000)}
             else:
                 aio_streams, aio_in = [], 0
-            aio_ms = int(soft * 1000)
+                aio_ms = int(float(soft or 0) * 1000)
+                aio_meta = {'tag': AIO_TAG, 'ok': False, 'err': 'timeout', 'count': 0, 'ms': int(aio_ms or 0), 'soft_timeout_ms': int(float(soft or 0) * 1000)}
+            pass  # aio_ms set per-branch
 
             # refresh cache when AIO finishes
             aio_fut.add_done_callback(_make_aio_cache_update_cb(aio_key))
@@ -3771,7 +3784,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
         _harvest_p2()
 
         if aio_streams:
-            _aio_cache_set(aio_key, aio_streams, aio_in)
+            _aio_cache_set(aio_key, aio_streams, aio_in, int(aio_ms or 0))
 
     merged = aio_streams + p2_streams
 
