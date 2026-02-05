@@ -102,11 +102,11 @@ class PipeStats:
         """Backward-compatible alias for older log strings that expect stats.platform."""
         return self.client_platform
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, wait
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 import requests
-from flask import Flask, jsonify, g, has_request_context, request, redirect, make_response, Response
+from flask import Flask, jsonify, g, has_request_context, request, make_response, Response
 from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -195,7 +195,6 @@ FLAG_SLOW_TB_API_MS = _safe_int(os.environ.get("FLAG_SLOW_TB_API_MS", "3000"), 3
 FLAG_SLOW_TITLE_MS = _safe_int(os.environ.get("FLAG_SLOW_TITLE_MS", "800"), 800)
 FLAG_SLOW_UNCACHED_MS = _safe_int(os.environ.get("FLAG_SLOW_UNCACHED_MS", "800"), 800)
 ENABLE_STATS_ENDPOINT = _parse_bool(os.environ.get("ENABLE_STATS_ENDPOINT", "true"), True)
-ANDROID_MAX_DELIVER = _safe_int(os.environ.get('ANDROID_MAX_DELIVER', '60'), 60)
 
 INPUT_CAP = _safe_int(os.environ.get('INPUT_CAP', '4500'), 4500)
 MAX_DELIVER = _safe_int(os.environ.get('MAX_DELIVER', '80'), 80)
@@ -231,6 +230,25 @@ TB_BASE = "https://api.torbox.app"
 TB_BATCH_SIZE = _safe_int(os.environ.get('TB_BATCH_SIZE', '50'), 50)
 TB_BATCH_CONCURRENCY = _safe_int(os.environ.get('TB_BATCH_CONCURRENCY', '1'), 1)  # 1=sequential; >1 parallelize TorBox batch requests
 TB_MAX_HASHES = _safe_int(os.environ.get('TB_MAX_HASHES', '60'), 60)  # limit hashes checked per request for speed
+
+# TorBox per-platform hash budgets (fallback to TB_MAX_HASHES if unset)
+TB_MAX_HASHES_DESKTOP = _safe_int(os.environ.get('TB_MAX_HASHES_DESKTOP', str(TB_MAX_HASHES)), TB_MAX_HASHES)
+TB_MAX_HASHES_ANDROID = _safe_int(os.environ.get('TB_MAX_HASHES_ANDROID', str(TB_MAX_HASHES)), TB_MAX_HASHES)
+TB_MAX_HASHES_IPHONE = _safe_int(os.environ.get('TB_MAX_HASHES_IPHONE', str(TB_MAX_HASHES)), TB_MAX_HASHES)
+TB_MAX_HASHES_ANDROIDTV = _safe_int(os.environ.get('TB_MAX_HASHES_ANDROIDTV', str(TB_MAX_HASHES)), TB_MAX_HASHES)
+
+# Futures timeouts (seconds) to prevent slow/blocked futures from stalling /stream
+TB_BATCH_FUTURE_TIMEOUT = _safe_float(os.environ.get('TB_BATCH_FUTURE_TIMEOUT', '8'), 8.0)
+WEBDAV_FUTURE_TIMEOUT = _safe_float(os.environ.get('WEBDAV_FUTURE_TIMEOUT', '3'), 3.0)
+VERIFY_FUTURE_TIMEOUT = _safe_float(os.environ.get('VERIFY_FUTURE_TIMEOUT', '4'), 4.0)
+
+# RD heuristic tuning knobs
+RD_HEUR_THR = _safe_float(os.environ.get('RD_HEUR_THR', '0.82'), 0.82)
+RD_HEUR_MIN_SIZE_GB = _safe_float(os.environ.get('RD_HEUR_MIN_SIZE_GB', '1.0'), 1.0)
+
+# TorBox known-cached memoization (TTL cache)
+TB_KNOWN_CACHED_TTL = _safe_int(os.environ.get('TB_KNOWN_CACHED_TTL', '3600'), 3600)
+TB_KNOWN_CACHED_MAX = _safe_int(os.environ.get('TB_KNOWN_CACHED_MAX', '20000'), 20000)
 TB_API_MIN_HASHES = _safe_int(os.environ.get('TB_API_MIN_HASHES', '20'), 20)  # skip TorBox API calls if fewer hashes
 TB_CACHE_HINTS = _parse_bool(os.environ.get("TB_CACHE_HINTS", "true"), True)  # enable TorBox cache hint lookups
 TB_EARLY_EXIT = _parse_bool(os.environ.get("TB_EARLY_EXIT", "false"), False)  # skip TorBox checks when enough cached hints already present
@@ -273,21 +291,18 @@ PREFERRED_LANG = os.environ.get("PREFERRED_LANG", "EN").upper()
 # Premium priorities and verification
 PREMIUM_PRIORITY = _safe_csv(os.environ.get('PREMIUM_PRIORITY', 'TB,RD,AD,ND'))
 USENET_PRIORITY = _safe_csv(os.environ.get('USENET_PRIORITY', 'ND,EW,NG'))
-# Original: IPHONE_USENET_ONLY = _parse_bool(os.environ.get("IPHONE_USENET_ONLY", "true"), True)
-IPHONE_USENET_ONLY = False  # Add: Enable debrid HTTP on iPhone (short paths only, no magnets—fixes hash with cached streams)
+IPHONE_USENET_ONLY = _parse_bool(os.environ.get("IPHONE_USENET_ONLY", "false"), False)  # env-driven; default off
 USENET_PROVIDERS = _safe_csv(os.environ.get("USENET_PROVIDERS", ",".join(USENET_PRIORITY) if USENET_PRIORITY else "ND,EW,NG"))
 USENET_SEEDER_BOOST = _safe_int(os.environ.get('USENET_SEEDER_BOOST', '10'), 10)
 INSTANT_BOOST_TOP_N = _safe_int(os.environ.get('INSTANT_BOOST_TOP_N', '0'), 0)  # 0=off; set in Render if wanted
 DIVERSITY_TOP_M = _safe_int(os.environ.get('DIVERSITY_TOP_M', '0'), 0)  # 0=off; set in Render if wanted
 DIVERSITY_POOL_MULT = _safe_int(os.environ.get('DIVERSITY_POOL_MULT', '10'), 10)  # pool = m * mult (lets diversity pull from deeper)
-CANDIDATE_WINDOW_MULT = _safe_int(os.environ.get('CANDIDATE_WINDOW_MULT', '10'), 10)  # window = DELIVER_CAP * mult (buffer for quotas)
 DIVERSITY_THRESHOLD = _safe_float(os.environ.get('DIVERSITY_THRESHOLD', '0.85'), 0.85)  # quality guard for diversity (0.0-1.0)
 P2_SRC_BOOST = _safe_int(os.environ.get('P2_SRC_BOOST', '5'), 5)  # slight preference for P2 when diversifying
 INPUT_CAP_PER_SOURCE = _safe_int(os.environ.get('INPUT_CAP_PER_SOURCE', '0'), 0)  # 0=off; per-supplier cap if set
 DL_ASSOC_PARSE = _parse_bool(os.environ.get('DL_ASSOC_PARSE', 'true'), True)  # default true; set false in Render to disable
 VERIFY_PREMIUM = _parse_bool(os.environ.get("VERIFY_PREMIUM", "true"), True)
 ASSUME_PREMIUM_ON_FAIL = _parse_bool(os.environ.get("ASSUME_PREMIUM_ON_FAIL", "false"), False)
-POLL_ATTEMPTS = _safe_int(os.environ.get('POLL_ATTEMPTS', '2'), 2)
 
 # TorBox WebDAV — INACTIVE  //✅
 # Kept as stubs for future experimentation, but FORCED OFF so it never affects runtime or logic.
@@ -304,16 +319,13 @@ TB_WEBDAV_STRICT = False  # INACTIVE  //✅ (ignore env)
 VERIFY_CACHED_ONLY = _parse_bool(os.environ.get("VERIFY_CACHED_ONLY", "false"), False)
 STRICT_PREMIUM_ONLY = _parse_bool(os.environ.get('STRICT_PREMIUM_ONLY', 'false'), False)  # loose default; strict drops uncached
 MIN_CACHE_CONFIDENCE = _safe_float(os.environ.get('MIN_CACHE_CONFIDENCE', '0.8'), 0.8)
-VALIDATE_CACHE_TIMEOUT = _safe_float(os.environ.get('VALIDATE_CACHE_TIMEOUT', '10'), 10.0)
 
 # Cancelled RD/AD instant checks – removed functions, now heuristics only
 # (No RD_STRICT_CACHE_CHECK, RD_API_KEY, AD_STRICT_CACHE_CHECK, AD_API_KEY)
 
 # Limit strict cache checks per request to avoid excessive API churn
-STRICT_CACHE_MAX = _safe_int(os.environ.get('STRICT_CACHE_MAX', '18'), 18)
 
 # --- Add-ons / extensions (optional) ---
-DEPRIORITIZE_RD = _parse_bool(os.environ.get("DEPRIORITIZE_RD", "false"), False)
 DROP_RD = _parse_bool(os.environ.get("DROP_RD", "false"), False)
 DROP_AD = _parse_bool(os.environ.get("DROP_AD", "false"), False)
 
@@ -324,7 +336,6 @@ USE_AGE_HEURISTIC = _parse_bool(os.environ.get("USE_AGE_HEURISTIC", "true"), Tru
 ADD_CACHE_HINT = _parse_bool(os.environ.get("ADD_CACHE_HINT", "true"), True)
 
 # TorBox strict cache filtering (different from TB_CACHE_HINTS which only adds a hint)
-TORBOX_CACHE_CHECK = _parse_bool(os.environ.get("TORBOX_CACHE_CHECK", "true"), True)
 VERIFY_TB_CACHE_OFF = _parse_bool(os.environ.get("VERIFY_TB_CACHE_OFF", "false"), False)
 
 # Wrapper behavior toggles
@@ -338,16 +349,13 @@ RANGE_PROBE_GUARD = _parse_bool(os.environ.get("RANGE_PROBE_GUARD", "true"), Tru
 RANGE_PROBE_MAX_BYTES = _safe_int(os.environ.get("RANGE_PROBE_MAX_BYTES", "1024"), 1024)
 WRAPPER_DEDUP = _parse_bool(os.environ.get("WRAPPER_DEDUP", "true"), True)
 
-VERIFY_STREAM = _parse_bool(os.environ.get("VERIFY_STREAM", "true"), True)
+VERIFY_STREAM = _parse_bool(os.environ.get("VERIFY_STREAM", "false"), False)  # env-driven; default off
 VERIFY_STREAM_TIMEOUT = _safe_float(os.environ.get('VERIFY_STREAM_TIMEOUT', '4'), 4.0)
 
 # Stronger playback verification (catches upstream /static/500.mp4 placeholders)
 VERIFY_RANGE = _parse_bool(os.environ.get("VERIFY_RANGE", "true"), True)
-VERIFY_DROP_STATIC_500 = _parse_bool(os.environ.get("VERIFY_DROP_STATIC_500", "false"), False)
-VERIFY_MIN_TOTAL_BYTES = _safe_int(os.environ.get('VERIFY_MIN_TOTAL_BYTES', '5000000'), 5000000)  # 5MB floor
 ANDROID_VERIFY_TOP_N = _safe_int(os.environ.get('ANDROID_VERIFY_TOP_N', '6'), 6)
 VERIFY_DESKTOP_TOP_N = _safe_int(os.environ.get('VERIFY_DESKTOP_TOP_N', '20'), 20)
-VERIFY_MAX_WORKERS = _safe_int(os.environ.get('VERIFY_MAX_WORKERS', '8'), 8)
 ANDROID_VERIFY_TIMEOUT = _safe_float(os.environ.get('ANDROID_VERIFY_TIMEOUT', '3.0'), 3.0)
 ANDROID_VERIFY_OFF = _parse_bool(os.environ.get("ANDROID_VERIFY_OFF", "false"), False)
 
@@ -364,7 +372,6 @@ BLACKLIST_TERMS = [t.strip().lower() for t in os.environ.get("BLACKLIST_TERMS", 
 BLACKLIST_URL = os.environ.get("BLACKLIST_URL", "")
 USE_FAKES_DB = _parse_bool(os.environ.get("USE_FAKES_DB", "true"), True)
 FAKES_DB_URL = os.environ.get("FAKES_DB_URL", "")
-USE_SIZE_MISMATCH = _parse_bool(os.environ.get("USE_SIZE_MISMATCH", "true"), True)
 
 # Optional: simple rate-limit (e.g. "30/m", "5/s"). Blank disables it.
 RATE_LIMIT = (os.environ.get("RATE_LIMIT", "") or "").strip()
@@ -633,20 +640,6 @@ def _parse_http_range(rng: str):
     end = int(end_s) if end_s != "" else None
     return (start, end)
 
-def _parse_content_range_total(cr: Optional[str]) -> Optional[int]:
-    # Example: "bytes 0-0/16440"
-    if not cr or "/" not in cr:
-        return None
-    try:
-        total = cr.split("/")[-1].strip()
-        return int(total) if total.isdigit() else None
-    except Exception:
-        return None
-
-
-def _looks_like_static_500(url: str) -> bool:
-    u = (url or "").lower()
-    return "500.mp4" in u and "/static/" in u
 
 
 def _verify_stream_url(
@@ -1027,6 +1020,55 @@ def _provider_rank(prov: str) -> int:
     return 999
 
 
+# TorBox known-cached memoization (TTL cache).
+# This avoids re-checking hashes we've recently confirmed as cached,
+# reducing TorBox API churn and improving /stream latency.
+_TB_KNOWN_CACHED_LOCK = threading.Lock()
+_TB_KNOWN_CACHED: Dict[str, float] = {}  # hash -> expires_epoch
+
+def _tb_known_cached_prune(now_epoch: float, ttl_s: int, max_items: int) -> None:
+    """Prune expired entries and cap total size."""
+    if ttl_s <= 0 or max_items <= 0:
+        with _TB_KNOWN_CACHED_LOCK:
+            _TB_KNOWN_CACHED.clear()
+        return
+    with _TB_KNOWN_CACHED_LOCK:
+        # Remove expired
+        for h, exp in list(_TB_KNOWN_CACHED.items()):
+            if exp <= now_epoch:
+                _TB_KNOWN_CACHED.pop(h, None)
+        # Cap size (evict arbitrary oldest-in-dict entries)
+        while len(_TB_KNOWN_CACHED) > max_items:
+            _TB_KNOWN_CACHED.pop(next(iter(_TB_KNOWN_CACHED)), None)
+
+def _tb_known_cached_is_live(h: str, now_epoch: Optional[float] = None) -> bool:
+    if not h:
+        return False
+    hh = (h or '').strip().lower()
+    now = float(now_epoch) if now_epoch is not None else time.time()
+    with _TB_KNOWN_CACHED_LOCK:
+        exp = _TB_KNOWN_CACHED.get(hh)
+    return bool(exp and exp > now)
+
+def _tb_known_cached_refresh(h: str, now_epoch: float, ttl_s: int) -> None:
+    if not h or ttl_s <= 0:
+        return
+    hh = (h or '').strip().lower()
+    with _TB_KNOWN_CACHED_LOCK:
+        _TB_KNOWN_CACHED[hh] = float(now_epoch) + float(ttl_s)
+
+def _tb_known_cached_premark(hashes: List[str], cached_map: Dict[str, Any], now_epoch: float) -> set:
+    """Pre-mark cached_map for hashes known cached and return the known set."""
+    known = set()
+    for h in hashes or []:
+        hh = (h or '').strip().lower()
+        if not hh:
+            continue
+        if _tb_known_cached_is_live(hh, now_epoch=now_epoch):
+            cached_map[hh] = True
+            known.add(hh)
+    return known
+
 def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
     """TorBox torrent cached availability check.
 
@@ -1092,13 +1134,26 @@ def tb_get_cached(hashes: List[str]) -> Dict[str, bool]:
 
     bc = max(1, int(TB_BATCH_CONCURRENCY or 1))
     if bc > 1 and len(batches) > 1:
-        with ThreadPoolExecutor(max_workers=min(bc, len(batches))) as ex:
-            futs = [ex.submit(_do_batch, b) for b in batches]
-            for fut in as_completed(futs):
+        ex = ThreadPoolExecutor(max_workers=min(bc, len(batches)))
+        futs = [ex.submit(_do_batch, b) for b in batches]
+        try:
+            done, not_done = wait(futs, timeout=float(TB_BATCH_FUTURE_TIMEOUT or 8.0))
+            for fut in done:
                 try:
                     out.update(fut.result() or {})
                 except Exception:
                     continue
+            # Cancel any remaining work; don't stall request on slow batches.
+            for fut in not_done:
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+        finally:
+            try:
+                ex.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                ex.shutdown(wait=False)
     else:
         for b in batches:
             out.update(_do_batch(b))
@@ -1163,13 +1218,25 @@ def tb_get_usenet_cached(hashes: List[str]) -> Dict[str, bool]:
 
     bc = max(1, int(TB_BATCH_CONCURRENCY or 1))
     if bc > 1 and len(batches) > 1:
-        with ThreadPoolExecutor(max_workers=min(bc, len(batches))) as ex:
-            futs = [ex.submit(_do_batch, b) for b in batches]
-            for fut in as_completed(futs):
+        ex = ThreadPoolExecutor(max_workers=min(bc, len(batches)))
+        futs = [ex.submit(_do_batch, b) for b in batches]
+        try:
+            done, not_done = wait(futs, timeout=float(TB_BATCH_FUTURE_TIMEOUT or 8.0))
+            for fut in done:
                 try:
                     out.update(fut.result() or {})
                 except Exception:
                     continue
+            for fut in not_done:
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+        finally:
+            try:
+                ex.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                ex.shutdown(wait=False)
     else:
         for b in batches:
             out.update(_do_batch(b))
@@ -1223,21 +1290,28 @@ def tb_webdav_batch_check(hashes: List[str], stats: Optional[PipeStats] = None) 
         if ok:
             return h
         return None
-    from concurrent.futures import as_completed
-    with ThreadPoolExecutor(max_workers=max(1, TB_WEBDAV_WORKERS)) as ex:
-        futures = [ex.submit(worker, item) for item in urls]
-        for fut in as_completed(futures):
+    ex = ThreadPoolExecutor(max_workers=max(1, TB_WEBDAV_WORKERS))
+    futures = [ex.submit(worker, item) for item in urls]
+    try:
+        done, not_done = wait(futures, timeout=float(WEBDAV_FUTURE_TIMEOUT or 3.0))
+        for fut in done:
             try:
                 res = fut.result()
                 if res:
                     ok.add(res)
-            except Exception as e:
-                logger.warning("WebDAV worker error: %s", e)
-                try:
-                    if stats is not None:
-                        stats.errors_api += 1
-                except Exception:
-                    pass
+            except Exception:
+                continue
+        for fut in not_done:
+            try:
+                fut.cancel()
+            except Exception:
+                pass
+    finally:
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            ex.shutdown(wait=False)
+
     return ok
 
 
@@ -1977,138 +2051,6 @@ class SafeFormatter(logging.Formatter):
         return super().format(record)
 
 
-@app.get("/copy/<path:token>")
-def copy_stream_url(token: str):
-    """Human-friendly helper: resolve /r/<token> to the upstream URL and provide a Copy button."""
-    url = None
-
-    # 1) Short-token map (if enabled)
-    if WRAP_URL_SHORT:
-        try:
-            url = _wrap_url_load(token)
-        except Exception:
-            url = None
-
-    # 2) Restart-safe compressed token
-    if not url and str(token).startswith("z"):
-        try:
-            url = _zurl_decode(token)
-        except Exception:
-            url = None
-
-    # 3) Legacy: token may be base64 of the full URL
-    if not url:
-        try:
-            url = _b64u_decode(token)
-        except Exception:
-            url = None
-
-    if not url:
-        return ("", 404)
-
-    # Best-effort: attach stored token metadata for correlation (especially iPhone "not ready" cases)
-    _tok_meta = None
-    try:
-        if WRAP_URL_SHORT and token and (not token.startswith("z")):
-            _tok_meta = _wrap_url_meta_load(token)
-    except Exception:
-        _tok_meta = None
-
-    try:
-        if _is_true(os.environ.get("WRAP_LOG_TOKEN_HIT", "false")):
-            # Sampling (percent)
-            try:
-                pct = float(os.environ.get("WRAP_LOG_TOKEN_SAMPLE_PCT", "100") or "100")
-            except Exception:
-                pct = 100.0
-            if pct >= 100.0 or (random.random() * 100.0) <= pct:
-                _tok_disp = token if _is_true(os.environ.get("WRAP_LOG_TOKEN_FULL", "false")) else (token[:4] + "…" + token[-4:] if len(token) > 10 else token)
-                _rng = request.headers.get("Range", "")
-                logger.info(
-                    "TOKEN_HIT rid=%s tok=%s method=%s platform=%s ua=%s range=%s host=%s emit_rid=%s prov=%s tag=%s res=%s seeders=%s cached=%s ready=%s",
-                    _rid(),
-                    _tok_disp,
-                    request.method,
-                    client_platform(is_android=is_android_client(), is_iphone=is_iphone_client()),
-                    _rng[:64],
-                    _safe_url_host(url),
-                    (_tok_meta or {}).get("emit_rid", ""),
-                    (_tok_meta or {}).get("provider", ""),
-                    (_tok_meta or {}).get("tag", ""),
-                    (_tok_meta or {}).get("res", ""),
-                    (_tok_meta or {}).get("seeders", ""),
-                    (_tok_meta or {}).get("cached", ""),
-                    (_tok_meta or {}).get("ready", ""),
-                )
-    except Exception:
-        pass
-
-
-    esc = _html.escape
-    upstream = str(url)
-    upstream_esc = esc(upstream, quote=True)
-
-    html_page = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Copy stream URL</title>
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; padding: 24px; max-width: 900px; margin: 0 auto; }}
-    h1 {{ font-size: 18px; margin: 0 0 12px; }}
-    .row {{ display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }}
-    input {{ width: min(820px, 100%); padding: 10px; font-size: 14px; }}
-    button, a {{ padding: 10px 14px; font-size: 14px; text-decoration: none; cursor: pointer; }}
-    .ok {{ opacity: .8; font-size: 12px; margin-top: 8px; }}
-  </style>
-</head>
-<body>
-  <h1>Copy stream URL</h1>
-  <div class="row">
-    <input id="u" value="{upstream_esc}" readonly />
-    <button id="btn" onclick="copyUrl()">Copy</button>
-    <a href="{upstream_esc}" target="_blank" rel="noopener">Open</a>
-  </div>
-  <div id="msg" class="ok"></div>
-  <script>
-    function copyUrl() {{
-      const el = document.getElementById('u');
-      el.focus();
-      el.select();
-      el.setSelectionRange(0, 999999);
-      const v = el.value;
-      const msg = document.getElementById('msg');
-
-      if (navigator.clipboard && navigator.clipboard.writeText) {{
-        navigator.clipboard.writeText(v).then(() => {{
-          msg.textContent = "Copied!";
-        }}).catch(() => {{
-          try {{
-            document.execCommand('copy');
-            msg.textContent = "Copied!";
-          }} catch (e) {{
-            msg.textContent = "Copy failed — select the text and copy manually.";
-          }}
-        }});
-      }} else {{
-        try {{
-          document.execCommand('copy');
-          msg.textContent = "Copied!";
-        }} catch (e) {{
-          msg.textContent = "Copy failed — select the text and copy manually.";
-        }}
-      }}
-    }}
-  </script>
-</body>
-</html>"""
-
-    resp = make_response(html_page, 200)
-    resp.headers["Content-Type"] = "text/html; charset=utf-8"
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    return resp
 
 
 class RequestIdFilter(logging.Filter):
@@ -2256,6 +2198,19 @@ def client_platform(is_android: bool, is_iphone: bool) -> str:
     if "windows" in ua_l or "mac os" in ua_l or "x11" in ua_l or "linux" in ua_l:
         return "desktop"
     return "unknown"
+
+def _choose_tb_max_hashes(platform: str) -> int:
+    """Choose the TorBox hash budget based on client platform (fallback to TB_MAX_HASHES)."""
+    p = (platform or '').strip().lower()
+    if p == 'desktop':
+        return int(TB_MAX_HASHES_DESKTOP or TB_MAX_HASHES)
+    if p == 'androidtv':
+        return int(TB_MAX_HASHES_ANDROIDTV or TB_MAX_HASHES)
+    if p == 'android':
+        return int(TB_MAX_HASHES_ANDROID or TB_MAX_HASHES)
+    if p == 'iphone':
+        return int(TB_MAX_HASHES_IPHONE or TB_MAX_HASHES)
+    return int(TB_MAX_HASHES)
 
 
 # ---------------------------
@@ -2436,16 +2391,6 @@ def android_sanitize_out_stream(stream: Any) -> Optional[Dict[str, Any]]:
     return out
 
 
-def android_sanitize_stream_list(streams: Any) -> List[Dict[str, Any]]:
-    if not isinstance(streams, list):
-        return []
-    cleaned: List[Dict[str, Any]] = []
-    for s in streams:
-        cs = android_sanitize_out_stream(s)
-        if isinstance(cs, dict) and cs.get("url"):
-            cleaned.append(cs)
-    return cleaned
-
 def _parse_rate_limit(limit: str) -> tuple[int, int]:
     s = (limit or '').strip().lower()
     m = re.match(r'^(\d+)\s*/\s*(second|sec|minute|min|hour|hr)$', s)
@@ -2499,33 +2444,6 @@ def _looks_instant(text: str) -> bool:
     if any(grp in text for grp in ['diyhdhome', 'aoc', 'tmt', 'surcode', 'bhysourbits']):
         return True
     return False
-
-def _cache_confidence(s: Dict[str, Any], meta: Dict[str, Any]) -> float:
-    try:
-        text = f"{s.get('name','')} {s.get('description','')} {meta.get('title_raw','')}"
-        size_gb = float(meta.get('size', 0)) / (1024 ** 3) if meta.get('size') else 0.0
-        age = _extract_age_days(text)  # None if unknown
-        instant = _looks_instant(text)
-        score = 0.0
-        # Add: RD-specific heuristic boost (maintain without API—France cancel)
-        provider = str(meta.get('provider') or s.get('provider') or '').upper().strip()
-        seeders = int(meta.get('seeders') or 0)
-
-        if size_gb >= 2.0:
-            score += 0.4
-        if age is not None and age <= 30:
-            score += 0.3
-        if instant:
-            score += 0.3
-        # Add: RD-specific heuristic boost (maintain without API—France cancel)
-        if provider in ('RD', 'REALDEBRID'):
-            if seeders > 50:
-                score += 0.3  # RD high seeders likely cached (heuristic)
-            if size_gb > 10:
-                score += 0.2  # Large RD files often cached (heuristic)
-        return min(1.0, max(0.0, score))
-    except Exception:
-        return 0.0
 
 def _heuristic_cached(s: Dict[str, Any], meta: Dict[str, Any]) -> bool:
     """Heuristic guess for whether a premium/debrid stream is effectively cached/ready.
@@ -2617,7 +2535,12 @@ def _heuristic_cached(s: Dict[str, Any], meta: Dict[str, Any]) -> bool:
     ok = False
     try:
         if provider == "RD":
-            ok = conf >= 0.70
+            thr = float(RD_HEUR_THR or 0.70)
+            min_gb = float(RD_HEUR_MIN_SIZE_GB or 0.0)
+            if size_gb is not None and float(size_gb) < min_gb:
+                ok = False
+            else:
+                ok = conf >= thr
         elif provider == "AD":
             ok = conf >= 0.65
         else:
@@ -2893,13 +2816,6 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
         "container": container,
     }
 
-# Helper for provider keys (customize as per env)
-def api_key_for_provider(provider: str) -> str:
-    provider = (provider or "").upper()
-    if provider == "TB":
-        return os.environ.get("TB_API_KEY", "")
-    # No RD/AD keys needed now
-    return ""
 
 # ---------------------------
 # Expected metadata (real TMDB fetch)
@@ -3472,8 +3388,12 @@ def build_stream_object_rich(
 
     # Helpful hints for debugging/stats (safe under behaviorHints).
     # These are ignored by strict clients, but make logs and troubleshooting much easier.
-    bh_out["provider"] = str((m or {}).get("provider") or raw_bh.get("provider") or "UNK").upper()
-    bh_out["source"] = str((m or {}).get("source") or raw_bh.get("source") or "UNK")
+    prov_hint = str((m or {}).get("provider") or raw_bh.get("provider") or "").upper().strip()
+    if prov_hint:
+        bh_out["provider"] = prov_hint
+    src_hint = str((m or {}).get("source") or raw_bh.get("source") or "").strip()
+    if src_hint:
+        bh_out["source"] = src_hint
     if is_confirmed:
         bh_out["cached"] = True
     elif isinstance(raw_bh.get("cached"), (bool, str)):
@@ -3485,6 +3405,7 @@ def build_stream_object_rich(
 
     # Preserve wrapper supplier tag (AIO/P2) on delivered streams so WRAP_COUNTS out.by_supplier stays correct.
     # NOTE: behaviorHints.source may be WEB/BLURAY/REMUX/etc; supplier is tracked separately in wrap_src/source_tag.
+    default_sup = str(AIO_TAG or "AIO").upper()
     try:
         supplier = (raw_bh.get("wrap_src") or raw_bh.get("source_tag") or "").strip()
         supplier_u = str(supplier).upper() if supplier else ""
@@ -3493,11 +3414,11 @@ def build_stream_object_rich(
             bh_out["wrap_src"] = supplier_u
             bh_out["source_tag"] = supplier_u
         else:
-            bh_out["wrap_src"] = "UNK"
-            bh_out["source_tag"] = "UNK"
+            bh_out["wrap_src"] = default_sup
+            bh_out["source_tag"] = default_sup
     except Exception:
-        bh_out["wrap_src"] = "UNK"
-        bh_out["source_tag"] = "UNK"
+        bh_out["wrap_src"] = default_sup
+        bh_out["source_tag"] = default_sup
 
     out = {
         "name": name,
@@ -3532,40 +3453,6 @@ def _auth_headers(auth: str) -> Dict[str, str]:
     headers['Authorization'] = auth
     return headers
 
-def _fetch_streams_from_base(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float = REQUEST_TIMEOUT, no_retry: bool = False) -> List[Dict[str, Any]]:
-    if not base:
-        return []
-    url = f"{base}/stream/{type_}/{id_}.json"
-    headers = _auth_headers(auth)
-    logger.info(f'{tag} fetch URL: {url}')
-    try:
-        sess = fast_session if no_retry else session
-        resp = sess.get(url, headers=headers, timeout=timeout)
-        logger.info(f'{tag} status={resp.status_code} bytes={len(resp.content)}')
-        if resp.status_code != 200:
-            return []
-        data = resp.json() if resp.content else {}
-        raw_streams = (data.get('streams') or [])
-        cap_n = int(INPUT_CAP)
-        if INPUT_CAP_PER_SOURCE and int(INPUT_CAP_PER_SOURCE) > 0:
-            cap_n = min(cap_n, int(INPUT_CAP_PER_SOURCE))
-        streams = raw_streams[:cap_n]
-        # Lightweight tagging for debug (does not expose tokens)
-        for s in streams:
-            if isinstance(s, dict):
-                bh = s.setdefault('behaviorHints', {})
-                # Preserve wrapper supplier tag separately from content 'source' (which later becomes WEB/BLURAY/etc)
-                # IMPORTANT: do NOT overwrite behaviorHints.source here; it is content-origin (WEB/BLURAY/etc), not supplier.
-                bh['wrap_src'] = tag
-                bh['source_tag'] = tag
-        return streams
-    except json.JSONDecodeError as e:
-        logger.error(f'{tag} JSON error: {e}; head={resp.text[:200] if "resp" in locals() else ""}')
-        return []
-    except Exception as e:
-        logger.error(f'{tag} fetch error: {e}')
-        return []
-
 
 def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float = REQUEST_TIMEOUT, no_retry: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Fetch provider streams and return (streams, meta).
@@ -3594,11 +3481,13 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
         for s in streams:
             if not isinstance(s, dict):
                 continue
-            bh = s.setdefault("behaviorHints", {})
-            if isinstance(bh, dict):
-                # Always tag supplier (AIO/P2) for downstream counters/debug.
-                bh["wrap_src"] = tag
-                bh["source_tag"] = tag
+            bh = s.get("behaviorHints")
+            if not isinstance(bh, dict):
+                bh = {}
+                s["behaviorHints"] = bh
+            # Always tag supplier (AIO/P2) for downstream counters/debug.
+            bh["wrap_src"] = tag
+            bh["source_tag"] = tag
         meta["count"] = int(len(streams))
         meta["ok"] = True
         return streams, meta
@@ -4093,6 +3982,7 @@ def _drop_bad_top_n(
     *,
     top_n: int,
     timeout_s: Optional[float] = None,
+    range_mode: Optional[bool] = None,
     deliver_cap: Optional[int] = None,
     sort_buffer: Optional[int] = None,
     base_sort_key: Optional[Callable[[Tuple[Dict[str, Any], Dict[str, Any]]], Any]] = None,
@@ -4196,7 +4086,7 @@ def _drop_bad_top_n(
         if hk in unsafe_hosts:
             return (idx, (False, 0, "HOST_ALREADY_UNSAFE", hk))
         u = s.get("url") or s.get("externalUrl") or ""
-        keep, pen, cls = _verify_stream_url(u, sess, timeout_s=timeout_s)
+        keep, pen, cls = _verify_stream_url(u, sess, timeout_s=timeout_s, range_mode=range_mode)
         return (idx, (keep, pen, cls, hk))
 
     # Progressive verify: batches until we have enough kept verified items
@@ -4209,10 +4099,11 @@ def _drop_bad_top_n(
         ptr += len(batch)
 
         try:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futs = {ex.submit(_worker, i): i for i in batch}
-                for fut in as_completed(futs):
+            ex = ThreadPoolExecutor(max_workers=max_workers)
+            futs = [ex.submit(_worker, i) for i in batch]
+            try:
+                done, not_done = wait(futs, timeout=float(VERIFY_FUTURE_TIMEOUT or timeout_s or 4.0))
+                for fut in done:
                     idx, (keep, pen, cls, hk) = fut.result()
                     results[idx] = (keep, pen, cls)
                     total_done += 1
@@ -4234,6 +4125,16 @@ def _drop_bad_top_n(
                         to_drop_idx.add(idx)
                     else:
                         kept_ok += 1
+                for fut in not_done:
+                    try:
+                        fut.cancel()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    ex.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    ex.shutdown(wait=False)
         except Exception:
             # If verification machinery fails, fall back to no-op (keep original ordering).
             return pairs
@@ -4385,17 +4286,18 @@ def _summarize_streams_for_counts(streams: List[Dict[str, Any]]) -> Dict[str, An
         if not isinstance(s, dict):
             continue
         out["total"] += 1
-        bh = s.get("behaviorHints") or {}
+        bh = s.get("behaviorHints")
+        if not isinstance(bh, dict):
+            bh = {}
         supplier = (bh.get("wrap_src") or "")
         if not supplier:
             # Only trust source_tag when it matches our wrapper supplier tags (avoid WEB/BLURAY/REMUX/etc pollution)
             st = (bh.get("source_tag") or "").strip()
             st_u = str(st).upper() if st else ""
             allowed = {str(AIO_TAG).upper(), str(PROV2_TAG).upper()}
-            supplier = st_u if st_u in allowed else "UNK"
+            supplier = st_u if st_u in allowed else str(AIO_TAG or "AIO").upper()
         supplier = str(supplier).upper()
 
-        supplier = str(supplier).upper()
         try:
             m = classify(s)
         except Exception:
@@ -4465,7 +4367,9 @@ def _diversify_by_quality_bucket(
     def _supplier_of(pair):
         s, _m = pair
         bh = (s.get("behaviorHints") or {}) if isinstance(s, dict) else {}
-        return str((bh.get("wrap_src") or bh.get("source_tag") or "UNK")).upper()
+        if not isinstance(bh, dict):
+            bh = {}
+        return str((bh.get("wrap_src") or bh.get("source_tag") or _m.get("supplier") or (AIO_TAG or "AIO"))).upper()
 
     def _size_gb(pair) -> float:
         _s, _m = pair
@@ -4876,6 +4780,10 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     stats.aio_in = aio_in
     stats.prov2_in = prov2_in
     stats.merged_in = len(streams)
+    # Client platform + per-request TorBox hash budget
+    platform = stats.client_platform or client_platform(is_android=is_android, is_iphone=is_iphone)
+    stats.client_platform = platform
+    tb_max_hashes = _choose_tb_max_hashes(platform)
 
     iphone_usenet_mode = bool(is_iphone and IPHONE_USENET_ONLY)
     usenet_priority_set = {str(p).upper() for p in (USENET_PRIORITY or []) if p}
@@ -5636,7 +5544,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         try:
             top_n = ANDROID_VERIFY_TOP_N if (is_android or is_iphone) else VERIFY_DESKTOP_TOP_N
             timeout = ANDROID_VERIFY_TIMEOUT if (is_android or is_iphone) else VERIFY_STREAM_TIMEOUT
-            out_pairs = _drop_bad_top_n(out_pairs, top_n=int(top_n or 0), timeout_s=float(timeout or VERIFY_STREAM_TIMEOUT), stats=stats, rid=rid, range_mode=VERIFY_RANGE, deliver_cap=deliver_cap_eff, sort_buffer=VERIFY_SORT_BUFFER)
+            out_pairs = _drop_bad_top_n(out_pairs, top_n=int(top_n or 0), timeout_s=float(timeout or VERIFY_STREAM_TIMEOUT), range_mode=VERIFY_RANGE, deliver_cap=deliver_cap_eff, sort_buffer=VERIFY_SORT_BUFFER)
             out_pairs.sort(key=sort_key)
             did_verify = True
         except Exception as e:
@@ -5650,7 +5558,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         topn = []
         for rank, (s, m) in enumerate(out_pairs[:proof_n], start=1):
             bh = (s.get("behaviorHints") or {}) if isinstance(s, dict) else {}
-            supplier = (bh.get("wrap_src") or bh.get("source_tag") or "UNK")
+            if not isinstance(bh, dict):
+                bh = {}
+            supplier = (bh.get("wrap_src") or bh.get("source_tag") or (AIO_TAG or "AIO"))
             desc = ""
             try:
                 if isinstance(s, dict):
@@ -5732,7 +5642,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             sup_top10 = []
             for _s, _m in out_pairs[:10]:
                 bh = (_s.get('behaviorHints') or {}) if isinstance(_s, dict) else {}
-                sup_top10.append(str((bh.get('wrap_src') or bh.get('source_tag') or 'UNK')).upper())
+                if not isinstance(bh, dict):
+                    bh = {}
+                sup_top10.append(str((bh.get('wrap_src') or bh.get('source_tag') or (AIO_TAG or 'AIO'))).upper())
             logger.debug("POST_DIVERSITY_BUCKET rid=%s sup_top10=%s", rid, sup_top10)
         except Exception:
             pass
@@ -5785,7 +5697,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 try:
                     top_by: Dict[str, int] = {}
                     for _s, _m in out_pairs[:deliver_cap_eff]:
-                        pp = (_m.get("provider") or "").upper() or "UNK"
+                        pp = str(_m.get("provider") or "").upper().strip()
+                        if not pp:
+                            continue
                         top_by[pp] = top_by.get(pp, 0) + 1
                     logger.info(
                         "PREMIUM_MIX rid=%s top=%d min_each=%d providers=%s top_by_provider=%s",
@@ -5918,7 +5832,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 try:
                     _top_by = {}
                     for _s, _m in out_pairs[:deliver_cap_eff]:
-                        _pp = (_m.get("provider") or "").upper() or "UNK"
+                        _pp = str(_m.get("provider") or "").upper().strip()
+                        if not _pp:
+                            continue
                         _top_by[_pp] = _top_by.get(_pp, 0) + 1
                     logger.info(
                         "STREAK_MIX rid=%s top=%d max_usenet=%d top_by_provider=%s",
@@ -5979,7 +5895,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 logger.debug("ANDROID_VERIFY_SKIP rid=%s reason=already_verified", rid)
             else:
                 try:
-                    candidates = _drop_bad_top_n(candidates, top_n=int(ANDROID_VERIFY_TOP_N or 0), timeout_s=float(ANDROID_VERIFY_TIMEOUT or 0.0) or None, deliver_cap=deliver_cap_eff, sort_buffer=VERIFY_SORT_BUFFER)
+                    candidates = _drop_bad_top_n(candidates, top_n=int(ANDROID_VERIFY_TOP_N or 0), timeout_s=float(ANDROID_VERIFY_TIMEOUT or 0.0) or None, range_mode=VERIFY_RANGE, deliver_cap=deliver_cap_eff, sort_buffer=VERIFY_SORT_BUFFER)
                 except Exception as e:
                     logger.debug("ANDROID_VERIFY_SKIPPED rid=%s err=%s", rid, e)
         else:
@@ -5998,7 +5914,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 continue
             seen_tb.add(h)
             tb_hashes.append(h)
-            if len(tb_hashes) >= TB_MAX_HASHES:
+            if len(tb_hashes) >= tb_max_hashes:
                 break
         if tb_hashes:
             try:
@@ -6060,7 +5976,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         try:
             lookahead = min(
                 len(candidates),
-                max(int(TB_MAX_HASHES or 0) * int(TB_EARLY_EXIT_MULT or 2), int(deliver_cap_eff or MAX_DELIVER or 60)),
+                max(int(tb_max_hashes or 0) * int(TB_EARLY_EXIT_MULT or 2), int(deliver_cap_eff or MAX_DELIVER or 60)),
             )
             insta_count = 0
             for _s, _m in candidates[:lookahead]:
@@ -6096,7 +6012,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     else:
         seen_h: set[str] = set()
         for _s, _m in candidates:
-            if len(tb_hashes) >= TB_MAX_HASHES:
+            if len(tb_hashes) >= tb_max_hashes:
                 break
             if (_m.get('provider') or '').upper() != 'TB':
                 continue
@@ -6105,7 +6021,15 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 seen_h.add(h)
                 tb_hashes.append(h)
 
-        if len(tb_hashes) < int(TB_API_MIN_HASHES or 0):
+        # TorBox known-cached memoization: premark and avoid redundant API checks.
+        now_epoch = time.time()
+        try:
+            _tb_known_cached_prune(now_epoch, int(TB_KNOWN_CACHED_TTL or 0), int(TB_KNOWN_CACHED_MAX or 0))
+        except Exception:
+            pass
+        known_cached = _tb_known_cached_premark(tb_hashes, cached_map, now_epoch)
+        tb_hashes_api = [h for h in tb_hashes if h not in known_cached]
+        if len(tb_hashes_api) < int(TB_API_MIN_HASHES or 0):
             tb_api_reason = "min_hashes"
         else:
             try:
@@ -6114,24 +6038,59 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 if tb_usenet_should_run and tb_usenet_hashes_list:
                     t_u0 = time.time()
                     try:
-                        with ThreadPoolExecutor(max_workers=2) as _ex:
-                            _f_t = _ex.submit(tb_get_cached, tb_hashes)
-                            _f_u = _ex.submit(tb_get_usenet_cached, tb_usenet_hashes_list)
-                            cached_map_raw = _f_t.result()
-                            usenet_cached_map = _f_u.result() or {}
+                        _ex = ThreadPoolExecutor(max_workers=2)
+                        _f_t = _ex.submit(tb_get_cached, tb_hashes_api)
+                        _f_u = _ex.submit(tb_get_usenet_cached, tb_usenet_hashes_list)
+                        try:
+                            try:
+                                _timeout = float(os.environ.get('TB_PARALLEL_FUTURE_TIMEOUT', str(TB_BATCH_FUTURE_TIMEOUT or 8.0)))
+                            except Exception:
+                                _timeout = float(TB_BATCH_FUTURE_TIMEOUT or 8.0)
+                            done, not_done = wait([_f_t, _f_u], timeout=_timeout)
+                            if _f_t in done:
+                                try:
+                                    cached_map_raw = _f_t.result()
+                                except Exception:
+                                    cached_map_raw = {}
+                            else:
+                                cached_map_raw = {}
+                                try:
+                                    _f_t.cancel()
+                                except Exception:
+                                    pass
+                            if _f_u in done:
+                                try:
+                                    usenet_cached_map = _f_u.result() or {}
+                                except Exception:
+                                    usenet_cached_map = {}
+                            else:
+                                usenet_cached_map = {}
+                                try:
+                                    _f_u.cancel()
+                                except Exception:
+                                    pass
+                        finally:
+                            try:
+                                _ex.shutdown(wait=False, cancel_futures=True)
+                            except Exception:
+                                pass
                         stats.ms_tb_usenet = int((time.time() - t_u0) * 1000)
                         tb_usenet_should_run = False
                     except Exception:
-                        cached_map_raw = tb_get_cached(tb_hashes)
+                        cached_map_raw = tb_get_cached(tb_hashes_api)
+                        tb_usenet_should_run = False  # don't retry later; keep request bounded
                 else:
-                    cached_map_raw = tb_get_cached(tb_hashes)
-                cached_map = {}
+                    cached_map_raw = tb_get_cached(tb_hashes_api)
+                # cached_map already contains known-cached premasks; merge API results into it.
                 for _k, _v in (cached_map_raw or {}).items():
                     _nk = norm_infohash(_k)
                     if _nk:
-                        cached_map[_nk] = bool(_v)
+                        v = bool(_v)
+                        cached_map[_nk] = v
+                        if v:
+                            _tb_known_cached_refresh(_nk, now_epoch, int(TB_KNOWN_CACHED_TTL or 0))
                 stats.ms_tb_api = int((time.time() - t0) * 1000)
-                stats.tb_api_hashes = len(tb_hashes)
+                stats.tb_api_hashes = len(tb_hashes_api)
                 tb_api_ran = True
                 tb_api_reason = "ok"
                 try:
@@ -6267,7 +6226,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     cached_marker = False
                     tb_src_nohash += 1
             elif provider in ('RD', 'AD'):
-                cached_marker = bool(_heuristic_cached(_s, _m))
+                cached_marker = 'LIKELY' if _heuristic_cached(_s, _m) else False
             elif provider in usenet_provs:
                 existing = _m.get('cached', None)
                 if existing is True:
@@ -6293,7 +6252,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     CACHED_HISTORY[h] = cached_marker
 
             if STRICT_PREMIUM_ONLY:
-                if cached_marker is True or cached_marker == 'LIKELY' or (str(_m.get('provider') or '').upper() in ('RD','REALDEBRID') and _heuristic_cached(_s, _m)):
+                if cached_marker is True or cached_marker == 'LIKELY':
                     kept.append((_s, _m))
                 else:
                     dropped_uncached += 1
@@ -6621,7 +6580,16 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
         else:
             # Legacy behavior (kept as a safety switch)
-            bh = s.setdefault("behaviorHints", {})
+            bh = s.get("behaviorHints")
+            if not isinstance(bh, dict):
+                bh = {}
+                s["behaviorHints"] = bh
+            try:
+                _sup = str((bh.get("wrap_src") or bh.get("source_tag") or m.get("supplier") or (AIO_TAG or "AIO"))).upper()
+                bh["wrap_src"] = _sup
+                bh["source_tag"] = _sup
+            except Exception:
+                pass
             # Always write provider/source for debugging & consistent stats
             bh["provider"] = str(m.get("provider") or bh.get("provider") or "UNK").upper()
             bh["source"] = str(m.get("source") or bh.get("source") or "UNK")
@@ -6724,6 +6692,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             logger.info(
                 "RD_HEUR_MAINTAIN rid=%s mode=heuristic thr=0.70 calls=%d ok=%d miss=%d avg_conf=%.2f out_cached_true=%d out_cached_likely=%d out_cached_false=%d out_cached_unk=%d",
                 _rid(),
+                float(RD_HEUR_THR or 0.70),
                 int(getattr(stats, "rd_heur_calls", 0) or 0),
                 int(getattr(stats, "rd_heur_true", 0) or 0),
                 int(getattr(stats, "rd_heur_false", 0) or 0),
@@ -7157,7 +7126,7 @@ def stream(type_: str, id_: str):
                 )
         except Exception:
             pass
-if WRAP_LOG_COUNTS:
+        if WRAP_LOG_COUNTS:
             try:
                 logger.info(
                     "WRAP_COUNTS rid=%s type=%s id=%s fetch_aio=%s fetch_p2=%s in=%s out=%s",
