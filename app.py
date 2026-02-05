@@ -6690,7 +6690,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         if int(getattr(stats, "rd_heur_calls", 0) or 0) > 0 or (rd_out_true + rd_out_likely + rd_out_false + rd_out_unk) > 0:
             avg_conf = (float(getattr(stats, "rd_heur_conf_sum", 0.0) or 0.0) / float(stats.rd_heur_calls)) if int(stats.rd_heur_calls or 0) > 0 else 0.0
             logger.info(
-                "RD_HEUR_MAINTAIN rid=%s mode=heuristic thr=0.70 calls=%d ok=%d miss=%d avg_conf=%.2f out_cached_true=%d out_cached_likely=%d out_cached_false=%d out_cached_unk=%d",
+                "RD_HEUR_MAINTAIN rid=%s mode=heuristic thr=%.2f calls=%d ok=%d miss=%d avg_conf=%.2f out_cached_true=%d out_cached_likely=%d out_cached_false=%d out_cached_unk=%d",
                 _rid(),
                 float(RD_HEUR_THR or 0.70),
                 int(getattr(stats, "rd_heur_calls", 0) or 0),
