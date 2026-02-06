@@ -11,6 +11,39 @@ import unicodedata
 import uuid
 import difflib
 import random
+import subprocess
+
+# ---------------------------
+# Build / version metadata (logging)
+# ---------------------------
+def _get_git_commit() -> str:
+    env = (os.environ.get("GIT_COMMIT") or os.environ.get("RENDER_GIT_COMMIT") or "").strip()
+    if env:
+        return env[:8]
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        if re.fullmatch(r"[0-9a-fA-F]{7,40}", out):
+            return out[:8]
+    except Exception:
+        pass
+    return "unknown"
+
+GIT_COMMIT = _get_git_commit()
+BUILD = os.environ.get("BUILD", "v1.0")  # Set this in Render env for deploy tracking
+
+def _safe_ua(ua_str: str, max_len: int = 100) -> str:
+    """Truncate/escape UA to keep logs sane."""
+    try:
+        s = str(ua_str or "")
+        s = s[:max_len].replace('"', '\"').replace("\n", " ").replace("\r", " ")
+        return s
+    except Exception:
+        return ""
+
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from xml.etree import ElementTree as ET  # NZBGeek (Newznab) readiness checks
@@ -7098,26 +7131,40 @@ def stream(type_: str, id_: str):
             pass
 
         logger.info(
-            "WRAP_TIMING rid=%s type=%s id=%s aio_ms=%s p2_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s",
-            _rid(), type_, id_,
+            "WRAP_TIMING rid=%s build=%s git=%s path=%s ua_class=%s type=%s id=%s aio_ms=%s p2_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s",
+            _rid(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
+            type_, id_,
             int(stats.ms_fetch_aio or 0), int(stats.ms_fetch_p2 or 0), int(stats.ms_tmdb or 0),
             int(stats.ms_tb_api or 0), int(stats.ms_tb_webdav or 0), int(stats.ms_tb_usenet or 0),
             int(stats.ms_title_mismatch or 0), int(stats.ms_uncached_check or 0),
             int(stats.tb_api_hashes or 0), int(stats.tb_webdav_hashes or 0), int(stats.tb_usenet_hashes or 0),
             int(stats.memory_peak_kb or 0),
         )
+        # New: Approximate output size (bytes) for debugging response bloat
+        try:
+            out_size = len(json.dumps(out_for_client, separators=(",", ":"))) if out_for_client else 0
+        except Exception:
+            out_size = 0
         logger.info(
-            "WRAP_STATS rid=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s android_magnets=%s iphone_magnets=%s dropped_platform_specific=%s deduped=%s delivered=%s cache_hit=%s cache_miss=%s cache_rate=%.2f platform=%s flags=%s errors=%s errors_timeout=%s errors_parse=%s errors_api=%s ms=%s",
-            _rid(), type_, id_,
+            "WRAP_STATS rid=%s build=%s git=%s path=%s ua_class=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_placeholder=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s android_magnets=%s iphone_magnets=%s dropped_platform_specific=%s dropped_magnet=%s deduped=%s dedup=%s delivered=%s out=%s cache_hit=%s cache_miss=%s cache_rate=%.2f platform=%s flags=%s errors=%s errors_timeout=%s errors_parse=%s errors_api=%s ms=%s",
+            _rid(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
+            type_, id_,
             int(stats.aio_in or 0), int(stats.prov2_in or 0), int(stats.merged_in or 0),
-            int(stats.dropped_error or 0), int(stats.dropped_missing_url or 0), int(stats.dropped_pollution or 0),
+            int(stats.dropped_error or 0), int(stats.dropped_missing_url or 0),
+            int(stats.dropped_pollution or 0),  # legacy name
+            int(stats.dropped_pollution or 0),  # alias: dropped_placeholder
             int(stats.dropped_low_seeders or 0), int(stats.dropped_lang or 0), int(stats.dropped_low_premium or 0),
-            int(stats.dropped_rd or 0), int(stats.dropped_ad or 0), int(stats.dropped_low_res or 0),
-            int(stats.dropped_old_age or 0), int(stats.dropped_blacklist or 0), int(stats.dropped_fakes_db or 0),
+            int(stats.dropped_rd or 0), int(stats.dropped_ad or 0),
+            int(stats.dropped_low_res or 0), int(stats.dropped_old_age or 0),
+            int(stats.dropped_blacklist or 0), int(stats.dropped_fakes_db or 0),
             int(stats.dropped_title_mismatch or 0), int(stats.dropped_dead_url or 0), int(stats.dropped_uncached or 0),
-            int(stats.dropped_uncached_tb or 0), int(stats.dropped_android_magnets or 0), int(stats.dropped_iphone_magnets or 0),
-            int(stats.dropped_platform_specific or 0),
-            int(stats.deduped or 0), int(stats.delivered or 0),
+            int(stats.dropped_uncached_tb or 0),
+            int(stats.dropped_android_magnets or 0), int(stats.dropped_iphone_magnets or 0),
+            int(stats.dropped_platform_specific or 0),  # legacy name
+            int(stats.dropped_platform_specific or 0),  # alias: dropped_magnet
+            int(stats.deduped or 0),  # legacy name
+            int(stats.deduped or 0),  # alias: dedup
+            int(stats.delivered or 0), int(out_size or 0),
             int(stats.cache_hit or 0), int(stats.cache_miss or 0), float(stats.cache_rate or 0.0),
             str(stats.client_platform or ""),
             ",".join(list(stats.flag_issues)[:8]) if isinstance(stats.flag_issues, list) else "",
@@ -7125,7 +7172,7 @@ def stream(type_: str, id_: str):
             int(stats.errors_timeout or 0), int(stats.errors_parse or 0), int(stats.errors_api or 0),
             ms_total,
         )
-        # NEW: Flag slow fetches with high seeders (diagnose buffering despite peers)
+# NEW: Flag slow fetches with high seeders (diagnose buffering despite peers)
         try:
             ms_fetch_aio = int(getattr(stats, "ms_fetch_aio", 0) or 0)
             if ms_fetch_aio > 5000 and any(int(s.get("seeders", 0) or 0) > 50 for s in (out_for_client or [])):
@@ -7142,13 +7189,15 @@ def stream(type_: str, id_: str):
         if WRAP_LOG_COUNTS:
             try:
                 logger.info(
-                    "WRAP_COUNTS rid=%s type=%s id=%s fetch_aio=%s fetch_p2=%s in=%s out=%s",
-                    _rid(), type_, id_,
+                    "WRAP_COUNTS rid=%s build=%s git=%s path=%s type=%s id=%s fetch_aio=%s fetch_p2=%s in=%s out=%s",
+                    _rid(), BUILD, GIT_COMMIT, request.path,
+                    type_, id_,
                     json.dumps(stats.fetch_aio, separators=(",", ":"), sort_keys=True),
                     json.dumps(stats.fetch_p2, separators=(",", ":"), sort_keys=True),
                     json.dumps(stats.counts_in, separators=(",", ":"), sort_keys=True),
                     json.dumps(stats.counts_out, separators=(",", ":"), sort_keys=True),
                 )
+
             except Exception:
                 pass
 
