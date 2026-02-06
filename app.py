@@ -2150,6 +2150,16 @@ def _before_request() -> None:
 def _rid() -> str:
     return g.request_id if has_request_context() and hasattr(g, "request_id") else "GLOBAL"
 
+def _mark() -> str:
+    """Request correlation marker from client header (X-REQ-MARK)."""
+    try:
+        if not has_request_context():
+            return ""
+        return (request.headers.get("X-REQ-MARK") or "")[:80]
+    except Exception:
+        return ""
+
+
 # Thread-local pointer to current request stats for lightweight heuristic markers.
 _TLS = threading.local()
 
@@ -7131,8 +7141,8 @@ def stream(type_: str, id_: str):
             pass
 
         logger.info(
-            "WRAP_TIMING rid=%s build=%s git=%s path=%s ua_class=%s type=%s id=%s aio_ms=%s p2_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s",
-            _rid(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
+            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s type=%s id=%s aio_ms=%s p2_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s",
+            _rid(), _mark(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
             type_, id_,
             int(stats.ms_fetch_aio or 0), int(stats.ms_fetch_p2 or 0), int(stats.ms_tmdb or 0),
             int(stats.ms_tb_api or 0), int(stats.ms_tb_webdav or 0), int(stats.ms_tb_usenet or 0),
@@ -7146,8 +7156,8 @@ def stream(type_: str, id_: str):
         except Exception:
             out_size = 0
         logger.info(
-            "WRAP_STATS rid=%s build=%s git=%s path=%s ua_class=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_placeholder=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s android_magnets=%s iphone_magnets=%s dropped_platform_specific=%s dropped_magnet=%s deduped=%s dedup=%s delivered=%s out=%s cache_hit=%s cache_miss=%s cache_rate=%.2f platform=%s flags=%s errors=%s errors_timeout=%s errors_parse=%s errors_api=%s ms=%s",
-            _rid(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
+            "WRAP_STATS rid=%s mark=%s build=%s git=%s path=%s ua_class=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_placeholder=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s android_magnets=%s iphone_magnets=%s dropped_platform_specific=%s dropped_magnet=%s deduped=%s dedup=%s delivered=%s out=%s cache_hit=%s cache_miss=%s cache_rate=%.2f platform=%s flags=%s errors=%s errors_timeout=%s errors_parse=%s errors_api=%s ms=%s",
+            _rid(), _mark(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
             type_, id_,
             int(stats.aio_in or 0), int(stats.prov2_in or 0), int(stats.merged_in or 0),
             int(stats.dropped_error or 0), int(stats.dropped_missing_url or 0),
@@ -7189,8 +7199,8 @@ def stream(type_: str, id_: str):
         if WRAP_LOG_COUNTS:
             try:
                 logger.info(
-                    "WRAP_COUNTS rid=%s build=%s git=%s path=%s type=%s id=%s fetch_aio=%s fetch_p2=%s in=%s out=%s",
-                    _rid(), BUILD, GIT_COMMIT, request.path,
+                    "WRAP_COUNTS rid=%s mark=%s build=%s git=%s path=%s type=%s id=%s fetch_aio=%s fetch_p2=%s in=%s out=%s",
+                    _rid(), _mark(), BUILD, GIT_COMMIT, request.path,
                     type_, id_,
                     json.dumps(stats.fetch_aio, separators=(",", ":"), sort_keys=True),
                     json.dumps(stats.fetch_p2, separators=(",", ":"), sort_keys=True),
