@@ -6996,7 +6996,7 @@ def stream(type_: str, id_: str):
                         stats.errors_timeout += 1
                     elif _err == "json":
                         stats.errors_parse += 1
-                    elif _err not in ("", "no_base"):
+                    elif _err not in ("", "no_base", "cache_hit", "cache_miss"):
                         stats.errors_api += 1
             except Exception:
                 pass
@@ -7045,6 +7045,23 @@ def stream(type_: str, id_: str):
         payload: Dict[str, Any] = {"streams": out_for_client, "cacheMaxAge": int(CACHE_TTL)}
 
         if want_dbg:
+            # Prefer remote timings, but fall back to wait timings when remote is unavailable.
+            aio_wait_ms = int(stats.ms_fetch_aio or 0)
+            p2_wait_ms  = int(stats.ms_fetch_p2 or 0)
+            aio_remote_ms = int(stats.ms_fetch_aio_remote or 0)
+            p2_remote_ms  = int(stats.ms_fetch_p2_remote or 0)
+
+            # What we "report" as timing_ms.* (used by smoke tests): remote when we have it, otherwise wait.
+            aio_ms = aio_remote_ms or aio_wait_ms
+            p2_ms  = p2_remote_ms or p2_wait_ms
+
+            tmdb_ms = int(stats.ms_tmdb or 0)
+            tb_api_ms = int(stats.ms_tb_api or 0)
+            tb_wd_ms = int(stats.ms_tb_webdav or 0)
+            tb_usenet_ms = int(stats.ms_tb_usenet or 0)
+            title_mismatch_ms = int(stats.ms_title_mismatch or 0)
+            uncached_check_ms = int(stats.ms_uncached_check or 0)
+
             payload["debug"] = {
                 "rid": _rid(),
                 "platform": platform,
@@ -7053,16 +7070,23 @@ def stream(type_: str, id_: str):
                 "fetch": {"aio": stats.fetch_aio, "p2": stats.fetch_p2},
                 "in": stats.counts_in,
                 "out": stats.counts_out,
-                "timing_ms": {
-                    "aio": int(stats.ms_fetch_aio or 0),
-                    "p2": int(stats.ms_fetch_p2 or 0),
-                    "tmdb": int(stats.ms_tmdb or 0),
-                    "tb_api": int(stats.ms_tb_api or 0),
-                    "tb_webdav": int(stats.ms_tb_webdav or 0),
-                    "title": int(stats.ms_title_mismatch or 0),
-                    "uncached": int(stats.ms_uncached_check or 0),
-                },
-                "delivered": int(stats.delivered or 0),
+                                "timing_ms": {
+                                    "aio": aio_ms,
+                                    "p2": p2_ms,
+                                    "tb_api": tb_api_ms,
+                                    "tmdb": tmdb_ms,
+                                    "aio_remote": aio_remote_ms,
+                                    "p2_remote": p2_remote_ms,
+                                    "aio_wait": aio_wait_ms,
+                                    "p2_wait": p2_wait_ms,
+                                    "tb_wd": tb_wd_ms,
+                                    "tb_usenet": tb_usenet_ms,
+                                    "title_mismatch": title_mismatch_ms,
+                                    "uncached_check": uncached_check_ms,
+                                },
+                                "remote_ms": {"aio": aio_remote_ms, "p2": p2_remote_ms},
+                                "wait_ms": {"aio": aio_wait_ms, "p2": p2_wait_ms},
+                                "delivered": int(stats.delivered or 0),
                 "drops": {
                     "error": int(stats.dropped_error or 0),
                     "missing_url": int(stats.dropped_missing_url or 0),
