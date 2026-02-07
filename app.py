@@ -33,7 +33,7 @@ def _get_git_commit() -> str:
     return "unknown"
 
 GIT_COMMIT = _get_git_commit()
-BUILD = os.environ.get("BUILD", "v1.0")  # Set this in Render env for deploy tracking
+BUILD = os.environ.get("BUILD", os.environ.get("BUILD_ID", "v1.0"))  # Set BUILD (or legacy BUILD_ID) in Render for deploy labels
 
 def _safe_ua(ua_str: str, max_len: int = 100) -> str:
     """Truncate/escape UA to keep logs sane."""
@@ -6839,23 +6839,52 @@ def stats_endpoint():
         snap["avg_ms"] = (float(snap.get("ms_sum", 0)) / req) if req else 0.0
     return jsonify(snap), 200
 
+@lru_cache(maxsize=1)
+def _manifest_base() -> dict:
+    """Load an optional manifest template from disk (default: ./manifest.json).
+
+    This lets you keep stable fields (id, idPrefixes, description, etc.) in the repo,
+    while still overriding name/version via env without editing Python.
+    """
+    path = (os.environ.get("ADDON_MANIFEST_FILE") or "manifest.json").strip()
+    if not path:
+        return {}
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        full_path = path if os.path.isabs(path) else os.path.join(base_dir, path)
+        with open(full_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
 @app.get("/manifest.json")
 def manifest():
     # Show minimal config flags in the manifest name (no secrets).
     cfg = f"aio={1 if bool(AIO_BASE) else 0} p2={1 if bool(PROV2_BASE) else 0} fl={1 if bool(FASTLANE_ENABLED) else 0}"
-    return jsonify(
-        {
-            "id": "org.buubuu.aio.wrapper.merge",
-            "version": "1.0.22",
-            "name": f"AIO Wrapper (Rich Output, 2 Lines Left) 9.1 v4.4.2 [{cfg}]",
-            "description": "Merges 2 providers and outputs a brand-new, strict-client-safe stream schema with rich AIOStreams-style emoji formatting (2-line left column).",
-            "resources": ["stream"],
-            "types": ["movie", "series"],
-            "catalogs": [],
-            "idPrefixes": ["tt", "tmdb"],
-        }
-    )
 
+    base = dict(_manifest_base() or {})
+
+    addon_name = (os.environ.get("ADDON_NAME") or "Buubuu wrapper the best mix on the net").strip() or "Buubuu wrapper the best mix on the net"
+    addon_display_ver = (os.environ.get("ADDON_DISPLAY_VERSION") or "11.7").strip() or "11.7"
+    addon_manifest_ver = (os.environ.get("ADDON_MANIFEST_VERSION") or "11.7.0").strip() or "11.7.0"
+
+    # Keep stable fields from manifest.json (if present) but ensure required keys exist.
+    base.setdefault("id", "org.buubuu.aio.wrapper.merge")
+    base.setdefault(
+        "description",
+        "Wraps AIOStreams to merge, filter, and format streams (client-safe schema).",
+    )
+    base.setdefault("resources", ["stream"])
+    base.setdefault("types", ["movie", "series"])
+    base.setdefault("catalogs", [])
+    base.setdefault("idPrefixes", ["tt", "tmdb"])
+
+    # Override name/version via env for easy changes without code edits.
+    base["version"] = addon_manifest_ver
+    base["name"] = f"{addon_name} v {addon_display_ver} [{cfg}]"
+
+    return jsonify(base)
 @app.get("/stream/<type_>/<id_>.json")
 def stream(type_: str, id_: str):
     if not _is_valid_stream_id(type_, id_):
