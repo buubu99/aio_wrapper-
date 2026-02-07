@@ -89,9 +89,12 @@ class PipeStats:
     cache_hit: int = 0
     cache_miss: int = 0
     cache_rate: float = 0.0  # cache_hit/(cache_hit+cache_miss)
-    # Timing/diagnostics (ms)
+    # Timing/diagnostics (ms). ms_fetch_* are wait times in this request (blocking time).
     ms_fetch_aio: int = 0
     ms_fetch_p2: int = 0
+    # Provider-reported fetch times (from provider meta); useful when ms_fetch_* is 0 due to cache/fastlane.
+    ms_fetch_aio_remote: int = 0
+    ms_fetch_p2_remote: int = 0
     ms_tmdb: int = 0
     ms_tb_api: int = 0
     ms_tb_webdav: int = 0
@@ -3642,7 +3645,9 @@ def try_fastlane(*, prov2_fut, aio_fut, aio_key: str, prov2_url: str, aio_url: s
         prov2_timeout = (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT)
         remaining = max(0.05, float(deadline) - time.monotonic())
         wait_s = min(float(prov2_timeout), remaining)
+        t_p2_wait0 = time.monotonic()
         p2_streams, prov2_in, p2_ms, p2_meta = prov2_fut.result(timeout=wait_s)
+        p2_wait_ms = int((time.monotonic() - t_p2_wait0) * 1000)
     except FuturesTimeoutError:
         return None
     except Exception:
@@ -3680,14 +3685,14 @@ def try_fastlane(*, prov2_fut, aio_fut, aio_key: str, prov2_url: str, aio_url: s
 
     # Fill in fetch timings for logs.
     stats.ms_fetch_aio = 0
-    stats.ms_fetch_p2 = int(p2_ms or 0)
+    stats.ms_fetch_p2 = int(p2_wait_ms or 0)
 
     logger.info(
-        "FASTLANE_TRIGGERED rid=%s type=%s id=%s out=%d p2_in=%d cached_tb=%d usenet=%d p2_ms=%d aio=%s p2=%s",
-        _rid(), type_, id_, len(out), prov2_in, cached_tb, usenet, int(p2_ms or 0),
+        "FASTLANE_TRIGGERED rid=%s type=%s id=%s out=%d p2_in=%d cached_tb=%d usenet=%d p2_wait_ms=%d p2_fetch_ms=%d aio=%s p2=%s",
+        _rid(), type_, id_, len(out), prov2_in, cached_tb, usenet, int(p2_wait_ms or 0), int(p2_ms or 0),
         bool(aio_url), bool(prov2_url),
     )
-    return out, 0, prov2_in, 0, int(p2_ms or 0), True, stats, {'aio': {}, 'p2': (p2_meta if 'p2_meta' in locals() and isinstance(p2_meta, dict) else {})}
+    return out, 0, prov2_in, 0, int(p2_wait_ms or 0), True, stats, {'aio': {}, 'p2': (p2_meta if 'p2_meta' in locals() and isinstance(p2_meta, dict) else {})}
 
 def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bool = False, client_timeout_s: float | None = None):
     """
@@ -3724,6 +3729,10 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
     prov2_in = 0
     aio_ms = 0
     p2_ms = 0
+
+    # Wait times (how long we blocked on futures in *this* request)
+    aio_wait_ms = 0
+    p2_wait_ms = 0
 
     aio_meta: dict[str, Any] = {}
     p2_meta: dict[str, Any] = {}
@@ -3768,15 +3777,19 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
 
 
     def _harvest_p2():
-        nonlocal p2_streams, prov2_in, p2_ms
+        nonlocal p2_streams, prov2_in, p2_ms, p2_meta, p2_wait_ms
         if not p2_fut:
             return
         remaining = max(0.05, deadline - time.monotonic())
+        t_wait0 = time.monotonic()
         try:
             p2_streams, prov2_in, p2_ms, p2_meta = p2_fut.result(timeout=remaining)
         except FuturesTimeoutError:
-            # leave empty; may still finish later
-            p2_streams, prov2_in, p2_ms, p2_meta = [], 0, int((time.monotonic() - t0) * 1000), {'tag': PROV2_TAG, 'ok': False, 'err': 'timeout'}
+            p2_streams, prov2_in, p2_ms, p2_meta = [], 0, 0, {'tag': PROV2_TAG, 'ok': False, 'err': 'timeout'}
+        except Exception as e:
+            p2_streams, prov2_in, p2_ms, p2_meta = [], 0, 0, {'tag': PROV2_TAG, 'ok': False, 'err': f'error:{type(e).__name__}'}
+        finally:
+            p2_wait_ms = int((time.monotonic() - t_wait0) * 1000)
 
     mode = AIO_CACHE_MODE
 
@@ -3798,16 +3811,22 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
             soft = max(0.05, deadline - time.monotonic())
 
         try:
+            t_aio_wait0 = time.monotonic()
             aio_streams, aio_in, aio_ms, aio_meta = aio_fut.result(timeout=min(soft, max(0.05, deadline - time.monotonic())))
+            aio_wait_ms = int((time.monotonic() - t_aio_wait0) * 1000)
         except FuturesTimeoutError:
+            try:
+                aio_wait_ms = int((time.monotonic() - t_aio_wait0) * 1000)
+            except Exception:
+                aio_wait_ms = int(float(soft or 0) * 1000)
             if cached is not None:
                 aio_streams, aio_in, cached_ms = cached
                 aio_ms = int(cached_ms or 0)
                 aio_meta = {'tag': AIO_TAG, 'ok': True, 'err': 'soft_timeout_cache' if float(soft or 0) > 0 else 'cache_hit', 'count': int(aio_in or 0), 'ms': int(aio_ms or 0), 'soft_timeout_ms': int(float(soft or 0) * 1000)}
             else:
                 aio_streams, aio_in = [], 0
-                aio_ms = int(float(soft or 0) * 1000)
-                aio_meta = {'tag': AIO_TAG, 'ok': False, 'err': 'timeout', 'count': 0, 'ms': int(aio_ms or 0), 'soft_timeout_ms': int(float(soft or 0) * 1000)}
+                aio_ms = 0
+                aio_meta = {'tag': AIO_TAG, 'ok': False, 'err': 'timeout', 'count': 0, 'ms': 0, 'soft_timeout_ms': int(float(soft or 0) * 1000)}
             pass  # aio_ms set per-branch
 
             # refresh cache when AIO finishes
@@ -3820,9 +3839,15 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
         if aio_fut:
             remaining = max(0.05, deadline - time.monotonic())
             try:
+                t_aio_wait0 = time.monotonic()
                 aio_streams, aio_in, aio_ms, aio_meta = aio_fut.result(timeout=remaining)
+                aio_wait_ms = int((time.monotonic() - t_aio_wait0) * 1000)
             except FuturesTimeoutError:
-                aio_streams, aio_in, aio_ms, aio_meta = [], 0, int((time.monotonic() - t0) * 1000), {'tag': AIO_TAG, 'ok': False, 'err': 'timeout'}
+                try:
+                    aio_wait_ms = int((time.monotonic() - t_aio_wait0) * 1000)
+                except Exception:
+                    aio_wait_ms = int((time.monotonic() - t0) * 1000)
+                aio_streams, aio_in, aio_ms, aio_meta = [], 0, 0, {'tag': AIO_TAG, 'ok': False, 'err': 'timeout'}
 
         _harvest_p2()
 
@@ -3880,7 +3905,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
         except Exception:
             pass
 
-    return merged, aio_in, prov2_in, aio_ms, p2_ms, False, None, {'aio': aio_meta, 'p2': p2_meta}
+    return merged, aio_in, prov2_in, aio_wait_ms, p2_wait_ms, False, None, {'aio': aio_meta, 'p2': p2_meta}
 
 def hash_stats(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
     total = len(pairs)
@@ -6955,6 +6980,12 @@ def stream(type_: str, id_: str):
         try:
             stats.fetch_aio = _compact_fetch_meta((fetch_meta or {}).get("aio") or {})
             stats.fetch_p2 = _compact_fetch_meta((fetch_meta or {}).get("p2") or {})
+            try:
+                stats.ms_fetch_aio_remote = int((stats.fetch_aio or {}).get('ms') or 0)
+                stats.ms_fetch_p2_remote = int((stats.fetch_p2 or {}).get('ms') or 0)
+            except Exception:
+                stats.ms_fetch_aio_remote = 0
+                stats.ms_fetch_p2_remote = 0
             # Error breakdown from fetch meta (timeout/json/other)
             try:
                 for _fm in (stats.fetch_aio, stats.fetch_p2):
@@ -7170,10 +7201,13 @@ def stream(type_: str, id_: str):
             pass
 
         logger.info(
-            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s type=%s id=%s aio_ms=%s p2_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s",
+            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s type=%s id=%s served_cache=%s aio_ms=%s p2_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s",
             _rid(), _mark(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
             type_, id_,
-            int(stats.ms_fetch_aio or 0), int(stats.ms_fetch_p2 or 0), int(stats.ms_tmdb or 0),
+            int(1 if served_from_cache else 0),
+            int(stats.ms_fetch_aio or 0), int(stats.ms_fetch_p2 or 0),
+            int(getattr(stats, 'ms_fetch_aio_remote', 0) or 0), int(getattr(stats, 'ms_fetch_p2_remote', 0) or 0),
+            int(stats.ms_tmdb or 0),
             int(stats.ms_tb_api or 0), int(stats.ms_tb_webdav or 0), int(stats.ms_tb_usenet or 0),
             int(stats.ms_title_mismatch or 0), int(stats.ms_uncached_check or 0),
             int(stats.tb_api_hashes or 0), int(stats.tb_webdav_hashes or 0), int(stats.tb_usenet_hashes or 0),
