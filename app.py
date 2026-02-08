@@ -634,6 +634,22 @@ _QUALITY_ONLY_WORDS = {
     "rip", "encode", "reencode",
 }
 
+
+
+def _similarity_ratio(a, b):
+    """Similarity ratio in [0,1] for already-normalized compare strings.
+
+    This helper MUST be exception-safe: title-mismatch logic should never crash the stream pipeline.
+    """
+    try:
+        if not a or not b:
+            return 0.0
+        a2 = " ".join(str(a).split())
+        b2 = " ".join(str(b).split())
+        return difflib.SequenceMatcher(None, a2, b2).ratio()
+    except Exception:
+        return 0.0
+
 def _is_quality_only_title(t: str) -> bool:
     """True if string looks like only quality/tech metadata (no real title words)."""
     if not t:
