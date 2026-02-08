@@ -5291,9 +5291,18 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 cand_cmp = clean_title_for_compare(cand_title)
                 show_cmp = clean_title_for_compare(expected_title) if expected_title else ''
                 ep_cmp = clean_title_for_compare(expected_ep_title) if expected_ep_title else ''
-                sim_show = difflib.SequenceMatcher(None, cand_cmp, show_cmp).ratio() if show_cmp else 0.0
-                sim_ep = difflib.SequenceMatcher(None, cand_cmp, ep_cmp).ratio() if ep_cmp else 0.0
-                similarity = sim_show if sim_show >= sim_ep else sim_ep
+                # Some suppliers (especially RD/TB) sometimes emit labels like "2160p WEB-DL 23 GB" with no actual title.
+                # For *movies*, treat an empty/near-empty comparable title as "unknown" (do not hard-drop as mismatch).
+                alpha_ct = sum(1 for ch in cand_cmp if ch.isalpha())
+                if type_ == "movie" and ((not cand_cmp) or (alpha_ct < 3)):
+                    sim_show = float(TRAKT_TITLE_MIN_RATIO)
+                    sim_ep = 0.0
+                    similarity = float(TRAKT_TITLE_MIN_RATIO)
+                    m["_title_unknown"] = True
+                else:
+                    sim_show = difflib.SequenceMatcher(None, cand_cmp, show_cmp).ratio() if show_cmp else 0.0
+                    sim_ep = difflib.SequenceMatcher(None, cand_cmp, ep_cmp).ratio() if ep_cmp else 0.0
+                    similarity = sim_show if sim_show >= sim_ep else sim_ep
                 # Point 11 tie-break input: keep similarity for later dedup/sort tie breaks
                 try:
                     m["_mismatch_ratio"] = float(similarity)
