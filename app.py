@@ -152,7 +152,7 @@ try:
 except Exception:
     ua_parse = None
     UA_PARSER_AVAILABLE = False
-from flask import Flask, jsonify, g, has_request_context, request, make_response, Response
+from flask import Flask, jsonify, g, has_request_context, request, make_response, Response, send_from_directory, abort
 from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -6913,6 +6913,22 @@ def _manifest_base() -> dict:
     except Exception:
         return {}
 
+
+@app.get("/logo.png")
+def logo_png():
+    """
+    Serve a local logo.png from the repo root.
+    This avoids Stremio/web clients blocking external image hosts.
+    """
+    try:
+        here = os.path.dirname(__file__)
+        path = os.path.join(here, "logo.png")
+        if not os.path.exists(path):
+            return ("", 404)
+        return send_from_directory(here, "logo.png", mimetype="image/png")
+    except Exception:
+        return ("", 404)
+
 @app.get("/manifest.json")
 def manifest():
     # Show minimal config flags in the manifest name (no secrets).
@@ -6926,11 +6942,15 @@ def manifest():
         "Movies & Series | Mixes AIOStreams with usenet & debrid for premium, "
         "filtered streams — fast & reliable!"
     )
-    DEFAULT_ADDON_LOGO = (
-        "https://uxwing.com/wp-content/themes/uxwing/download/"
-        "video-photography-multimedia/live-streaming-icon.png"
-    )
-
+    # Prefer local /logo.png if present (more reliable for Stremio). Fallback to a public icon.
+    local_logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
+    if os.path.exists(local_logo_path):
+        DEFAULT_ADDON_LOGO = request.url_root.rstrip("/") + "/logo.png"
+    else:
+        DEFAULT_ADDON_LOGO = (
+            "https://uxwing.com/wp-content/themes/uxwing/download/"
+            "video-photography-multimedia/live-streaming-icon.png"
+        )
     addon_name = (os.environ.get("ADDON_NAME") or base.get("name") or DEFAULT_ADDON_NAME).strip() or DEFAULT_ADDON_NAME
     addon_desc = (os.environ.get("ADDON_DESCRIPTION") or base.get("description") or DEFAULT_ADDON_DESC).strip() or DEFAULT_ADDON_DESC
     addon_logo = (os.environ.get("ADDON_LOGO") or base.get("logo") or DEFAULT_ADDON_LOGO).strip() or DEFAULT_ADDON_LOGO
