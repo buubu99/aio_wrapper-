@@ -92,7 +92,7 @@ class PipeStats:
     # Timing/diagnostics (ms). ms_fetch_* are wait times in this request (blocking time).
     ms_fetch_aio: int = 0
     ms_fetch_p2: int = 0
-    # Provider-reported fetch times (from provider meta); useful when ms_fetch_* is 0 due to cache/fastlane.
+    # Provider-reported fetch times (from provider meta); useful when ms_fetch_* is 0 due to cache.
     ms_fetch_aio_remote: int = 0
     ms_fetch_p2_remote: int = 0
     ms_tmdb: int = 0
@@ -420,6 +420,75 @@ FAKES_DB_URL = os.environ.get("FAKES_DB_URL", "")
 
 # Optional: simple rate-limit (e.g. "30/m", "5/s"). Blank disables it.
 RATE_LIMIT = (os.environ.get("RATE_LIMIT", "") or "").strip()
+
+
+# ---------- FETCH EXECUTOR + AIO CACHE ----------
+WRAP_FETCH_WORKERS = int(os.getenv("WRAP_FETCH_WORKERS") or os.getenv("FETCH_WORKERS") or "8")
+FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=WRAP_FETCH_WORKERS)
+
+AIO_CACHE_TTL_S = int(os.getenv("AIO_CACHE_TTL_S", "600") or 600)   # 0 disables cache
+AIO_CACHE_MAX = int(os.getenv("AIO_CACHE_MAX", "200") or 200)
+AIO_CACHE_MODE = (os.getenv("AIO_CACHE_MODE", "off") or "off").lower()  # off|swr|soft
+AIO_SOFT_TIMEOUT_S = float(os.getenv("AIO_SOFT_TIMEOUT_S", "0") or 0)   # only used in 'soft' mode
+
+
+_AIO_CACHE = {}  # key -> (ts_monotonic, streams, count, ms)
+_AIO_CACHE_LOCK = threading.Lock()
+
+def _aio_cache_get(key: str):
+    if AIO_CACHE_TTL_S <= 0:
+        return None
+    now = time.monotonic()
+    with _AIO_CACHE_LOCK:
+        v = _AIO_CACHE.get(key)
+        if not v:
+            return None
+        # Backward compatible with older 3-tuple cache entries
+        try:
+            ts, streams, count, ms = v
+        except Exception:
+            try:
+                ts, streams, count = v
+                ms = 0
+            except Exception:
+                return None
+        if (now - ts) > AIO_CACHE_TTL_S:
+            _AIO_CACHE.pop(key, None)
+            return None
+        return streams, count, int(ms or 0)
+
+def _aio_cache_set(key: str, streams: list, count: int, ms: int = 0):
+    if AIO_CACHE_TTL_S <= 0:
+        return
+    now = time.monotonic()
+    with _AIO_CACHE_LOCK:
+        _AIO_CACHE[key] = (now, streams, count, int(ms or 0))
+        # evict oldest entries if over cap
+        while len(_AIO_CACHE) > AIO_CACHE_MAX:
+            oldest = next(iter(_AIO_CACHE))
+            _AIO_CACHE.pop(oldest, None)
+
+
+def _make_aio_cache_update_cb(aio_key: str):
+    """Return a Future callback that updates the AIO cache when the fetch completes."""
+    def _cb(fut):
+        try:
+            s, cnt, _ms, _meta = fut.result()
+            if s:
+                _aio_cache_set(aio_key, s, cnt, int(_ms or 0))
+        except Exception:
+            pass
+    return _cb
+
+def _aio_cache_key(type_: str, id_: str, extras) -> str:
+    # extras can be dict or None; keep stable key
+    if not extras:
+        return f"{type_}:{id_}"
+    try:
+        return f"{type_}:{id_}:{json.dumps(extras, sort_keys=True, separators=(',',':'))}"
+    except Exception:
+        return f"{type_}:{id_}:{str(extras)}"
+
 
 # ---------------------------
 # Helpers (used by the pipeline)
@@ -3623,149 +3692,11 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
         meta["ms"] = int((time.time() - t0) * 1000)
 
 
-# ---------- FASTLANE (Patch 3): shared fetch executor + AIO cache ----------
-WRAP_FETCH_WORKERS = int(os.getenv("WRAP_FETCH_WORKERS") or os.getenv("FETCH_WORKERS") or "8")
-FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=WRAP_FETCH_WORKERS)
-
-AIO_CACHE_TTL_S = int(os.getenv("AIO_CACHE_TTL_S", "600") or 600)   # 0 disables cache
-AIO_CACHE_MAX = int(os.getenv("AIO_CACHE_MAX", "200") or 200)
-AIO_CACHE_MODE = (os.getenv("AIO_CACHE_MODE", "off") or "off").lower()  # off|swr|soft
-AIO_SOFT_TIMEOUT_S = float(os.getenv("AIO_SOFT_TIMEOUT_S", "0") or 0)   # only used in 'soft' mode
-
-# Prov2-only fastlane (separate from AIO cache modes): early-return if Prov2 alone is "good enough"
-FASTLANE_ENABLED = _parse_bool(os.getenv("FASTLANE_ENABLED", "false"), False)
-FASTLANE_MIN_STREAMS = _safe_int(os.getenv("FASTLANE_MIN_STREAMS", "8"), 8)
-
-_AIO_CACHE = {}  # key -> (ts_monotonic, streams, count, ms)
-_AIO_CACHE_LOCK = threading.Lock()
-
-def _aio_cache_get(key: str):
-    if AIO_CACHE_TTL_S <= 0:
-        return None
-    now = time.monotonic()
-    with _AIO_CACHE_LOCK:
-        v = _AIO_CACHE.get(key)
-        if not v:
-            return None
-        # Backward compatible with older 3-tuple cache entries
-        try:
-            ts, streams, count, ms = v
-        except Exception:
-            try:
-                ts, streams, count = v
-                ms = 0
-            except Exception:
-                return None
-        if (now - ts) > AIO_CACHE_TTL_S:
-            _AIO_CACHE.pop(key, None)
-            return None
-        return streams, count, int(ms or 0)
-
-def _aio_cache_set(key: str, streams: list, count: int, ms: int = 0):
-    if AIO_CACHE_TTL_S <= 0:
-        return
-    now = time.monotonic()
-    with _AIO_CACHE_LOCK:
-        _AIO_CACHE[key] = (now, streams, count, int(ms or 0))
-        # evict oldest entries if over cap
-        while len(_AIO_CACHE) > AIO_CACHE_MAX:
-            oldest = next(iter(_AIO_CACHE))
-            _AIO_CACHE.pop(oldest, None)
-
-
-def _make_aio_cache_update_cb(aio_key: str):
-    """Return a Future callback that updates the AIO cache when the fetch completes."""
-    def _cb(fut):
-        try:
-            s, cnt, _ms, _meta = fut.result()
-            if s:
-                _aio_cache_set(aio_key, s, cnt, int(_ms or 0))
-        except Exception:
-            pass
-    return _cb
-
-def _aio_cache_key(type_: str, id_: str, extras) -> str:
-    # extras can be dict or None; keep stable key
-    if not extras:
-        return f"{type_}:{id_}"
-    try:
-        return f"{type_}:{id_}:{json.dumps(extras, sort_keys=True, separators=(',',':'))}"
-    except Exception:
-        return f"{type_}:{id_}:{str(extras)}"
-
 def get_streams_single(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float = REQUEST_TIMEOUT, no_retry: bool = False) -> tuple[list[dict[str, Any]], int, int, dict[str, Any]]:
     """Fetch a single provider and return (streams, count, ms, meta)."""
     streams, meta = _fetch_streams_from_base_with_meta(base, auth, type_, id_, tag, timeout=timeout, no_retry=no_retry)
     ms = int(meta.get("ms") or 0)
     return streams, int(len(streams)), ms, meta
-
-def try_fastlane(*, prov2_fut, aio_fut, aio_key: str, prov2_url: str, aio_url: str, type_: str, id_: str, is_android: bool, is_iphone: bool = False, client_timeout_s: float, deadline: float):
-    """Prov2-only early return. Returns (out, aio_in, prov2_in, aio_ms, p2_ms, prefiltered, stats, fetch_meta) or None."""
-    if not FASTLANE_ENABLED or not prov2_fut or not prov2_url:
-        return None
-
-    # Android normal path: do not fastlane-return Prov2-only; wait for AIO merge.
-    # (Android clients were getting usenet-only results when fastlane returned early.)
-    if is_android and not is_iphone:
-        return None
-
-    # iPhone mixed mode: do not fastlane-return Prov2-only; wait for AIO merge so premium/debrid streams can join.
-    # (Prov2 is often usenet-only; fastlane here would incorrectly yield 0 debrid on iPhone.)
-    if is_iphone and not IPHONE_USENET_ONLY:
-        return None
-    # Cap how long we wait for Prov2 before deciding. We never block on AIO here.
-    try:
-        prov2_timeout = (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT)
-        remaining = max(0.05, float(deadline) - time.monotonic())
-        wait_s = min(float(prov2_timeout), remaining)
-        t_p2_wait0 = time.monotonic()
-        p2_streams, prov2_in, p2_ms, p2_meta = prov2_fut.result(timeout=wait_s)
-        p2_wait_ms = int((time.monotonic() - t_p2_wait0) * 1000)
-    except FuturesTimeoutError:
-        return None
-    except Exception:
-        return None
-
-    # Run the normal pipeline on Prov2-only to see if it's already "good enough".
-    try:
-        out, stats = filter_and_format(type_, id_, p2_streams, aio_in=0, prov2_in=prov2_in, is_android=is_android, is_iphone=False)
-    except Exception:
-        return None
-
-    try:
-        cached_tb = 0
-        usenet = 0
-        for s in out:
-            bh = (s.get('behaviorHints') or {}) if isinstance(s, dict) else {}
-            prov = (bh.get('provider') or '').upper()
-            if prov == 'TB' and bh.get('cached') is True:
-                cached_tb += 1
-            if prov in USENET_PRIORITY:
-                usenet += 1
-    except Exception:
-        cached_tb = 0
-        usenet = 0
-
-    if len(out) < FASTLANE_MIN_STREAMS and cached_tb < FASTLANE_MIN_STREAMS and usenet < int(MIN_USENET_DELIVER or 0):
-        return None
-
-    # Warm AIO cache in the background so the next request can merge instantly.
-    if aio_fut and AIO_CACHE_TTL_S > 0:
-        try:
-            aio_fut.add_done_callback(_make_aio_cache_update_cb(aio_key))
-        except Exception:
-            pass
-
-    # Fill in fetch timings for logs.
-    stats.ms_fetch_aio = 0
-    stats.ms_fetch_p2 = int(p2_wait_ms or 0)
-
-    logger.info(
-        "FASTLANE_TRIGGERED rid=%s type=%s id=%s out=%d p2_in=%d cached_tb=%d usenet=%d p2_wait_ms=%d p2_fetch_ms=%d aio=%s p2=%s",
-        _rid(), type_, id_, len(out), prov2_in, cached_tb, usenet, int(p2_wait_ms or 0), int(p2_ms or 0),
-        bool(aio_url), bool(prov2_url),
-    )
-    return out, 0, prov2_in, 0, int(p2_wait_ms or 0), True, stats, {'aio': {}, 'p2': (p2_meta if 'p2_meta' in locals() and isinstance(p2_meta, dict) else {})}
 
 def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bool = False, client_timeout_s: float | None = None):
     """
@@ -3773,7 +3704,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
       - AIO_BASE (debrid instance)
       - PROV2_BASE (usenet instance)
 
-    Patch 3 ("fastlane") adds optional AIO cache / soft-timeout:
+    Patch 3 adds optional AIO cache / soft-timeout:
       - AIO_CACHE_MODE=off  : previous behavior (wait for both)
       - AIO_CACHE_MODE=swr  : use cached AIO immediately (stale-while-revalidate) and refresh in background
       - AIO_CACHE_MODE=soft : wait up to AIO_SOFT_TIMEOUT_S for AIO; if not ready, fall back to cached AIO (if any)
@@ -3831,24 +3762,6 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
         logger.warning("AIO disabled rid=%s reason=no_base", _rid())
     if PROV2_BASE:
         p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, upstream_id, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT))
-    # Fastlane: Prov2-only early return if it's already good enough (does not wait on AIO).
-    fl = try_fastlane(
-        prov2_fut=p2_fut,
-        aio_fut=aio_fut,
-        aio_key=aio_key,
-        prov2_url=prov2_url,
-        aio_url=aio_url,
-        type_=type_,
-        id_=id_,
-        is_android=is_android,
-            is_iphone=is_iphone,
-        client_timeout_s=float(client_timeout_s),
-        deadline=deadline,
-    )
-    if fl is not None:
-        return fl
-
-
     def _harvest_p2():
         nonlocal p2_streams, prov2_in, p2_ms, p2_meta, p2_wait_ms
         if not p2_fut:
@@ -6959,7 +6872,7 @@ def _manifest_base() -> dict:
 @app.get("/manifest.json")
 def manifest():
     # Show minimal config flags in the manifest name (no secrets).
-    cfg = f"aio={1 if bool(AIO_BASE) else 0} p2={1 if bool(PROV2_BASE) else 0} fl={1 if bool(FASTLANE_ENABLED) else 0}"
+    cfg = f"aio={1 if bool(AIO_BASE) else 0} p2={1 if bool(PROV2_BASE) else 0}"
 
     base = dict(_manifest_base() or {})
 
