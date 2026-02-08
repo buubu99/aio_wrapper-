@@ -1,8 +1,8 @@
 {
   "id": "org.jason.wrapper",
   "version": "11.7.0",
-  "name": "Buubuu wrapper the best mix on the net",
-  "description": "Wraps AIOStreams to filter and format streams w usenet",
+  "name": "BuuBuu Super Wrapper – Ultimate Stream Mix!",
+  "description": "Movies & Series | The best mix of AIOStreams, usenet & debrid for premium, filtered streams — fast & reliable!",
   "resources": [
     "stream"
   ],
@@ -13,5 +13,10 @@
   "catalogs": [],
   "idPrefixes": [
     "tt"
-  ]
+  ],
+  "logo": "https://uxwing.com/wp-content/themes/uxwing/download/video-photography-multimedia/live-streaming-icon.png",
+  "behaviorHints": {
+    "configurable": true,
+    "configurationRequired": false
+  }
 }
