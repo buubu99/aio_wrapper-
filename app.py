@@ -142,6 +142,15 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 import requests
+
+
+# Optional UA parsing (tiny pure-Python dep: `ua-parser`)
+try:
+    from ua_parser import parse as ua_parse  # pip install ua-parser
+    UA_PARSER_AVAILABLE = True
+except Exception:
+    ua_parse = None
+    UA_PARSER_AVAILABLE = False
 from flask import Flask, jsonify, g, has_request_context, request, make_response, Response
 from flask_cors import CORS
 from requests.adapters import HTTPAdapter
@@ -2167,84 +2176,148 @@ def _mark() -> str:
 _TLS = threading.local()
 
 def is_android_client() -> bool:
-    """Best-effort detection of Android/TV-ish clients for tighter time budgets.
-
-    Important: blank User-Agent is *not* treated as Android unless EMPTY_UA_IS_ANDROID=true.
-    (Your curl tests often use an empty UA; we don't want that to trigger Android limits.)
-    """
-    ua = request.headers.get("User-Agent", "") if has_request_context() else ""
-    ua_l = (ua or "").strip().lower()
-
-    if not ua_l:
-        return bool(EMPTY_UA_IS_ANDROID)
-
-    return (
-        ("android" in ua_l)
-        or ("dalvik" in ua_l)
-        or ("okhttp" in ua_l)
-        or ("exoplayer" in ua_l)
-        or ("google tv" in ua_l)
-        or ("stremio" in ua_l and "tv" in ua_l)
-    )
+    """True for Android Mobile + Android TV."""
+    p = _platform_cached()
+    return p in ("android", "androidtv")
 
 
-def is_android_tv_client() -> bool:
-    """Detect Android TV / Google TV / Fire TV-ish clients.
+def is_android_tv_client(ua: str | None = None) -> bool:
+    """Heuristic for Android TV / Google TV / Chromecast-type devices."""
+    if ua is None:
+        ua = (request.headers.get("User-Agent") or "").lower()
+    else:
+        ua = (ua or "").lower()
 
-    Used only for labeling (logs/stats) and optional platform-specific policies.
-    """
-    ua = request.headers.get("User-Agent", "") if has_request_context() else ""
-    ua_l = (ua or "").strip().lower()
-    if not ua_l:
+    if not ua:
         return False
-    # TV-oriented indicators (keep conservative to avoid mislabeling phones)
-    return (
-        ("android tv" in ua_l)
-        or ("google tv" in ua_l)
-        or ("fire tv" in ua_l)
-        or ("aft" in ua_l)  # Amazon Fire TV device codes often include 'AFT'
-        or ("shield" in ua_l)  # NVIDIA Shield
-        or ("bravia" in ua_l)
-        or ("smart-tv" in ua_l)
-        or ("smarttv" in ua_l)
-        or ("stremio" in ua_l and "tv" in ua_l)
+
+    # Stremio explicit UA token (most reliable)
+    if "stremioandroidtv" in ua:
+        return True
+
+    # General Android-TV / Google-TV hints
+    tv_hints = (
+        "android tv", "androidtv",
+        "googletv", "google tv", "google_tv",
+        "smart-tv", "smarttv",
+        "hbbtv",
+        "bravia", "shield", "nexus player",
+        "aftt", "aftmm",  # Fire TV models
+        "crkey", "chromecast",
     )
+    return ("android" in ua) and any(h in ua for h in tv_hints)
+
+
+def get_ua() -> str:
+    return (request.headers.get("User-Agent") or "").strip()
+
+
+def _ua_token(ua_lower: str) -> str:
+    for tok in ("stremioshell", "stremioandroidtv", "stremioios", "stremio", "web.stremio.com"):
+        if tok in ua_lower:
+            return tok
+    if any(k in ua_lower for k in ("iphone", "ipad", "ipod")):
+        return "apple"
+    if "android" in ua_lower:
+        return "android"
+    if any(k in ua_lower for k in ("macintosh", "windows", "linux")):
+        return "desktop"
+    return "other"
+
+
+def parse_platform(ua: str | None = None) -> str:
+    """
+    Returns: 'android', 'androidtv', 'ios', 'desktop', 'unknown'
+
+    Key points:
+    - iPhone + iPad are unified as 'ios'
+    - iPad Safari may advertise a macOS UA; detect via 'Macintosh' + 'Mobile/'
+    - Uses `ua-parser` if installed, with robust string fallback
+    """
+    if ua is None:
+        ua = get_ua()
+
+    if not ua:
+        if EMPTY_UA_IS_ANDROID:
+            return "android"
+        logger.debug("EMPTY_UA rid=%s", _rid())
+        return "unknown"
+
+    ua_lower = ua.lower()
+
+    # Stremio-specific overrides (avoid fragile substring tricks)
+    if "stremioshell" in ua_lower:
+        return "desktop"
+    if "stremioandroidtv" in ua_lower:
+        return "androidtv"
+    if "stremioios" in ua_lower:
+        return "ios"
+
+    # UA-parser path (optional)
+    if UA_PARSER_AVAILABLE and ua_parse is not None:
+        try:
+            parsed = ua_parse(ua)
+            os_family = (getattr(parsed.os, "family", "") or "").lower()
+            dev_family = (getattr(parsed.device, "family", "") or "").lower()
+
+            if "android" in os_family:
+                if ("tv" in dev_family) or is_android_tv_client(ua_lower):
+                    return "androidtv"
+                return "android"
+
+            if os_family == "ios" or any(k in dev_family for k in ("iphone", "ipad", "ipod")):
+                return "ios"
+
+            # iPadOS masquerading as macOS (Safari on iPad can do this)
+            if (os_family in ("mac os x", "macos")) and ("macintosh" in ua_lower) and ("mobile/" in ua_lower):
+                return "ios"
+
+            if os_family in ("mac os x", "macos", "windows", "linux", "ubuntu", "chrome os"):
+                return "desktop"
+        except Exception:
+            pass  # fall through
+
+    # String fallback (avoid naive 'ios' substring to prevent 'stremio[s]hell' false positives)
+    if "android" in ua_lower:
+        return "androidtv" if is_android_tv_client(ua_lower) else "android"
+
+    if any(k in ua_lower for k in ("iphone", "ipad", "ipod", "cpu iphone os", "cpu os", "stremioios")):
+        return "ios"
+
+    if ("macintosh" in ua_lower) and ("mobile/" in ua_lower):
+        return "ios"
+
+    if any(k in ua_lower for k in ("windows", "macintosh", "mac os x", "linux", "x11")):
+        return "desktop"
+
+    return "unknown"
+
+
+def _platform_cached() -> str:
+    p = getattr(g, "_cached_platform", None)
+    if p:
+        return p
+    p = parse_platform()
+    g._cached_platform = p
+    g._cached_ua_tok = _ua_token((get_ua() or "").lower())
+    return p
 
 
 def is_iphone_client() -> bool:
-    """Best-effort detection of iPhone/iOS-ish clients.
+    """Back-compat name: now means iOS (iPhone + iPad)."""
+    return _platform_cached() == "ios"
 
-    Used to apply the same strict behavior as Android on mobile platforms
-    (notably dropping magnet: URLs).
-    """
-    ua = request.headers.get("User-Agent", "") if has_request_context() else ""
-    ua_l = (ua or "").strip().lower()
-    if not ua_l:
-        return False
-    # Common iOS identifiers (avoid false positives on "like Mac OS X" alone)
-    return ("iphone" in ua_l) or ("ipad" in ua_l) or ("ipod" in ua_l) or ("ios" in ua_l) or ("cfnetwork" in ua_l)
 
 def client_platform(is_android: bool, is_iphone: bool) -> str:
-    if is_iphone:
-        return "iphone"
-    if is_android:
-        # Distinguish Android TV / Google TV for clearer logs & debugging.
-        try:
-            if is_android_tv_client():
-                return "androidtv"
-        except Exception:
-            pass
-        return "android"
-    # Safari / desktop apps
-    ua = request.headers.get("User-Agent", "") if has_request_context() else ""
-    ua_l = (ua or "").strip().lower()
-    if not ua_l:
-        logger.debug("EMPTY_UA rid=%s", _rid())
-        return "android" if EMPTY_UA_IS_ANDROID else "unknown"
-    if "windows" in ua_l or "mac os" in ua_l or "x11" in ua_l or "linux" in ua_l:
+    """Return 'android', 'androidtv', 'ios', or 'desktop'."""
+    p = _platform_cached()
+    if p == "unknown":
+        if is_android:
+            return "android"
+        if is_iphone:
+            return "ios"
         return "desktop"
-    return "unknown"
-
+    return p
 def _choose_tb_max_hashes(platform: str) -> int:
     """Choose the TorBox hash budget based on client platform (fallback to TB_MAX_HASHES)."""
     p = (platform or '').strip().lower()
@@ -2254,7 +2327,7 @@ def _choose_tb_max_hashes(platform: str) -> int:
         return int(TB_MAX_HASHES_ANDROIDTV or TB_MAX_HASHES)
     if p == 'android':
         return int(TB_MAX_HASHES_ANDROID or TB_MAX_HASHES)
-    if p == 'iphone':
+    if p in ('iphone','ios'):
         return int(TB_MAX_HASHES_IPHONE or TB_MAX_HASHES)
     return int(TB_MAX_HASHES)
 
@@ -7225,8 +7298,10 @@ def stream(type_: str, id_: str):
             pass
 
         logger.info(
-            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s type=%s id=%s served_cache=%s aio_ms=%s p2_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s",
+            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s platform=%s ua_tok=%s type=%s id=%s served_cache=%s aio_ms=%s p2_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s",
             _rid(), _mark(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
+            platform,
+            getattr(g, "_cached_ua_tok", ""),
             type_, id_,
             int(1 if served_from_cache else 0),
             int(stats.ms_fetch_aio or 0), int(stats.ms_fetch_p2 or 0),
@@ -7243,8 +7318,9 @@ def stream(type_: str, id_: str):
         except Exception:
             out_size = 0
         logger.info(
-            "WRAP_STATS rid=%s mark=%s build=%s git=%s path=%s ua_class=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_placeholder=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s android_magnets=%s iphone_magnets=%s dropped_platform_specific=%s dropped_magnet=%s deduped=%s dedup=%s delivered=%s out=%s cache_hit=%s cache_miss=%s cache_rate=%.2f platform=%s flags=%s errors=%s errors_timeout=%s errors_parse=%s errors_api=%s ms=%s",
+            "WRAP_STATS rid=%s mark=%s build=%s git=%s path=%s ua_class=%s ua_tok=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_placeholder=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s android_magnets=%s iphone_magnets=%s dropped_platform_specific=%s dropped_magnet=%s deduped=%s dedup=%s delivered=%s out=%s cache_hit=%s cache_miss=%s cache_rate=%.2f platform=%s flags=%s errors=%s errors_timeout=%s errors_parse=%s errors_api=%s ms=%s",
             _rid(), _mark(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
+            getattr(g, "_cached_ua_tok", ""),
             type_, id_,
             int(stats.aio_in or 0), int(stats.prov2_in or 0), int(stats.merged_in or 0),
             int(stats.dropped_error or 0), int(stats.dropped_missing_url or 0),
