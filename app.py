@@ -5350,7 +5350,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     m['_mismatch_ratio'] = title_ratio
                     if title_ratio < TRAKT_TITLE_MIN_RATIO:
                         stats.dropped_title_mismatch += 1
-                        stats.t_title_mismatch += 1
+                        stats.dropped_title_mismatch += 1  # fixed: PipeStats has dropped_title_mismatch
                         logger.info(
                             'DROP_TITLE_MISMATCH rid=%s platform=%s type=%s id=%s cand=%r expected_title=%r expected_ep=%r ratio=%.3f #%d',
                             rid, platform, type, id, cand_title, expected_title, expected_ep_title, title_ratio, stats.dropped_title_mismatch
