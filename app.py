@@ -7209,7 +7209,7 @@ def stream(type_: str, id_: str):
             pass
 
         logger.info(
-            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s platform=%s ua_tok=%s type=%s id=%s served_cache=%s aio_ms=%s p2_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s",
+            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s platform=%s ua_tok=%s type=%s id=%s served_cache=%s aio_wait_ms=%s p2_wait_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s",
             _rid(), _mark(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
             platform,
             getattr(g, "_cached_ua_tok", ""),
