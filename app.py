@@ -6920,24 +6920,36 @@ def manifest():
 
     base = dict(_manifest_base() or {})
 
-    addon_name = (os.environ.get("ADDON_NAME") or "Buubuu wrapper the best mix on the net").strip() or "Buubuu wrapper the best mix on the net"
+    # Defaults (can be overridden by manifest.json and/or env vars).
+    DEFAULT_ADDON_NAME = "BuuBuu Super Wrapper – Ultimate Stream Mix!"
+    DEFAULT_ADDON_DESC = (
+        "Movies & Series | Mixes AIOStreams with usenet & debrid for premium, "
+        "filtered streams — fast & reliable!"
+    )
+    DEFAULT_ADDON_LOGO = (
+        "https://uxwing.com/wp-content/themes/uxwing/download/"
+        "video-photography-multimedia/live-streaming-icon.png"
+    )
+
+    addon_name = (os.environ.get("ADDON_NAME") or base.get("name") or DEFAULT_ADDON_NAME).strip() or DEFAULT_ADDON_NAME
+    addon_desc = (os.environ.get("ADDON_DESCRIPTION") or base.get("description") or DEFAULT_ADDON_DESC).strip() or DEFAULT_ADDON_DESC
+    addon_logo = (os.environ.get("ADDON_LOGO") or base.get("logo") or DEFAULT_ADDON_LOGO).strip() or DEFAULT_ADDON_LOGO
     addon_display_ver = (os.environ.get("ADDON_DISPLAY_VERSION") or "11.7").strip() or "11.7"
     addon_manifest_ver = (os.environ.get("ADDON_MANIFEST_VERSION") or "11.7.0").strip() or "11.7.0"
 
     # Keep stable fields from manifest.json (if present) but ensure required keys exist.
     base.setdefault("id", "org.buubuu.aio.wrapper.merge")
-    base.setdefault(
-        "description",
-        "Wraps AIOStreams to merge, filter, and format streams (client-safe schema).",
-    )
     base.setdefault("resources", ["stream"])
     base.setdefault("types", ["movie", "series"])
     base.setdefault("catalogs", [])
     base.setdefault("idPrefixes", ["tt", "tmdb"])
+    base.setdefault("behaviorHints", {"configurable": True, "configurationRequired": False})
 
-    # Override name/version via env for easy changes without code edits.
+    # Override name/version/branding via env for easy changes without code edits.
     base["version"] = addon_manifest_ver
-    base["name"] = f"{addon_name} v {addon_display_ver} [{cfg}]"
+    base["name"] = f"{addon_name} v{addon_display_ver} [{cfg}]"
+    base["description"] = addon_desc
+    base["logo"] = addon_logo
 
     return jsonify(base)
 @app.get("/stream/<type_>/<id_>.json")
