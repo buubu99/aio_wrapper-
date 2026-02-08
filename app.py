@@ -73,6 +73,7 @@ class PipeStats:
     dropped_blacklist: int = 0
     dropped_fakes_db: int = 0
     dropped_title_mismatch: int = 0
+    skipped_title_mismatch: int = 0  # title/ep-title validation skipped (quality-only titles)
     dropped_dead_url: int = 0
     dropped_uncached: int = 0
     dropped_uncached_tb: int = 0
@@ -616,6 +617,37 @@ def clean_title_for_compare(title: str) -> str:
     # Collapse whitespace
     t = re.sub(r"\s+", " ", t).strip()
     return t
+
+
+# Words that are common in "quality-only" strings and shouldn't be treated as real titles.
+_QUALITY_ONLY_WORDS = {
+    # containers / sources
+    "web", "dl", "webrip", "webdl", "hdrip", "bdrip", "dvdrip",
+    "bluray", "blu", "ray", "remux",
+    # codecs / formats
+    "x264", "x265", "h264", "h265", "hevc", "avc", "aac", "ac3", "eac3", "dts", "truehd",
+    "hdr", "sdr", "dv", "dolby", "vision", "atmos",
+    # misc release words
+    "proper", "repack", "rerip", "internal", "limited", "uncut", "extended",
+    "dub", "dubs", "sub", "subs", "multisub", "multi", "dual", "audio",
+    # generic
+    "rip", "encode", "reencode",
+}
+
+def _is_quality_only_title(t: str) -> bool:
+    """True if string looks like only quality/tech metadata (no real title words)."""
+    if not t:
+        return True
+    tl = t.lower()
+
+    # If there are non-latin letters and no latin letters, treat as NOT quality-only
+    # (we'll run mismatch logic, usually dropping it).
+    if re.search(r"[a-z]", tl) is None and re.search(r"[^\W\d_]", tl, flags=re.UNICODE):
+        return False
+
+    words = re.findall(r"[a-z]{3,}", tl)
+    meaningful = [w for w in words if w not in _QUALITY_ONLY_WORDS]
+    return len(meaningful) == 0
 def _human_size_bytes(n: int) -> str:
     try:
         n = int(n or 0)
@@ -5285,40 +5317,29 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         filtered_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
         for s, m in out_pairs:
             # Prefer our parsed raw title; fall back to upstream 'title' then name/desc.
-            cand_title = (m.get('title_raw') or s.get('title') or s.get('name') or '').lower().strip()
+            cand_title = (m.get('title_raw') or s.get('title') or s.get('name') or s.get('description') or '').lower().strip()
 
             if TRAKT_VALIDATE_TITLES and (expected_title or expected_ep_title) and cand_title:
-                cand_cmp = clean_title_for_compare(cand_title)
-                show_cmp = clean_title_for_compare(expected_title) if expected_title else ''
-                ep_cmp = clean_title_for_compare(expected_ep_title) if expected_ep_title else ''
-                # Some suppliers (especially RD/TB) sometimes emit labels like "2160p WEB-DL 23 GB" with no actual title.
-                # For *movies*, treat an empty/near-empty comparable title as "unknown" (do not hard-drop as mismatch).
-                alpha_ct = sum(1 for ch in cand_cmp if ch.isalpha())
-                if type_ == "movie" and ((not cand_cmp) or (alpha_ct < 3)):
-                    sim_show = float(TRAKT_TITLE_MIN_RATIO)
-                    sim_ep = 0.0
-                    similarity = float(TRAKT_TITLE_MIN_RATIO)
-                    m["_title_unknown"] = True
+                is_quality_only = _is_quality_only_title(cand_title)
+                if is_quality_only:
+                    # Providers sometimes emit names like '2160p WEB-DL 23.3 GB' with no real title words.
+                    # Treat as 'unknown title' and skip mismatch dropping to avoid under-delivery.
+                    stats.skipped_title_mismatch += 1
                 else:
-                    sim_show = difflib.SequenceMatcher(None, cand_cmp, show_cmp).ratio() if show_cmp else 0.0
-                    sim_ep = difflib.SequenceMatcher(None, cand_cmp, ep_cmp).ratio() if ep_cmp else 0.0
-                    similarity = sim_show if sim_show >= sim_ep else sim_ep
-                # Point 11 tie-break input: keep similarity for later dedup/sort tie breaks
-                try:
-                    m["_mismatch_ratio"] = float(similarity)
-                except Exception:
-                    m["_mismatch_ratio"] = 0.0
-                if similarity < TRAKT_TITLE_MIN_RATIO:
-                    logger.debug(
-                        f"TITLE_MISMATCH platform={stats.client_platform} type={type_} id={id_} cand={cand_cmp!r} "
-                        f"show={show_cmp!r} ep={ep_cmp!r} sim_show={sim_show:.3f} sim_ep={sim_ep:.3f} min={TRAKT_TITLE_MIN_RATIO}"
-                    )
-                    stats.dropped_title_mismatch += 1
-                    try:
-                        logger.info("DROP_TITLE_MISMATCH rid=%s name=%s expected_title=%s dropped_title_mismatch=%s", rid, s.get("name"), expected_title, stats.dropped_title_mismatch)
-                    except Exception:
-                        pass
-                    continue
+                    cand_cmp = clean_title_for_compare(cand_title)
+                    show_cmp = clean_title_for_compare(expected_title) if expected_title else ''
+                    ep_cmp = clean_title_for_compare(expected_ep_title) if expected_ep_title else ''
+                    expected_cmp = ep_cmp or show_cmp
+                    title_ratio = _similarity_ratio(cand_cmp, expected_cmp) if expected_cmp else 1.0
+                    m['_mismatch_ratio'] = title_ratio
+                    if title_ratio < TRAKT_TITLE_MIN_RATIO:
+                        stats.dropped_title_mismatch += 1
+                        stats.t_title_mismatch += 1
+                        logger.info(
+                            'DROP_TITLE_MISMATCH rid=%s platform=%s type=%s id=%s cand=%r expected_title=%r expected_ep=%r ratio=%.3f #%d',
+                            rid, platform, type, id, cand_title, expected_title, expected_ep_title, title_ratio, stats.dropped_title_mismatch
+                        )
+                        continue
             if TRAKT_STRICT_YEAR and expected_year:
                 stream_year = _extract_year(s.get('name') or '') or _extract_year(s.get('description') or '')
                 if stream_year and abs(int(stream_year) - int(expected_year)) > 1:
