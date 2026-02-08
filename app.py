@@ -3732,8 +3732,6 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
     aio_in = 0
     prov2_in = 0
     aio_ms = 0
-    p2_ms = 0
-
     # Wait times (how long we blocked on futures in *this* request)
     aio_wait_ms = 0
     p2_wait_ms = 0
@@ -3763,17 +3761,17 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
     if PROV2_BASE:
         p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, upstream_id, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT))
     def _harvest_p2():
-        nonlocal p2_streams, prov2_in, p2_ms, p2_meta, p2_wait_ms
+        nonlocal p2_streams, prov2_in, p2_meta, p2_wait_ms
         if not p2_fut:
             return
         remaining = max(0.05, deadline - time.monotonic())
         t_wait0 = time.monotonic()
         try:
-            p2_streams, prov2_in, p2_ms, p2_meta = p2_fut.result(timeout=remaining)
+            p2_streams, prov2_in, _p2_remote_ms, p2_meta = p2_fut.result(timeout=remaining)
         except FuturesTimeoutError:
-            p2_streams, prov2_in, p2_ms, p2_meta = [], 0, 0, {'tag': PROV2_TAG, 'ok': False, 'err': 'timeout'}
+            p2_streams, prov2_in, _p2_remote_ms, p2_meta = [], 0, 0, {'tag': PROV2_TAG, 'ok': False, 'err': 'timeout'}
         except Exception as e:
-            p2_streams, prov2_in, p2_ms, p2_meta = [], 0, 0, {'tag': PROV2_TAG, 'ok': False, 'err': f'error:{type(e).__name__}'}
+            p2_streams, prov2_in, _p2_remote_ms, p2_meta = [], 0, 0, {'tag': PROV2_TAG, 'ok': False, 'err': f'error:{type(e).__name__}'}
         finally:
             p2_wait_ms = int((time.monotonic() - t_wait0) * 1000)
 
@@ -7038,8 +7036,8 @@ def stream(type_: str, id_: str):
             p2_remote_ms  = int(stats.ms_fetch_p2_remote or 0)
 
             # What we "report" as timing_ms.* (used by smoke tests): remote when we have it, otherwise wait.
-            aio_ms = aio_remote_ms or aio_wait_ms
-            p2_ms  = p2_remote_ms or p2_wait_ms
+            aio_ms = aio_remote_ms
+            p2_ms  = p2_remote_ms
 
             tmdb_ms = int(stats.ms_tmdb or 0)
             tb_api_ms = int(stats.ms_tb_api or 0)
