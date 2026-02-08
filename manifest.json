@@ -12,9 +12,9 @@
   ],
   "catalogs": [],
   "idPrefixes": [
-    "tt"
+    "tt""logo": "https://aio-wrapper-add-on.onrender.com/logo.png",
   ],
-  "logo": "https://uxwing.com/wp-content/themes/uxwing/download/video-photography-multimedia/live-streaming-icon.png",
+  "logo": "",
   "behaviorHints": {
     "configurable": true,
     "configurationRequired": false
