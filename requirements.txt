@@ -4,3 +4,4 @@ flask-cors
 gunicorn
 python-levenshtein
 uvicorn
+ua-parser
