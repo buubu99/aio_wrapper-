@@ -6931,17 +6931,11 @@ def logo_png():
 
 @app.get("/manifest.json")
 def manifest():
-    # Show minimal config flags in the manifest name (no secrets).
-    cfg = f"aio={1 if bool(AIO_BASE) else 0} p2={1 if bool(PROV2_BASE) else 0}"
-
     base = dict(_manifest_base() or {})
 
     # Defaults (can be overridden by manifest.json and/or env vars).
-    DEFAULT_ADDON_NAME = "BuuBuu Super Wrapper – Ultimate Stream Mix!"
-    DEFAULT_ADDON_DESC = (
-        "Movies & Series | Mixes AIOStreams with usenet & debrid for premium, "
-        "filtered streams — fast & reliable!"
-    )
+    DEFAULT_ADDON_NAME = "Buubuu Wrapper"
+    DEFAULT_ADDON_DESC = "The best mix of AIOStreams, usenet & debrid for premium, filtered streams — fast & reliable!"
     # Prefer local /logo.png if present (more reliable for Stremio). Fallback to a public icon.
     local_logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
     if os.path.exists(local_logo_path):
@@ -6951,8 +6945,17 @@ def manifest():
             "https://uxwing.com/wp-content/themes/uxwing/download/"
             "video-photography-multimedia/live-streaming-icon.png"
         )
-    addon_name = (os.environ.get("ADDON_NAME") or base.get("name") or DEFAULT_ADDON_NAME).strip() or DEFAULT_ADDON_NAME
-    addon_desc = (os.environ.get("ADDON_DESCRIPTION") or base.get("description") or DEFAULT_ADDON_DESC).strip() or DEFAULT_ADDON_DESC
+    addon_name = (os.environ.get("ADDON_NAME") or DEFAULT_ADDON_NAME).strip() or DEFAULT_ADDON_NAME
+    addon_desc = (os.environ.get("ADDON_DESCRIPTION") or DEFAULT_ADDON_DESC).strip() or DEFAULT_ADDON_DESC
+    # Stremio already shows "Movies & Series" from types; avoid repeating it in description.
+    _d = addon_desc.strip()
+    if _d.lower().startswith("movies & series"):
+        for _sep in ("|", "—", "-", ":"):
+            if _sep in _d:
+                _left, _right = _d.split(_sep, 1)
+                if _left.strip().lower().startswith("movies & series"):
+                    addon_desc = _right.strip()
+                    break
     addon_logo = (os.environ.get("ADDON_LOGO") or base.get("logo") or DEFAULT_ADDON_LOGO).strip() or DEFAULT_ADDON_LOGO
     addon_display_ver = (os.environ.get("ADDON_DISPLAY_VERSION") or "11.7").strip() or "11.7"
     addon_manifest_ver = (os.environ.get("ADDON_MANIFEST_VERSION") or "11.7.0").strip() or "11.7.0"
@@ -6967,7 +6970,7 @@ def manifest():
 
     # Override name/version/branding via env for easy changes without code edits.
     base["version"] = addon_manifest_ver
-    base["name"] = f"{addon_name} v{addon_display_ver} [{cfg}]"
+    base["name"] = f"{addon_name} v{addon_display_ver}"
     base["description"] = addon_desc
     base["logo"] = addon_logo
 
