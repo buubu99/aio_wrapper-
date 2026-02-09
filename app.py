@@ -7283,10 +7283,7 @@ def stream(type_: str, id_: str):
             payload["debug"] = {
                 "rid": _rid(),
                 "platform": platform,
-                "ua_class": stats.client_class,
-                "ua_tok": getattr(g, "_cached_ua_tok", ""),
-                "ua_family": getattr(g, "_cached_ua_family", ""),
-                "ua_class": stats.client_class,
+                "ua_class": (getattr(stats, "client_class", "") or platform),
                 "ua_tok": getattr(g, "_cached_ua_tok", ""),
                 "ua_family": getattr(g, "_cached_ua_family", ""),
                 "cache": ("hit" if served_from_cache else "miss"),
@@ -7374,7 +7371,7 @@ def stream(type_: str, id_: str):
             payload["debug"] = {
                 "rid": _rid(),
                 "platform": platform,
-                "ua_class": _ua_class((get_ua() or "").lower()),
+                "ua_class": platform,
                 "ua_tok": getattr(g, "_cached_ua_tok", ""),
                 "ua_family": getattr(g, "_cached_ua_family", ""),
                 "cache": ("hit" if served_from_cache else "miss"),
@@ -7557,6 +7554,8 @@ def handle_unhandled_exception(e):
             stremio_id = id_part[:-5] if id_part.endswith(".json") else id_part
             cache_key = f"{type_}:{stremio_id}" if type_ and stremio_id else ""
         except Exception:
+            type_ = ""
+            stremio_id = ""
             cache_key = ""
 
         cached = cache_get(cache_key) if cache_key else None
@@ -7598,7 +7597,7 @@ def handle_unhandled_exception(e):
                 "errors": [f"unhandled:{type(e).__name__}"],
                 "flags": ["unhandled_exception"],
             }
-        _debug_log_full_streams(type_, id_, platform, out_for_client)
+        _debug_log_full_streams(type_ or "", stremio_id or "", platform, out_for_client)
         return jsonify(payload), 200
 
     return ("Internal Server Error", 500)
