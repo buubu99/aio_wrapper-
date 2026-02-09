@@ -635,6 +635,79 @@ _QUALITY_ONLY_WORDS = {
 }
 
 
+# --- Patch 2 (A/B/C): improved title normalization + scoring for title-mismatch filter ---
+# Step A: normalize titles hard (strip bracket noise, years, separators, release junk)
+# Step B: score using token containment + token Jaccard + fuzzy fallback
+# Step C: compare against TMDB aliases (title + original title/name) when available
+
+_JUNK_TOKENS = {
+    # resolution / general
+    "2160p", "1080p", "720p", "480p", "576p", "1440p", "4320p", "4k", "8k",
+    # hdr / formats
+    "hdr10", "hdr10+", "hdr", "sdr", "dv", "dovi", "dolby", "vision",
+    # sources / containers
+    "web", "dl", "webrip", "webdl", "web-dl", "bluray", "brrip", "bdrip", "remux", "hdrip",
+    # codecs
+    "x264", "x265", "h264", "h265", "hevc", "avc", "vp9", "av1",
+    # audio
+    "aac", "ac3", "eac3", "ddp", "dd", "atmos", "dts", "truehd", "opus", "flac",
+    # subs / language / services
+    "multi", "dual", "subs", "sub", "esub", "dub", "dublado", "ita", "eng", "kor",
+    "nf", "netflix", "amzn", "amazon", "hulu", "disney", "max",
+    # misc release words
+    "proper", "repack", "internal", "limited", "extended", "unrated", "imax",
+    # file extensions (also removed earlier but keep here too)
+    "mkv", "mp4", "avi", "m4v",
+}
+
+def _strip_brackets(s: str) -> str:
+    # remove 【...】 and (...) and [...]
+    s = re.sub(r"【[^】]*】", " ", s or "")
+    s = re.sub(r"\[[^\]]*\]", " ", s)
+    s = re.sub(r"\([^)]*\)", " ", s)
+    return s
+
+def norm_title(s: str) -> str:
+    """Normalize a candidate/expected title for mismatch scoring."""
+    if not s:
+        return ""
+    s = str(s).lower()
+    s = _strip_brackets(s)
+    s = re.sub(r"\.(mkv|mp4|avi|m4v)$", "", s)      # file ext at end
+    s = re.sub(r"[\._\-:/]+", " ", s)              # separators & colon -> space
+    s = re.sub(r"\b(19|20)\d{2}\b", " ", s)       # years
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)               # drop non-alnum
+    toks = [t for t in s.split() if t and t not in _JUNK_TOKENS]
+    return " ".join(toks)
+
+def title_score(cand: str, expected: str) -> float:
+    """Score in [0,1] for title-mismatch matching (robust to extra junk words)."""
+    try:
+        c = norm_title(cand)
+        e = norm_title(expected)
+        if not c or not e:
+            return 0.0
+
+        # If expected appears as a whole-word token sequence, accept strongly.
+        if f" {e} " in f" {c} ":
+            return 1.0
+
+        cset = set(c.split())
+        eset = set(e.split())
+        if not cset or not eset:
+            return 0.0
+
+        # Token Jaccard (robust to extra junk words)
+        jacc = len(cset & eset) / len(cset | eset)
+
+        # Fuzzy fallback on normalized strings
+        seq = difflib.SequenceMatcher(None, c, e).ratio()
+
+        return float(max(jacc, seq))
+    except Exception:
+        return 0.0
+
+
 
 def _similarity_ratio(a, b):
     """Similarity ratio in [0,1] for already-normalized compare strings.
@@ -2341,6 +2414,39 @@ def _ua_token(ua_lower: str) -> str:
         return "desktop"
     return "other"
 
+def _ua_family(ua: str) -> str:
+    """More specific UA classifier (logging/debug only).
+
+    Keeps `_ua_token` stable for existing logic while letting logs
+    distinguish WebStremio Safari vs Chrome, etc.
+    """
+    u = (ua or "").lower()
+
+    # Stremio native apps first
+    if "stremioios" in u:
+        return "stremio_ios"
+    if "stremioandroidtv" in u:
+        return "stremio_androidtv"
+    if "stremioshell" in u:
+        return "stremio_shell"
+    if "stremio" in u and "android" in u:
+        return "stremio_android"
+
+    # Browser families (WebStremio)
+    if "edg/" in u or "edge/" in u:
+        return "web_edge"
+    if "firefox/" in u:
+        return "web_firefox"
+    if "crios/" in u or "chrome/" in u:
+        return "web_chrome"
+    # Safari: has Safari but not Chrome/CriOS/Android
+    if "safari/" in u and "chrome/" not in u and "crios/" not in u and "android" not in u:
+        return "web_safari"
+
+    # Fallback (broad buckets)
+    return _ua_token(u)
+
+
 
 def parse_platform(ua: str | None = None) -> str:
     """
@@ -2416,7 +2522,9 @@ def _platform_cached() -> str:
         return p
     p = parse_platform()
     g._cached_platform = p
-    g._cached_ua_tok = _ua_token((get_ua() or "").lower())
+    ua = get_ua() or ""
+    g._cached_ua_tok = _ua_token(ua.lower())
+    g._cached_ua_family = _ua_family(ua)
     return p
 
 
@@ -3139,6 +3247,18 @@ def get_expected_metadata(type_: str, id_: str) -> dict:
                         if isinstance(ep, dict):
                             ep_title = (ep.get("title") or "").strip()
 
+
+                            title_original = ""
+                            try:
+                                if TMDB_API_KEY and tmdb_id:
+                                    kind2 = "movie" if type_ == "movie" else "tv"
+                                    meta_url2 = f"https://api.themoviedb.org/3/{kind2}/{tmdb_id}?api_key={TMDB_API_KEY}&language=en-US"
+                                    r0 = session.get(meta_url2, timeout=TMDB_TIMEOUT)
+                                    j0 = r0.json() if getattr(r0, "ok", False) else {}
+                                    title_original = (j0.get("original_title") if kind2 == "movie" else j0.get("original_name")) or ""
+                            except Exception:
+                                title_original = ""
+
                     # Ensure IMDb id (prefer Trakt ids, else TMDB external_ids)
                     imdb_from_trakt = (ids.get("imdb") or "").strip()
                     if (not imdb_from_trakt) and TMDB_API_KEY:
@@ -3149,7 +3269,8 @@ def get_expected_metadata(type_: str, id_: str) -> dict:
                     return {
                         "title": title,
                         "year": int(year) if str(year).isdigit() else year,
-                        "tmdb_id": tmdb_id,
+                        
+                        "title_original": str(title_original).strip(),"tmdb_id": tmdb_id,
                         "episode_title": ep_title,
                         "season": season,
                         "episode": episode,
@@ -3206,6 +3327,7 @@ def get_expected_metadata(type_: str, id_: str) -> dict:
         j = r.json() if getattr(r, "ok", False) else {}
 
         title = (j.get("title") if kind == "movie" else j.get("name")) or ""
+        title_original = (j.get("original_title") if kind == "movie" else j.get("original_name")) or ""
         date_str = (j.get("release_date") if kind == "movie" else j.get("first_air_date")) or ""
         year = int(date_str[:4]) if (len(date_str) >= 4 and date_str[:4].isdigit()) else None
 
@@ -5342,18 +5464,49 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     # Treat as 'unknown title' and skip mismatch dropping to avoid under-delivery.
                     stats.skipped_title_mismatch += 1
                 else:
-                    cand_cmp = clean_title_for_compare(cand_title)
-                    show_cmp = clean_title_for_compare(expected_title) if expected_title else ''
-                    ep_cmp = clean_title_for_compare(expected_ep_title) if expected_ep_title else ''
-                    expected_cmp = ep_cmp or show_cmp
-                    title_ratio = _similarity_ratio(cand_cmp, expected_cmp) if expected_cmp else 1.0
-                    m['_mismatch_ratio'] = title_ratio
-                    if title_ratio < TRAKT_TITLE_MIN_RATIO:
+                    # Patch 2 (A/B/C): token containment + Jaccard + fuzzy score; plus TMDB alias titles
+                    expected_titles = []
+                    if expected_ep_title:
+                        expected_titles.append(expected_ep_title)
+                    if expected_title:
+                        expected_titles.append(expected_title)
+                    try:
+                        orig = (expected.get("title_original") or expected.get("original_title") or expected.get("original_name") or "")
+                    except Exception:
+                        orig = ""
+                    if orig:
+                        expected_titles.append(str(orig).strip().lower())
+                    # Dedup expected candidates (preserve order)
+                    seen = set()
+                    exp_list = []
+                    for texp in expected_titles:
+                        texp = (texp or "").strip()
+                        if not texp:
+                            continue
+                        if texp in seen:
+                            continue
+                        seen.add(texp)
+                        exp_list.append(texp)
+                    best = 1.0
+                    if exp_list:
+                        best = 0.0
+                        for texp in exp_list:
+                            sc = title_score(cand_title, texp)
+                            if sc > best:
+                                best = sc
+                    m['_mismatch_ratio'] = best
+                    thr = TRAKT_TITLE_MIN_RATIO
+                    try:
+                        nt = norm_title(expected_title)
+                        if nt and len(nt) <= 6:
+                            thr = min(thr, 0.50)
+                    except Exception:
+                        pass
+                    if best < thr:
                         stats.dropped_title_mismatch += 1
-                        stats.dropped_title_mismatch += 1  # fixed: PipeStats has dropped_title_mismatch
                         logger.info(
-                            'DROP_TITLE_MISMATCH rid=%s platform=%s type=%s id=%s cand=%r expected_title=%r expected_ep=%r ratio=%.3f #%d',
-                            rid, platform, type, id, cand_title, expected_title, expected_ep_title, title_ratio, stats.dropped_title_mismatch
+                            'DROP_TITLE_MISMATCH rid=%s platform=%s type=%s id=%s cand=%r expected_title=%r expected_ep=%r ratio=%.3f thr=%.2f #%d',
+                            rid, platform, type_, id_, cand_title, expected_title, expected_ep_title, best, thr, stats.dropped_title_mismatch
                         )
                         continue
             if TRAKT_STRICT_YEAR and expected_year:
@@ -7130,6 +7283,12 @@ def stream(type_: str, id_: str):
             payload["debug"] = {
                 "rid": _rid(),
                 "platform": platform,
+                "ua_class": stats.client_class,
+                "ua_tok": getattr(g, "_cached_ua_tok", ""),
+                "ua_family": getattr(g, "_cached_ua_family", ""),
+                "ua_class": stats.client_class,
+                "ua_tok": getattr(g, "_cached_ua_tok", ""),
+                "ua_family": getattr(g, "_cached_ua_family", ""),
                 "cache": ("hit" if served_from_cache else "miss"),
                 "served_cache": bool(served_from_cache),
                 "fetch": {"aio": stats.fetch_aio, "p2": stats.fetch_p2},
@@ -7215,6 +7374,9 @@ def stream(type_: str, id_: str):
             payload["debug"] = {
                 "rid": _rid(),
                 "platform": platform,
+                "ua_class": _ua_class((get_ua() or "").lower()),
+                "ua_tok": getattr(g, "_cached_ua_tok", ""),
+                "ua_family": getattr(g, "_cached_ua_family", ""),
                 "cache": ("hit" if served_from_cache else "miss"),
                 "served_cache": bool(served_from_cache),
                 "fetch": {"aio": stats.fetch_aio, "p2": stats.fetch_p2},
@@ -7290,10 +7452,11 @@ def stream(type_: str, id_: str):
             pass
 
         logger.info(
-            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s platform=%s ua_tok=%s type=%s id=%s served_cache=%s aio_wait_ms=%s p2_wait_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s",
+            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s platform=%s ua_tok=%s ua_family=%s type=%s id=%s served_cache=%s aio_wait_ms=%s p2_wait_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s",
             _rid(), _mark(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
             platform,
             getattr(g, "_cached_ua_tok", ""),
+            getattr(g, "_cached_ua_family", ""),
             type_, id_,
             int(1 if served_from_cache else 0),
             int(stats.ms_fetch_aio or 0), int(stats.ms_fetch_p2 or 0),
@@ -7310,9 +7473,10 @@ def stream(type_: str, id_: str):
         except Exception:
             out_size = 0
         logger.info(
-            "WRAP_STATS rid=%s mark=%s build=%s git=%s path=%s ua_class=%s ua_tok=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_placeholder=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s android_magnets=%s iphone_magnets=%s dropped_platform_specific=%s dropped_magnet=%s deduped=%s dedup=%s delivered=%s out=%s cache_hit=%s cache_miss=%s cache_rate=%.2f platform=%s flags=%s errors=%s errors_timeout=%s errors_parse=%s errors_api=%s ms=%s",
+            "WRAP_STATS rid=%s mark=%s build=%s git=%s path=%s ua_class=%s ua_tok=%s ua_family=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_placeholder=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s android_magnets=%s iphone_magnets=%s dropped_platform_specific=%s dropped_magnet=%s deduped=%s dedup=%s delivered=%s out=%s cache_hit=%s cache_miss=%s cache_rate=%.2f platform=%s flags=%s errors=%s errors_timeout=%s errors_parse=%s errors_api=%s ms=%s",
             _rid(), _mark(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
             getattr(g, "_cached_ua_tok", ""),
+            getattr(g, "_cached_ua_family", ""),
             type_, id_,
             int(stats.aio_in or 0), int(stats.prov2_in or 0), int(stats.merged_in or 0),
             int(stats.dropped_error or 0), int(stats.dropped_missing_url or 0),
