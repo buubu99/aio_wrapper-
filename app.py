@@ -5621,29 +5621,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             except Exception:
                 pass
 
-        if ready_titles:
-            t_usmatch0 = time.monotonic()
-            flagged = 0
-            for s, meta in out_pairs:
-                prov_u = str(meta.get("provider") or "").upper().strip()
-                if prov_u not in usenet_provs_set:
-                    continue
-                stream_title = normalize_label(meta.get("title_raw") or s.get("title") or s.get("name") or "")
-                stream_title = stream_title.lower().strip()
-                if not stream_title:
-                    continue
-                for rt in ready_titles:
-                    if difflib.SequenceMatcher(None, stream_title, rt).ratio() >= float(NZBGEEK_TITLE_MATCH_MIN_RATIO or 0.80):
-                        meta["ready"] = True
-                        flagged += 1
-                        break
-
-            stats.ms_usenet_ready_match = int((time.monotonic() - t_usmatch0) * 1000)
-            if flagged:
-                logger.info(
-                    "NZBGEEK_READY rid=%s imdb=%s ready_titles=%s flagged=%s ms_tb_usenet=%s",
-                    rid, imdbid, len(ready_titles), flagged, stats.ms_tb_usenet
-                )
+        # NOTE: NZBGeek readiness matching is applied later (after dedup) for speed.
     except Exception as _e:
         logger.debug("NZBGEEK_READY_ERR rid=%s err=%s", rid, _e)
 
@@ -5719,6 +5697,84 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
         out_pairs = deduped
         stats.ms_py_dedup = int((time.monotonic() - t_dedup0) * 1000)
+
+    # Apply NZBGeek readiness matching AFTER dedup (smaller candidate set) to reduce CPU.
+    if ready_titles and out_pairs:
+        try:
+            t_usmatch0 = time.monotonic()
+            flagged = 0
+            ratio_thr = float(NZBGEEK_TITLE_MATCH_MIN_RATIO or 0.80)
+
+            # ready_titles are already normalized by normalize_label(); build fast lookup structures.
+            ready_norms = [str(rt).lower().strip() for rt in (ready_titles or []) if rt]
+            ready_set = set(ready_norms)
+            tok_index = defaultdict(list)
+            for rt in ready_norms:
+                for tok in rt.split():
+                    if len(tok) >= 3:
+                        tok_index[tok].append(rt)
+
+            # Cache readiness by normalized stream title to avoid repeated work within the request.
+            ready_cache = {}
+
+            for s, meta in out_pairs:
+                prov_u = str(meta.get('provider') or '').upper().strip()
+                if prov_u not in usenet_provs_set:
+                    continue
+
+                st = normalize_label(meta.get('title_raw') or s.get('title') or s.get('name') or '')
+                st = st.lower().strip()
+                if not st:
+                    continue
+
+                if st not in ready_cache:
+                    is_ready = False
+                    if st in ready_set:
+                        is_ready = True
+                    else:
+                        toks = [t for t in st.split() if len(t) >= 3]
+                        cand_counts = {}
+                        for t in toks:
+                            for rt in tok_index.get(t, ()):
+                                cand_counts[rt] = cand_counts.get(rt, 0) + 1
+
+                        if cand_counts:
+                            # Prefer candidates sharing >=2 meaningful tokens; else fall back to a small top list.
+                            cands = [rt for rt, c in sorted(cand_counts.items(), key=lambda kv: (-kv[1], kv[0])) if c >= 2]
+                            if not cands:
+                                cands = [rt for rt, _ in sorted(cand_counts.items(), key=lambda kv: (-kv[1], kv[0]))][:20]
+
+                            # Fast substring check before any fuzzy ratio work.
+                            for rt in cands:
+                                if rt and (rt in st or st in rt):
+                                    is_ready = True
+                                    break
+
+                            # Fuzzy match only against a small, token-filtered candidate set.
+                            if (not is_ready) and cands:
+                                for rt in cands[:50]:
+                                    if not rt:
+                                        continue
+                                    if abs(len(st) - len(rt)) > max(8, int(0.35 * max(len(st), len(rt)))):
+                                        continue
+                                    if difflib.SequenceMatcher(None, st, rt).ratio() >= ratio_thr:
+                                        is_ready = True
+                                        break
+
+                    ready_cache[st] = is_ready
+
+                if ready_cache.get(st) and not meta.get('ready'):
+                    meta['ready'] = True
+                    flagged += 1
+
+            stats.ms_usenet_ready_match = int((time.monotonic() - t_usmatch0) * 1000)
+            if flagged:
+                logger.info("NZBGEEK_READY rid=%s imdb=%s ready_titles=%s flagged=%s ms_tb_usenet=%s ms_match=%s", rid, imdbid, len(ready_titles or []), flagged, stats.ms_tb_usenet, stats.ms_usenet_ready_match)
+        except Exception as _e:
+            stats.ms_usenet_ready_match = 0
+            logger.debug("NZBGEEK_READY_MATCH_ERR rid=%s err=%s", rid, _e)
+    else:
+        stats.ms_usenet_ready_match = 0
 
 # MARKERS: show how many streams were validated by each "instant" mechanism.
     # NOTE: TB instant is NOT WebDAV here; it is usually signaled by upstream tags (CACHED:TRUE + PROXIED:TRUE)
