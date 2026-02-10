@@ -7323,6 +7323,7 @@ def stream(type_: str, id_: str):
                 "flags": list(stats.flag_issues)[:12],
             }
 
+        payload.update(payload.get("debug") or {})  # flatten debug keys to top-level for dbg=1
         _debug_log_full_streams(type_, id_, platform, out_for_client)
         return jsonify(payload), 200
 
