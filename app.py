@@ -100,6 +100,12 @@ class PipeStats:
     ms_tb_api: int = 0
     ms_tb_webdav: int = 0
     ms_tb_usenet: int = 0
+    # Local processing timings (measured inside Python; includes CPU work after fetches)
+    ms_py_ff: int = 0              # total time inside filter_and_format
+    ms_py_dedup: int = 0           # dedup + best-pick loop
+    ms_py_wrap_emit: int = 0       # wrapping /r/<token> URLs + building final delivered list
+    ms_usenet_ready_match: int = 0 # difflib.SequenceMatcher comparisons for usenet readiness
+
 
     # Per-filter timings (ms)
     ms_title_mismatch: int = 0
@@ -5007,6 +5013,7 @@ def check_nzbgeek_readiness_title(title_query: str) -> List[str]:
 def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0, is_android: bool = False, is_iphone: bool = False, fast_mode: bool = False, deliver_cap: Optional[int] = None) -> Tuple[List[Dict[str, Any]], PipeStats]:
     stats = PipeStats()
     rid = _rid()
+    t_ff0 = time.monotonic()
     # Expose per-request stats to heuristic helpers (thread-local)
     try:
         _TLS.stats = stats
@@ -5615,6 +5622,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 pass
 
         if ready_titles:
+            t_usmatch0 = time.monotonic()
             flagged = 0
             for s, meta in out_pairs:
                 prov_u = str(meta.get("provider") or "").upper().strip()
@@ -5630,6 +5638,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                         flagged += 1
                         break
 
+            stats.ms_usenet_ready_match = int((time.monotonic() - t_usmatch0) * 1000)
             if flagged:
                 logger.info(
                     "NZBGEEK_READY rid=%s imdb=%s ready_titles=%s flagged=%s ms_tb_usenet=%s",
@@ -5643,6 +5652,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # - Keeps ordering stable by preserving the first-seen index for each key.
     # - Replaces the stored entry when a later duplicate has a higher tie-break score.
     if WRAPPER_DEDUP and out_pairs:
+        t_dedup0 = time.monotonic()
         deduped: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
         best_idx: Dict[str, int] = {}
         best_score: Dict[str, float] = {}
@@ -5708,6 +5718,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             deduped.append((s, m))
 
         out_pairs = deduped
+        stats.ms_py_dedup = int((time.monotonic() - t_dedup0) * 1000)
 
 # MARKERS: show how many streams were validated by each "instant" mechanism.
     # NOTE: TB instant is NOT WebDAV here; it is usually signaled by upstream tags (CACHED:TRUE + PROXIED:TRUE)
@@ -6762,6 +6773,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 })
         except Exception:
             _wrapped_url_map = {}
+    t_wrap0 = time.monotonic()
     for s, m in candidates[:deliver_cap_eff]:
         h = (m.get("infohash") or "").lower().strip()
         cached_marker = m.get("cached")
@@ -6884,6 +6896,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 d.get("name"),
             )
 
+    stats.ms_py_wrap_emit = int((time.monotonic() - t_wrap0) * 1000)
     stats.delivered = len(delivered)
 
     # Cache summary (delivered streams only): keep WRAP_STATS aligned with WRAP_COUNTS out.cached
@@ -6969,6 +6982,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     except Exception:
         pass
 
+    stats.ms_py_ff = int((time.monotonic() - t_ff0) * 1000)
     # Clear TLS stats pointer to avoid leaking across requests
     try:
         if hasattr(_TLS, "stats"):
@@ -7304,6 +7318,10 @@ def stream(type_: str, id_: str):
                                     "tb_usenet": tb_usenet_ms,
                                     "title_mismatch": title_mismatch_ms,
                                     "uncached_check": uncached_check_ms,
+                                    "py_ff": int(getattr(stats, "ms_py_ff", 0) or 0),
+                                    "py_dedup": int(getattr(stats, "ms_py_dedup", 0) or 0),
+                                    "py_wrap_emit": int(getattr(stats, "ms_py_wrap_emit", 0) or 0),
+                                    "usenet_ready_match": int(getattr(stats, "ms_usenet_ready_match", 0) or 0),
                                 },
                                 "remote_ms": {"aio": aio_remote_ms, "p2": p2_remote_ms},
                                 "wait_ms": {"aio": aio_wait_ms, "p2": p2_wait_ms},
@@ -7450,7 +7468,7 @@ def stream(type_: str, id_: str):
             pass
 
         logger.info(
-            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s platform=%s ua_tok=%s ua_family=%s type=%s id=%s served_cache=%s aio_wait_ms=%s p2_wait_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s",
+            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s platform=%s ua_tok=%s ua_family=%s type=%s id=%s served_cache=%s aio_wait_ms=%s p2_wait_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s ms_py_ff=%s ms_py_dedup=%s ms_py_wrap_emit=%s ms_usenet_ready_match=%s",
             _rid(), _mark(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
             platform,
             getattr(g, "_cached_ua_tok", ""),
@@ -7464,6 +7482,10 @@ def stream(type_: str, id_: str):
             int(stats.ms_title_mismatch or 0), int(stats.ms_uncached_check or 0),
             int(stats.tb_api_hashes or 0), int(stats.tb_webdav_hashes or 0), int(stats.tb_usenet_hashes or 0),
             int(stats.memory_peak_kb or 0),
+            int(getattr(stats, 'ms_py_ff', 0) or 0),
+            int(getattr(stats, 'ms_py_dedup', 0) or 0),
+            int(getattr(stats, 'ms_py_wrap_emit', 0) or 0),
+            int(getattr(stats, 'ms_usenet_ready_match', 0) or 0),
         )
         # New: Approximate output size (bytes) for debugging response bloat
         try:
