@@ -236,6 +236,8 @@ if PROV2_BASE and not str(PROV2_BASE).startswith(("http://", "https://")):
 PROV2_AUTH = os.environ.get("PROV2_AUTH", "")  # 'user:pass' for Basic auth if needed
 PROV2_TAG = os.environ.get("PROV2_TAG", "P2")
 AIO_TAG = os.environ.get("AIO_TAG", "AIO")
+
+USE_AIO_READY = _parse_bool(os.environ.get("USE_AIO_READY", "false"), False)  # Trust AIOStreams 2.23+ C:/P:/T: tags
 WRAP_LOG_COUNTS = _parse_bool(os.environ.get("WRAP_LOG_COUNTS", "1"))
 WRAP_EMBED_DEBUG = _parse_bool(os.environ.get("WRAP_EMBED_DEBUG", "0"))
 
@@ -2958,13 +2960,100 @@ _GROUP_RE = re.compile(r"[-.]([a-z0-9]+)$", re.I)
 _HASH_RE = re.compile(r"btih:([0-9a-fA-F]{40})|([0-9a-fA-F]{40})", re.I)
 _CACHED_TAG_RE = re.compile(r'\bcached\s*:\s*true\b', re.I)  # Matches e.g. 'CACHED:true'
 
+# --- AIOStreams 2.23+ tag parsing (no-throw, fast) ---
+# We intentionally keep this tiny and defensive. These tags are produced by your AIOStreams formatter:
+#   IH:<hash> TB|RD|ND
+#   T:debrid|usenet  C:true|false  P:true|false
+_AIO_T_RE = re.compile(r"(?:^|\s)T\s*:\s*(debrid|usenet)(?=\s|$)", re.I)
+_AIO_C_RE = re.compile(r"(?:^|\s)C\s*:\s*(true|false)(?=\s|$)", re.I)
+_AIO_P_RE = re.compile(r"(?:^|\s)P\s*:\s*(true|false)(?=\s|$)", re.I)
+_AIO_IH_RE = re.compile(r"(?:^|\s)IH\s*:\s*([0-9a-fA-F]{32,40})(?:\s+([A-Za-z|]+))?", re.I)
+
+def _parse_aio_223_tags(desc: Any) -> Dict[str, Any]:
+    """Parse AIOStreams 2.23+ machine-readable tags from stream.description.
+
+    Returns dict with optional keys:
+      - ih (str)          : hash from IH:<hash> if present
+      - ih_provs (list)   : provider codes after IH, split by '|'
+      - type (str)        : 'debrid' or 'usenet'
+      - cached (bool)     : from C:true/false
+      - proxied (bool)    : from P:true/false
+
+    Never raises.
+    """
+    out: Dict[str, Any] = {}
+    try:
+        s = str(desc or "")
+    except Exception:
+        return out
+    if not s.strip():
+        return out
+
+    try:
+        m = _AIO_IH_RE.search(s)
+        if m:
+            ih = (m.group(1) or "").strip()
+            if ih:
+                out["ih"] = ih.lower()
+            provs = (m.group(2) or "").strip()
+            if provs:
+                out["ih_provs"] = [p for p in provs.split("|") if p]
+    except Exception:
+        pass
+
+    try:
+        mt = _AIO_T_RE.search(s)
+        if mt:
+            out["type"] = (mt.group(1) or "").strip().lower()
+    except Exception:
+        pass
+
+    try:
+        mc = _AIO_C_RE.search(s)
+        if mc:
+            out["cached"] = ((mc.group(1) or "").strip().lower() == "true")
+    except Exception:
+        pass
+
+    try:
+        mp = _AIO_P_RE.search(s)
+        if mp:
+            out["proxied"] = ((mp.group(1) or "").strip().lower() == "true")
+    except Exception:
+        pass
+
+    return out
+
+def _aio_tagged_instant(aio: Any) -> Optional[bool]:
+    """Return True/False if AIO tags include both cached + proxied, else None."""
+    try:
+        if not isinstance(aio, dict):
+            return None
+        if ("cached" in aio) and ("proxied" in aio):
+            return bool(aio.get("cached")) and bool(aio.get("proxied"))
+    except Exception:
+        return None
+    return None
+
+
 def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     name = s.get("name", "").lower()
-    desc = s.get("description", "").lower()
+    desc_raw = s.get("description", "") or ""
+    desc = str(desc_raw).lower()
     filename = s.get("behaviorHints", {}).get("filename", "").lower()
     text = f"{name} {desc} {filename}"
+
+    # Step 0: parse AIOStreams 2.23+ machine tags (no behavior change by itself)
+    aio = _parse_aio_223_tags(desc_raw)
+    aio_cached = None
+    try:
+        if isinstance(aio, dict):
+            aio_cached = aio.get("cached", None)
+    except Exception:
+        aio_cached = None
+
     # +++ Usenet Mod 1: cached tag parsing (matches e.g. 'CACHED:true')
-    cached = True if _CACHED_TAG_RE.search(text) else None
+    cached = True if _CACHED_TAG_RE.search(text) else (True if (USE_AIO_READY and aio_cached is True) else None)
     # Container (from filename extension)
     m_container = re.search(r'\.(MKV|MP4|AVI|M2TS|TS)\b', text, re.I)
     container = (m_container.group(1).upper() if m_container else 'UNK')
@@ -3150,6 +3239,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "provider": provider,
         "cached": cached,
+        "aio": aio,
         "res": res,
         "source": source,
         "codec": codec,
@@ -5794,13 +5884,27 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     desc_u = str(_s.get('description') or '').upper()
             except Exception:
                 desc_u = ''
-            has_cached_tag = ('CACHED:TRUE' in desc_u)
-            has_proxied_tag = ('PROXIED:TRUE' in desc_u)
+            aio = _m.get('aio') if isinstance(_m, dict) else None
+            aio_cached = None
+            aio_proxied = None
+            try:
+                if isinstance(aio, dict):
+                    aio_cached = aio.get('cached', None)
+                    aio_proxied = aio.get('proxied', None)
+            except Exception:
+                aio_cached = None
+                aio_proxied = None
+
+            has_cached_tag = ('CACHED:TRUE' in desc_u) or (USE_AIO_READY and (aio_cached is not None))
+            has_proxied_tag = ('PROXIED:TRUE' in desc_u) or (USE_AIO_READY and (aio_proxied is not None))
+
             if has_cached_tag:
                 c_cachedtag[prov] += 1
             if has_proxied_tag:
                 c_proxiedtag[prov] += 1
-            if has_cached_tag and has_proxied_tag:
+
+            # "Tagged instant" means cached+proxied are both True (truth tags if present, else legacy TRUE tokens).
+            if ('CACHED:TRUE' in desc_u and 'PROXIED:TRUE' in desc_u) or (USE_AIO_READY and (aio_cached is True and aio_proxied is True)):
                 c_tagged[prov] += 1
             if _m.get('infohash'):
                 c_hash[prov] += 1
@@ -5829,7 +5933,16 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         usenet_provs = {str(p).upper() for p in (USENET_PROVIDERS or USENET_PRIORITY or [])}
         usenet_provs.add('ND')  # Treat ND as usenet-like
 
-        if seeders == 0 and (prov in usenet_provs):
+        aio = m.get('aio') if isinstance(m, dict) else None
+        aio_type = None
+        try:
+            if isinstance(aio, dict):
+                aio_type = aio.get('type', None)
+        except Exception:
+            aio_type = None
+        is_usenet = (prov in usenet_provs) or (USE_AIO_READY and (aio_type == 'usenet'))
+
+        if seeders == 0 and is_usenet:
             seeders = USENET_SEEDER_BOOST
 
         cached = m.get('cached')
@@ -5838,10 +5951,10 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         elif cached == 'LIKELY':
             cached_val = 0.5
         else:
-            cached_val = 1.0 if (prov in usenet_provs) else 2.0
+            cached_val = 1.0 if is_usenet else 2.0
 
         # Optional (usenet-only mode): prefer usenet slightly to avoid iOS torrent edge cases
-        if iphone_usenet_mode and (prov in usenet_provs):
+        if iphone_usenet_mode and is_usenet:
             cached_val = min(cached_val, 0.1)
 
         # "Instant / ready-to-play" signal (preferred over provider priority).
@@ -5853,7 +5966,12 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         except Exception:
             desc = ""
         desc_u = str(desc).upper()
-        is_instant = ("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) or _looks_instant(str(desc))
+        # Step 1: Prefer truth tags (C:/P:) when available (gated by USE_AIO_READY). Fall back to legacy tokens + heuristic.
+        aio_ti = _aio_tagged_instant(aio) if USE_AIO_READY else None
+        if aio_ti is not None:
+            is_instant = bool(aio_ti)
+        else:
+            is_instant = ("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) or _looks_instant(str(desc))
         instant_val = 0 if is_instant else 1
 
         ready_val = 0 if m.get("ready") else 1
@@ -5899,7 +6017,18 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             except Exception:
                 desc = ""
             desc_u = str(desc).upper()
-            tagged_instant = ("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u)
+            aio = m.get("aio") if isinstance(m, dict) else None
+            aio_cached = None
+            aio_proxied = None
+            try:
+                if isinstance(aio, dict):
+                    aio_cached = aio.get("cached", None)
+                    aio_proxied = aio.get("proxied", None)
+            except Exception:
+                aio_cached = None
+                aio_proxied = None
+            aio_ti = (aio_cached is True and aio_proxied is True) if (USE_AIO_READY and (aio_cached is not None or aio_proxied is not None)) else None
+            tagged_instant = bool(aio_ti) if (aio_ti is not None) else ("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u)
             # Prefer cached signal from the outgoing stream's behaviorHints (what the client sees).
             bh = {}
             try:
@@ -6550,17 +6679,51 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     with CACHED_HISTORY_LOCK:
                         cached_marker = bool(CACHED_HISTORY.get(h, False))
                     tb_src_hist += 1
-                elif ASSUME_PREMIUM_ON_FAIL:
-                    cached_marker = True
-                    tb_src_assume += 1
                 else:
-                    cached_marker = False
-                    tb_src_nohash += 1
+                    # No hash: prefer truth tag (C:true/false) if present (gated).
+                    aio0 = _m.get('aio') if isinstance(_m, dict) else None
+                    aio_cached0 = None
+                    try:
+                        if isinstance(aio0, dict):
+                            aio_cached0 = aio0.get('cached', None)
+                    except Exception:
+                        aio_cached0 = None
+
+                    if USE_AIO_READY and isinstance(aio_cached0, bool):
+                        cached_marker = bool(aio_cached0)
+                    elif ASSUME_PREMIUM_ON_FAIL:
+                        cached_marker = True
+                        tb_src_assume += 1
+                    else:
+                        cached_marker = False
+                        tb_src_nohash += 1
             elif provider in ('RD', 'AD'):
-                cached_marker = 'LIKELY' if _heuristic_cached(_s, _m) else False
+                aio0 = _m.get('aio') if isinstance(_m, dict) else None
+                aio_cached0 = None
+                try:
+                    if isinstance(aio0, dict):
+                        aio_cached0 = aio0.get('cached', None)
+                except Exception:
+                    aio_cached0 = None
+
+                if USE_AIO_READY and isinstance(aio_cached0, bool):
+                    cached_marker = bool(aio_cached0)
+                else:
+                    cached_marker = 'LIKELY' if _heuristic_cached(_s, _m) else False
             elif provider in usenet_provs:
                 existing = _m.get('cached', None)
-                if existing is True:
+
+                aio0 = _m.get('aio') if isinstance(_m, dict) else None
+                aio_cached0 = None
+                try:
+                    if isinstance(aio0, dict):
+                        aio_cached0 = aio0.get('cached', None)
+                except Exception:
+                    aio_cached0 = None
+
+                if USE_AIO_READY and isinstance(aio_cached0, bool):
+                    cached_marker = bool(aio_cached0)
+                elif existing is True:
                     cached_marker = True
                 elif existing == 'LIKELY':
                     cached_marker = 'LIKELY'
