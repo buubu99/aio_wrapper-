@@ -3053,7 +3053,13 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
         aio_cached = None
 
     # +++ Usenet Mod 1: cached tag parsing (matches e.g. 'CACHED:true')
-    cached = True if _CACHED_TAG_RE.search(text) else (True if (USE_AIO_READY and aio_cached is True) else None)
+    cached = True if _CACHED_TAG_RE.search(text) else None
+    # Step 1: if AIO 2.23+ C: tag is present (true/false) and USE_AIO_READY is enabled, trust it.
+    try:
+        if USE_AIO_READY and isinstance(aio, dict) and (aio.get("cached", None) is not None):
+            cached = bool(aio.get("cached"))
+    except Exception:
+        pass
     # Container (from filename extension)
     m_container = re.search(r'\.(MKV|MP4|AVI|M2TS|TS)\b', text, re.I)
     container = (m_container.group(1).upper() if m_container else 'UNK')
@@ -5895,8 +5901,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 aio_cached = None
                 aio_proxied = None
 
-            has_cached_tag = ('CACHED:TRUE' in desc_u) or (USE_AIO_READY and (aio_cached is not None))
-            has_proxied_tag = ('PROXIED:TRUE' in desc_u) or (USE_AIO_READY and (aio_proxied is not None))
+            has_cached_tag = ('CACHED:TRUE' in desc_u) or (USE_AIO_READY and (aio_cached is True))
+            has_proxied_tag = ('PROXIED:TRUE' in desc_u) or (USE_AIO_READY and (aio_proxied is True))
 
             if has_cached_tag:
                 c_cachedtag[prov] += 1
@@ -6027,7 +6033,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             except Exception:
                 aio_cached = None
                 aio_proxied = None
-            aio_ti = (aio_cached is True and aio_proxied is True) if (USE_AIO_READY and (aio_cached is not None or aio_proxied is not None)) else None
+            aio_ti = (aio_cached is True and aio_proxied is True) if (USE_AIO_READY and (aio_cached is not None and aio_proxied is not None)) else None
             tagged_instant = bool(aio_ti) if (aio_ti is not None) else ("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u)
             # Prefer cached signal from the outgoing stream's behaviorHints (what the client sees).
             bh = {}
