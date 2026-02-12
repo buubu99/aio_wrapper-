@@ -2961,23 +2961,108 @@ _HASH_RE = re.compile(r"btih:([0-9a-fA-F]{40})|([0-9a-fA-F]{40})", re.I)
 _CACHED_TAG_RE = re.compile(r'\bcached\s*:\s*true\b', re.I)  # Matches e.g. 'CACHED:true'
 
 # --- AIOStreams 2.23+ tag parsing (no-throw, fast) ---
-# We intentionally keep this tiny and defensive. These tags are produced by your AIOStreams formatter:
+# We intentionally keep this tiny and defensive. These tags are produced by your AIOStreams formatter
+# (examples; some fields may be missing per stream):
 #   IH:<hash> TB|RD|ND
+#   RG:<group>
+#   SE:<num>  NSE:<0-100>  SE★:<stars>  RSEM:<comma tags>
+#   RX:<num>  NRX:<0-100>  RX★:<stars>  RXM:<comma tags>  RRXM:<comma tags>
+#   BR:<Mbps>  SZ:<GB>
+#   VT:<visual tags>  AT:<audio tags>
+#   UL:<lang codes>  ULE:<emojis>
 #   T:debrid|usenet  C:true|false  P:true|false
-_AIO_T_RE = re.compile(r"(?:^|\s)T\s*:\s*(debrid|usenet)(?=\s|$)", re.I)
-_AIO_C_RE = re.compile(r"(?:^|\s)C\s*:\s*(true|false)(?=\s|$)", re.I)
-_AIO_P_RE = re.compile(r"(?:^|\s)P\s*:\s*(true|false)(?=\s|$)", re.I)
+#
+# Step 0 goal: parse into meta["aio"] with *no behavior change* by itself.
+_AIO_T_RE  = re.compile(r"(?:^|\s)T\s*:\s*(debrid|usenet)(?=\s|$)", re.I)
+_AIO_C_RE  = re.compile(r"(?:^|\s)C\s*:\s*(true|false)(?=\s|$)", re.I)
+_AIO_P_RE  = re.compile(r"(?:^|\s)P\s*:\s*(true|false)(?=\s|$)", re.I)
 _AIO_IH_RE = re.compile(r"(?:^|\s)IH\s*:\s*([0-9a-fA-F]{32,40})(?:\s+([A-Za-z|]+))?", re.I)
+
+_AIO_RG_RE      = re.compile(r"(?:^|\s)RG\s*:\s*([^\s]+)", re.I)
+_AIO_SE_RE      = re.compile(r"(?:^|\s)SE\s*:\s*(\d+(?:\.\d+)?)", re.I)
+_AIO_NSE_RE     = re.compile(r"(?:^|\s)NSE\s*:\s*(\d+(?:\.\d+)?)", re.I)
+_AIO_SE_STAR_RE = re.compile(r"(?:^|\s)SE(?:★|\*)\s*:\s*(\d+)", re.I)
+_AIO_RSEM_RE    = re.compile(r"(?:^|\s)RSEM\s*:\s*([^\r\n]+)", re.I)
+
+_AIO_RX_RE      = re.compile(r"(?:^|\s)RX\s*:\s*(\d+(?:\.\d+)?)", re.I)
+_AIO_NRX_RE     = re.compile(r"(?:^|\s)NRX\s*:\s*(\d+(?:\.\d+)?)", re.I)
+_AIO_RX_STAR_RE = re.compile(r"(?:^|\s)RX(?:★|\*)\s*:\s*(\d+)", re.I)
+_AIO_RXM_RE     = re.compile(r"(?:^|\s)RXM\s*:\s*([^\r\n]+)", re.I)
+_AIO_RRXM_RE    = re.compile(r"(?:^|\s)RRXM\s*:\s*([^\r\n]+)", re.I)
+
+_AIO_BR_RE  = re.compile(r"(?:^|\s)BR\s*:\s*(\d+(?:\.\d+)?)", re.I)
+_AIO_SZ_RE  = re.compile(r"(?:^|\s)SZ\s*:\s*(\d+(?:\.\d+)?)", re.I)
+_AIO_VT_RE  = re.compile(r"(?:^|\s)VT\s*:\s*([^\r\n]+)", re.I)
+_AIO_AT_RE  = re.compile(r"(?:^|\s)AT\s*:\s*([^\r\n]+)", re.I)
+_AIO_UL_RE  = re.compile(r"(?:^|\s)UL\s*:\s*([^\r\n]+)", re.I)
+_AIO_ULE_RE = re.compile(r"(?:^|\s)ULE\s*:\s*([^\r\n]+)", re.I)
+
+_AIO_TAG_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*\+?")  # handles HDR10+ / DD+ / TrueHD etc.
+_AIO_LANG_TOKEN_RE = re.compile(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?")
+
+def _aio_split_csv(raw: str) -> List[str]:
+    try:
+        return [x.strip() for x in str(raw or "").split(",") if x.strip()]
+    except Exception:
+        return []
+
+def _aio_split_tags(raw: str, upper: bool = True) -> List[str]:
+    """Split VT/AT style compact strings into tokens; keeps tokens like HDR10+ and DD+ intact."""
+    try:
+        toks = [t for t in _AIO_TAG_TOKEN_RE.findall(str(raw or "")) if t]
+        if upper:
+            toks = [t.upper() for t in toks]
+        # de-dup preserve order
+        seen = set()
+        out = []
+        for t in toks:
+            if t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+        return out
+    except Exception:
+        return []
+
+def _aio_split_langs(raw: str) -> List[str]:
+    try:
+        toks = [t.upper() for t in _AIO_LANG_TOKEN_RE.findall(str(raw or "")) if t]
+        seen = set()
+        out = []
+        for t in toks:
+            if t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+        return out
+    except Exception:
+        return []
 
 def _parse_aio_223_tags(desc: Any) -> Dict[str, Any]:
     """Parse AIOStreams 2.23+ machine-readable tags from stream.description.
 
     Returns dict with optional keys:
-      - ih (str)          : hash from IH:<hash> if present
-      - ih_provs (list)   : provider codes after IH, split by '|'
-      - type (str)        : 'debrid' or 'usenet'
-      - cached (bool)     : from C:true/false
-      - proxied (bool)    : from P:true/false
+      - ih (str)            : hash from IH:<hash> if present
+      - ih_provs (list)     : provider codes after IH, split by '|'
+      - type (str)          : 'debrid' or 'usenet' (T:)
+      - cached (bool)       : from C:true/false
+      - proxied (bool)      : from P:true/false
+      - rg (str)            : release group (RG:)
+      - se (float)          : SE score (SE:)
+      - nse (float)         : normalized SE score 0-100 (NSE:)
+      - se_star (int)       : SE★ stars (SE★:)
+      - rsem (list[str])    : stream-expression match tags (RSEM:)
+      - rx (float)          : regex score (RX:)
+      - nrx (float)         : normalized regex score 0-100 (NRX:)
+      - rx_star (int)       : RX★ stars (RX★:)
+      - rxm (list[str])     : regex match tags (RXM:)
+      - rrxm (list[str])    : reverse regex match tags (RRXM:)
+      - br_mbps (float)     : bitrate Mbps (BR:)
+      - sz_gb (float)       : size GB (SZ:)
+      - vt (list[str])      : visual tags (VT:)
+      - at (list[str])      : audio tags (AT:)
+      - ul (list[str])      : language codes (UL:)
+      - ule (str)           : language emojis string (ULE:)
 
     Never raises.
     """
@@ -2988,6 +3073,151 @@ def _parse_aio_223_tags(desc: Any) -> Dict[str, Any]:
         return out
     if not s.strip():
         return out
+
+    # Single pass over lines keeps it fast and avoids accidental matches in free-form prose.
+    try:
+        for ln in s.splitlines():
+            if not ln:
+                continue
+            line = ln.strip()
+            if not line or ":" not in line:
+                continue
+
+            # IH:<hash> <provs>
+            if "ih" not in out:
+                try:
+                    m = _AIO_IH_RE.search(line)
+                    if m:
+                        ih = (m.group(1) or "").strip()
+                        if ih:
+                            out["ih"] = ih.lower()
+                        provs = (m.group(2) or "").strip()
+                        if provs:
+                            out["ih_provs"] = [p for p in provs.split("|") if p]
+                except Exception:
+                    pass
+
+            # Combined line: T:/C:/P: may share a single line.
+            if "type" not in out:
+                try:
+                    mt = _AIO_T_RE.search(line)
+                    if mt:
+                        out["type"] = (mt.group(1) or "").strip().lower()
+                except Exception:
+                    pass
+            if "cached" not in out:
+                try:
+                    mc = _AIO_C_RE.search(line)
+                    if mc:
+                        out["cached"] = ((mc.group(1) or "").strip().lower() == "true")
+                except Exception:
+                    pass
+            if "proxied" not in out:
+                try:
+                    mp = _AIO_P_RE.search(line)
+                    if mp:
+                        out["proxied"] = ((mp.group(1) or "").strip().lower() == "true")
+                except Exception:
+                    pass
+
+            # The remaining tags are typically one per line, but we still search defensively.
+            if "rg" not in out:
+                try:
+                    mrg = _AIO_RG_RE.search(line)
+                    if mrg:
+                        out["rg"] = (mrg.group(1) or "").strip()
+                except Exception:
+                    pass
+
+            # Scores (SE/RX) and match reasons
+            try:
+                if "se" not in out:
+                    mse = _AIO_SE_RE.search(line)
+                    if mse:
+                        out["se"] = _safe_float(mse.group(1), 0.0)
+                if "nse" not in out:
+                    mnse = _AIO_NSE_RE.search(line)
+                    if mnse:
+                        out["nse"] = _safe_float(mnse.group(1), 0.0)
+                if "se_star" not in out:
+                    mses = _AIO_SE_STAR_RE.search(line)
+                    if mses:
+                        out["se_star"] = _safe_int(mses.group(1), 0)
+                if "rsem" not in out:
+                    mrsem = _AIO_RSEM_RE.search(line)
+                    if mrsem:
+                        out["rsem"] = _aio_split_csv(mrsem.group(1))
+            except Exception:
+                pass
+
+            try:
+                if "rx" not in out:
+                    mrx = _AIO_RX_RE.search(line)
+                    if mrx:
+                        out["rx"] = _safe_float(mrx.group(1), 0.0)
+                if "nrx" not in out:
+                    mnrx = _AIO_NRX_RE.search(line)
+                    if mnrx:
+                        out["nrx"] = _safe_float(mnrx.group(1), 0.0)
+                if "rx_star" not in out:
+                    mrxs = _AIO_RX_STAR_RE.search(line)
+                    if mrxs:
+                        out["rx_star"] = _safe_int(mrxs.group(1), 0)
+                if "rxm" not in out:
+                    mrxm = _AIO_RXM_RE.search(line)
+                    if mrxm:
+                        out["rxm"] = _aio_split_csv(mrxm.group(1))
+                if "rrxm" not in out:
+                    mrrxm = _AIO_RRXM_RE.search(line)
+                    if mrrxm:
+                        out["rrxm"] = _aio_split_csv(mrrxm.group(1))
+            except Exception:
+                pass
+
+            # Bitrate / size
+            try:
+                if "br_mbps" not in out:
+                    mbr = _AIO_BR_RE.search(line)
+                    if mbr:
+                        out["br_mbps"] = _safe_float(mbr.group(1), 0.0)
+                if "sz_gb" not in out:
+                    msz = _AIO_SZ_RE.search(line)
+                    if msz:
+                        out["sz_gb"] = _safe_float(msz.group(1), 0.0)
+            except Exception:
+                pass
+
+            # Visual/audio tags
+            try:
+                if "vt" not in out:
+                    mvt = _AIO_VT_RE.search(line)
+                    if mvt:
+                        out["vt"] = _aio_split_tags(mvt.group(1), upper=True)
+                if "at" not in out:
+                    mat = _AIO_AT_RE.search(line)
+                    if mat:
+                        out["at"] = _aio_split_tags(mat.group(1), upper=True)
+            except Exception:
+                pass
+
+            # Language tags
+            try:
+                if "ul" not in out:
+                    mul = _AIO_UL_RE.search(line)
+                    if mul:
+                        out["ul"] = _aio_split_langs(mul.group(1))
+                if "ule" not in out:
+                    mule = _AIO_ULE_RE.search(line)
+                    if mule:
+                        out["ule"] = (mule.group(1) or "").strip()
+            except Exception:
+                pass
+
+    except Exception:
+        # Fully defensive: never throw from parsing.
+        return out
+
+    return out
 
     try:
         m = _AIO_IH_RE.search(s)
@@ -6082,8 +6312,20 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             except Exception:
                 desc = ""
             desc_u = str(desc).upper()
-            super_instant = 0 if ("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) else 1
-
+            aio = m.get("aio") if isinstance(m, dict) else None
+            aio_cached = None
+            aio_proxied = None
+            try:
+                if isinstance(aio, dict):
+                    aio_cached = aio.get("cached", None)
+                    aio_proxied = aio.get("proxied", None)
+            except Exception:
+                aio_cached = None
+                aio_proxied = None
+            if USE_AIO_READY and (aio_cached is not None) and (aio_proxied is not None):
+                super_instant = 0 if (aio_cached is True and aio_proxied is True) else 1
+            else:
+                super_instant = 0 if ("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) else 1
             return (super_instant,) + k
 
         top_pairs.sort(key=instant_key)
