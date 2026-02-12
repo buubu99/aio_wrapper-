@@ -3267,14 +3267,15 @@ def _aio_tagged_instant(aio: Any) -> Optional[bool]:
 
 
 def classify(s: Dict[str, Any]) -> Dict[str, Any]:
+    bh = s.get("behaviorHints", {}) or {}
     name = s.get("name", "").lower()
     desc_raw = s.get("description", "") or ""
     desc = str(desc_raw).lower()
-    filename = s.get("behaviorHints", {}).get("filename", "").lower()
+    filename = (bh.get("filename", "") or "").lower()
     text = f"{name} {desc} {filename}"
 
-    # Step 0: parse AIOStreams 2.23+ machine tags (no behavior change by itself)
-    aio = _parse_aio_223_tags(desc_raw)
+    # Step 0: parse AIOStreams 2.23+ machine tags (prefer persisted bh["wrap_aio"] if available)
+    aio = (bh.get("wrap_aio") if isinstance(bh.get("wrap_aio"), dict) else _parse_aio_223_tags(desc_raw))
     aio_cached = None
     try:
         if isinstance(aio, dict):
@@ -4178,6 +4179,24 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
             # Always tag supplier (AIO/P2) for downstream counters/debug.
             bh["wrap_src"] = tag
             bh["source_tag"] = tag
+            # Parse and persist AIOStreams 2.23+ machine tags EARLY (before we rewrite description for UI).
+            # This lets later stages (sorting/counts/logs) use C:/P:/T:/UL:/VT:/NSE etc even if description gets overwritten.
+            try:
+                desc_raw = s.get("description", "") or ""
+                aio_tags = _parse_aio_223_tags(desc_raw)
+                if isinstance(aio_tags, dict) and aio_tags:
+                    bh["wrap_aio"] = aio_tags  # full tag dict (debuggable; not shown to user UI)
+                    # Step 1 truth signals: trust C:/P:/T: when present (gated by USE_AIO_READY).
+                    if USE_AIO_READY:
+                        if aio_tags.get("cached", None) is not None:
+                            bh["cached"] = bool(aio_tags.get("cached"))
+                        if aio_tags.get("proxied", None) is not None:
+                            bh["wrap_proxied"] = bool(aio_tags.get("proxied"))
+                        if aio_tags.get("type"):
+                            bh["wrap_type"] = str(aio_tags.get("type"))
+            except Exception:
+                pass
+
         meta["count"] = int(len(streams))
         meta["ok"] = True
         return streams, meta
