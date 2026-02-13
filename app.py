@@ -2958,7 +2958,7 @@ _AUDIO_TOKS = ["DDP", "DD+", "DD", "EAC3", "TRUEHD", "DTS-HD", "DTS", "AAC", "AC
 _LANG_TOKS = ["ENG", "ENGLISH", "SPANISH", "FRENCH", "GERMAN", "ITALIAN", "KOREAN", "JAPANESE", "CHINESE", "MULTI", "VOSTFR", "SUBBED"]
 _GROUP_RE = re.compile(r"[-.]([a-z0-9]+)$", re.I)
 _HASH_RE = re.compile(r"btih:([0-9a-fA-F]{40})|([0-9a-fA-F]{40})", re.I)
-_CACHED_TAG_RE = re.compile(r'\bcached\s*:\s*true\b', re.I)  # Matches e.g. 'CACHED:true'
+_CACHED_TAG_RE = re.compile(r'\b(?:cached|c)\s*:\s*true\b', re.I)  # Matches e.g. 'CACHED:true' or 'C:true'
 
 # --- AIOStreams 2.23+ tag parsing (no-throw, fast) ---
 # We intentionally keep this tiny and defensive. These tags are produced by your AIOStreams formatter
@@ -2984,11 +2984,14 @@ _AIO_NSE_RE     = re.compile(r"(?:^|\s)NSE\s*:\s*(\d+(?:\.\d+)?)", re.I)
 _AIO_SE_STAR_RE = re.compile(r"(?:^|\s)SE(?:★|\*)\s*:\s*(\d+)", re.I)
 _AIO_RSEM_RE    = re.compile(r"(?:^|\s)RSEM\s*:\s*([^\r\n]+)", re.I)
 
-_AIO_RX_RE      = re.compile(r"(?:^|\s)RX\s*:\s*(\d+(?:\.\d+)?)", re.I)
-_AIO_NRX_RE     = re.compile(r"(?:^|\s)NRX\s*:\s*(\d+(?:\.\d+)?)", re.I)
+_AIO_RX_RE      = re.compile(r"(?:^|\s)RX\s*:\s*([-+]?\d+(?:\.\d+)?)", re.I)
+_AIO_NRX_RE     = re.compile(r"(?:^|\s)NRX\s*:\s*([-+]?\d+(?:\.\d+)?)", re.I)
 _AIO_RX_STAR_RE = re.compile(r"(?:^|\s)RX(?:★|\*)\s*:\s*(\d+)", re.I)
 _AIO_RXM_RE     = re.compile(r"(?:^|\s)RXM\s*:\s*([^\r\n]+)", re.I)
 _AIO_RRXM_RE    = re.compile(r"(?:^|\s)RRXM\s*:\s*([^\r\n]+)", re.I)
+
+_AIO_MT_RE     = re.compile(r"(?:^|\s)MT\s*:\s*([^\r\n]+)", re.I)
+_AIO_MY_RE     = re.compile(r"(?:^|\s)MY\s*:\s*(\d{4})", re.I)
 
 _AIO_BR_RE  = re.compile(r"(?:^|\s)BR\s*:\s*(\d+(?:\.\d+)?)", re.I)
 _AIO_SZ_RE  = re.compile(r"(?:^|\s)SZ\s*:\s*(\d+(?:\.\d+)?)", re.I)
@@ -3005,6 +3008,27 @@ def _aio_split_csv(raw: str) -> List[str]:
         return [x.strip() for x in str(raw or "").split(",") if x.strip()]
     except Exception:
         return []
+
+
+def _aio_trim_value(val: str, stop_keys: Optional[List[str]] = None) -> str:
+    """Trim an extracted inline tag value so it doesn't swallow the next TAG: on the same line."""
+    try:
+        s = str(val or "").strip()
+        if not s:
+            return ""
+        keys = stop_keys or []
+        low = s.lower()
+        cut = None
+        for k in keys:
+            needle = f" {k.lower()}:"
+            pos = low.find(needle)
+            if pos != -1:
+                cut = pos if cut is None else min(cut, pos)
+        if cut is not None:
+            return s[:cut].strip()
+        return s
+    except Exception:
+        return str(val or "").strip()
 
 def _aio_split_tags(raw: str, upper: bool = True) -> List[str]:
     """Split VT/AT style compact strings into tokens; keeps tokens like HDR10+ and DD+ intact."""
@@ -3166,11 +3190,19 @@ def _parse_aio_223_tags(desc: Any) -> Dict[str, Any]:
                 if "rxm" not in out:
                     mrxm = _AIO_RXM_RE.search(line)
                     if mrxm:
-                        out["rxm"] = _aio_split_csv(mrxm.group(1))
+                        out["rxm"] = _aio_split_csv(_aio_trim_value(mrxm.group(1), stop_keys=["RRXM","RSEM","RX","NRX","VT","AT","UL","ULE","T","C","P","BR","SZ","RG","SE","NSE","MT","MY"]))
                 if "rrxm" not in out:
                     mrrxm = _AIO_RRXM_RE.search(line)
                     if mrrxm:
-                        out["rrxm"] = _aio_split_csv(mrrxm.group(1))
+                        out["rrxm"] = _aio_split_csv(_aio_trim_value(mrrxm.group(1), stop_keys=["RXM","RSEM","RX","NRX","VT","AT","UL","ULE","T","C","P","BR","SZ","RG","SE","NSE","MT","MY"]))
+                        if "mt" not in out:
+                            mmt = _AIO_MT_RE.search(line)
+                            if mmt:
+                                out["mt"] = _aio_trim_value(mmt.group(1), stop_keys=["MY","VT","AT","UL","ULE","T","C","P","BR","SZ","RG","SE","NSE","RSEM","RX","NRX","RXM","RRXM"]).strip()
+                        if "my" not in out:
+                            mmy = _AIO_MY_RE.search(line)
+                            if mmy:
+                                out["my"] = _safe_int(mmy.group(1), 0)
             except Exception:
                 pass
 
@@ -3192,11 +3224,11 @@ def _parse_aio_223_tags(desc: Any) -> Dict[str, Any]:
                 if "vt" not in out:
                     mvt = _AIO_VT_RE.search(line)
                     if mvt:
-                        out["vt"] = _aio_split_tags(mvt.group(1), upper=True)
+                        out["vt"] = _aio_split_tags(_aio_trim_value(mvt.group(1), stop_keys=["AT","UL","ULE","T","C","P","BR","SZ","RG","SE","NSE","RSEM","RX","NRX","RXM","RRXM","MT","MY"]), upper=True)
                 if "at" not in out:
                     mat = _AIO_AT_RE.search(line)
                     if mat:
-                        out["at"] = _aio_split_tags(mat.group(1), upper=True)
+                        out["at"] = _aio_split_tags(_aio_trim_value(mat.group(1), stop_keys=["VT","UL","ULE","T","C","P","BR","SZ","RG","SE","NSE","RSEM","RX","NRX","RXM","RRXM","MT","MY"]), upper=True)
             except Exception:
                 pass
 
@@ -3205,7 +3237,7 @@ def _parse_aio_223_tags(desc: Any) -> Dict[str, Any]:
                 if "ul" not in out:
                     mul = _AIO_UL_RE.search(line)
                     if mul:
-                        out["ul"] = _aio_split_langs(mul.group(1))
+                        out["ul"] = _aio_split_langs(_aio_trim_value(mul.group(1), stop_keys=["ULE","VT","AT","T","C","P","BR","SZ","RG","SE","NSE","RSEM","RX","NRX","RXM","RRXM","MT","MY"]))
                 if "ule" not in out:
                     mule = _AIO_ULE_RE.search(line)
                     if mule:
@@ -3254,13 +3286,36 @@ def _parse_aio_223_tags(desc: Any) -> Dict[str, Any]:
 
     return out
 
-def _aio_tagged_instant(aio: Any) -> Optional[bool]:
-    """Return True/False if AIO tags include both cached + proxied, else None."""
+def _is_controlled_playback_url(url: Any) -> bool:
+    """True if the URL is an AIOStreams-controlled playback endpoint (safe even if P:false)."""
+    try:
+        u = str(url or "")
+        if not u:
+            return False
+        return bool(re.search(r"/api/v1/(?:debrid|usenet)/playback/", u))
+    except Exception:
+        return False
+
+
+def _aio_tagged_instant(aio: Any, url: Any = None) -> Optional[bool]:
+    """Return True/False if AIO tags indicate 'instant/ready', else None.
+
+    Option C:
+      instant if cached==true AND (proxied==true OR url is a controlled playback endpoint).
+    """
     try:
         if not isinstance(aio, dict):
             return None
         if ("cached" in aio) and ("proxied" in aio):
-            return bool(aio.get("cached")) and bool(aio.get("proxied"))
+            cached = aio.get("cached", None)
+            proxied = aio.get("proxied", None)
+            if cached is None or proxied is None:
+                return None
+            if bool(cached) is False:
+                return False
+            if bool(proxied) is True:
+                return True
+            return _is_controlled_playback_url(url)
     except Exception:
         return None
     return None
@@ -6222,11 +6277,11 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             desc = ""
         desc_u = str(desc).upper()
         # Step 1: Prefer truth tags (C:/P:) when available (gated by USE_AIO_READY). Fall back to legacy tokens + heuristic.
-        aio_ti = _aio_tagged_instant(aio) if USE_AIO_READY else None
+        aio_ti = _aio_tagged_instant(aio, (s.get('url') if isinstance(s, dict) else None)) if USE_AIO_READY else None
         if aio_ti is not None:
             is_instant = bool(aio_ti)
         else:
-            is_instant = ("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) or _looks_instant(str(desc))
+            is_instant = ((("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) or ("C:TRUE" in desc_u and ("P:TRUE" in desc_u or _is_controlled_playback_url(s.get("url") if isinstance(s, dict) else None)))) or ("C:TRUE" in desc_u and ("P:TRUE" in desc_u or _is_controlled_playback_url(s.get("url") if isinstance(s, dict) else None)))) or _looks_instant(str(desc))
         instant_val = 0 if is_instant else 1
 
         ready_val = 0 if m.get("ready") else 1
@@ -6283,7 +6338,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 aio_cached = None
                 aio_proxied = None
             aio_ti = (aio_cached is True and aio_proxied is True) if (USE_AIO_READY and (aio_cached is not None and aio_proxied is not None)) else None
-            tagged_instant = bool(aio_ti) if (aio_ti is not None) else ("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u)
+            tagged_instant = bool(aio_ti) if (aio_ti is not None) else (("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) or ("C:TRUE" in desc_u and ("P:TRUE" in desc_u or _is_controlled_playback_url(s.get("url") if isinstance(s, dict) else None))))
             # Prefer cached signal from the outgoing stream's behaviorHints (what the client sees).
             bh = {}
             try:
@@ -6344,7 +6399,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             if USE_AIO_READY and (aio_cached is not None) and (aio_proxied is not None):
                 super_instant = 0 if (aio_cached is True and aio_proxied is True) else 1
             else:
-                super_instant = 0 if ("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) else 1
+                super_instant = 0 if (("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) or ("C:TRUE" in desc_u and ("P:TRUE" in desc_u or _is_controlled_playback_url(s.get("url") if isinstance(s, dict) else None)))) else 1
             return (super_instant,) + k
 
         top_pairs.sort(key=instant_key)
