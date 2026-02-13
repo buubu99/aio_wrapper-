@@ -238,6 +238,19 @@ PROV2_TAG = os.environ.get("PROV2_TAG", "P2")
 AIO_TAG = os.environ.get("AIO_TAG", "AIO")
 
 USE_AIO_READY = _parse_bool(os.environ.get("USE_AIO_READY", "false"), False)  # Trust AIOStreams 2.23+ C:/P:/T: tags
+
+# P1 Hybrid A+C (merge/sort only; no new network calls).
+# - "ac" (default): expression-driven buckets + safe tie-breaks using 2.23 fields (RRXM/RXM/RSEM, VT/AT, SE★/NSE).
+# - "legacy"/"off": keep legacy ordering (no P1 bucket/qscore in sort key).
+P1_MODE_RAW = (os.environ.get("P1_MODE", "ac") or "ac").strip().lower()
+if P1_MODE_RAW in ("0", "false", "no", "off", "legacy", "old"):
+    P1_MODE = "legacy"
+elif P1_MODE_RAW in ("1", "true", "yes", "ac", "hybrid", "p1"):
+    P1_MODE = "ac"
+else:
+    P1_MODE = "ac"
+P1_DEBUG = _parse_bool(os.environ.get("P1_DEBUG", "0"))
+
 WRAP_LOG_COUNTS = _parse_bool(os.environ.get("WRAP_LOG_COUNTS", "1"))
 WRAP_EMBED_DEBUG = _parse_bool(os.environ.get("WRAP_EMBED_DEBUG", "0"))
 
@@ -3321,6 +3334,179 @@ def _aio_tagged_instant(aio: Any, url: Any = None) -> Optional[bool]:
     return None
 
 
+# ---------------------------
+# P1 Hybrid A+C scoring helpers (AIOStreams v2.23+ fields)
+# ---------------------------
+
+_P1_BUCKET_OTHER = 6
+_P1_BUCKET_LOWQ = 99
+
+# Recognized "class" names from AIOStreams configs (RRXM/RXM/RSEM carry these).
+# Lower bucket value is better.
+_P1_CLASS_MAP = [
+    ("REMUX T1", 0, "REMUX_T1"),
+    ("REMUX T2", 1, "REMUX_T2"),
+    ("BLURAY T1", 2, "BLURAY_T1"),
+    ("BLURAY T2", 3, "BLURAY_T2"),
+    ("WEB T1", 4, "WEB_T1"),
+    ("WEB SCENE", 4, "WEB_SCENE"),
+    ("WEB T2", 5, "WEB_T2"),
+]
+
+# Low-quality tokens (avoid false positives like WEB-DL).
+_P1_LOWQ_PATTERNS = [
+    r"\bCAM\b",
+    r"\bHDCAM\b",
+    r"\bTS\b",
+    r"\bHDTS\b",
+    r"\bTELESYNC\b",
+    r"\bT[ -]?SYNC\b",
+    r"\bTC\b",
+    r"\bTELECINE\b",
+    r"\bSCREENER\b",
+]
+
+def _p1_ac_labels(aio: Any) -> List[str]:
+    """Collect rule-hit labels from AIO 2.23 fields; returns uppercased list (dedup, order preserved)."""
+    out: List[str] = []
+    if not isinstance(aio, dict):
+        return out
+    try:
+        raw_lists = []
+        for k in ("rrxm", "rxm", "rsem"):
+            v = aio.get(k)
+            if isinstance(v, list):
+                raw_lists.append(v)
+            elif isinstance(v, str) and v.strip():
+                raw_lists.append([v])
+        seen = set()
+        for lst in raw_lists:
+            for it in lst:
+                t = str(it or "").strip()
+                if not t:
+                    continue
+                u = t.upper()
+                if u in seen:
+                    continue
+                seen.add(u)
+                out.append(u)
+    except Exception:
+        return out
+    return out
+
+def _p1_ac_bucket(aio: Any, text_upper: str) -> Tuple[int, str]:
+    """Return (bucket_rank, bucket_name)."""
+    # Low-quality guard first.
+    try:
+        for pat in _P1_LOWQ_PATTERNS:
+            if re.search(pat, text_upper):
+                return (_P1_BUCKET_LOWQ, "LOWQ")
+    except Exception:
+        pass
+
+    labels = _p1_ac_labels(aio)
+    for key, b, name in _P1_CLASS_MAP:
+        try:
+            if any(key in lab for lab in labels):
+                return (b, name)
+        except Exception:
+            continue
+    return (_P1_BUCKET_OTHER, "OTHER")
+
+def _p1_ac_qscore(aio: Any, bucket: int, text_upper: str) -> float:
+    """Higher is better. Designed to be robust across sources (caps numeric contributions)."""
+    q = 0.0
+    if not isinstance(aio, dict):
+        return q
+
+    # Visual tags (VT) and audio tags (AT) are uppercased lists by parser.
+    vt = aio.get("vt") if isinstance(aio.get("vt"), list) else []
+    at = aio.get("at") if isinstance(aio.get("at"), list) else []
+
+    try:
+        vt_set = set([str(t).upper() for t in vt if str(t).strip()])
+        at_set = set([str(t).upper() for t in at if str(t).strip()])
+    except Exception:
+        vt_set, at_set = set(), set()
+
+    # Visual bonuses
+    if "DV" in vt_set or "DOVI" in vt_set or "DOLBYVISION" in vt_set:
+        q += 12.0
+    if any(("HDR10+" in t) or ("HDR10++" in t) for t in vt_set):
+        q += 8.0
+    elif "HDR" in vt_set or "HDR10" in vt_set or "HDR10PLUS" in vt_set:
+        q += 5.0
+    if "10BIT" in vt_set or "10-BIT" in vt_set:
+        q += 2.0
+    if "AV1" in vt_set:
+        q += 3.0
+    if "HEVC" in vt_set or "X265" in vt_set or "H265" in vt_set:
+        q += 2.0
+
+    # Audio bonuses
+    if "ATMOS" in at_set:
+        q += 5.0
+    if "TRUEHD" in at_set:
+        q += 4.0
+    if ("DTSX" in at_set) or ("DTS:X" in at_set):
+        q += 4.0
+    if any(t.startswith("DTS-HD") for t in at_set):
+        q += 3.0
+    if "DTS" in at_set:
+        q += 1.5
+    if ("EAC3" in at_set) or ("DD+" in at_set) or ("DDP" in at_set):
+        q += 2.0
+    if ("AC3" in at_set) or ("DD" in at_set):
+        q += 1.0
+
+    # Stars (prefer SE★ when present)
+    try:
+        stars = int(aio.get("se_star") or 0)
+        if stars <= 0:
+            stars = int(aio.get("rx_star") or 0)
+        stars = max(0, min(5, stars))
+        q += float(stars) * 1.0
+    except Exception:
+        pass
+
+    # Normalized SE score is safe-ish within a source; cap contribution tightly.
+    try:
+        nse = float(aio.get("nse") or 0.0)
+        nse = max(0.0, min(100.0, nse))
+        q += nse * 0.02  # up to +2.0
+    except Exception:
+        pass
+
+    # Bitrate/size: tiny nudge only (avoid dominating across configs).
+    try:
+        br = float(aio.get("br_mbps") or 0.0)
+        br = max(0.0, min(120.0, br))
+        q += br * 0.02  # up to +2.4
+    except Exception:
+        pass
+    try:
+        sz = float(aio.get("sz_gb") or 0.0)
+        sz = max(0.0, min(200.0, sz))
+        q += sz * 0.01  # up to +2.0
+    except Exception:
+        pass
+
+    # Bucket-aware penalty for LOWQ (belt and suspenders).
+    if bucket >= _P1_BUCKET_LOWQ:
+        q -= 50.0
+
+    # Clamp (stability)
+    if q > 100.0:
+        q = 100.0
+    if q < -100.0:
+        q = -100.0
+    return q
+
+def _p1_ac_features(aio: Any, text_upper: str) -> Tuple[int, str, float]:
+    b, name = _p1_ac_bucket(aio, text_upper)
+    q = _p1_ac_qscore(aio, b, text_upper)
+    return b, name, q
+
 def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     bh = s.get("behaviorHints", {}) or {}
     name = s.get("name", "").lower()
@@ -3528,10 +3714,24 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     title_raw = normalize_display_title(filename or desc or name)
     # Premium level
     premium_level = 1 if is_premium_plan(provider) else 0
+
+    # P1 Hybrid A+C: compute bucket + qscore from AIOStreams 2.23 fields (merge/sort only).
+    p1_bucket = _P1_BUCKET_OTHER
+    p1_class = "OTHER"
+    p1_q = 0.0
+    try:
+        if P1_MODE == "ac":
+            p1_bucket, p1_class, p1_q = _p1_ac_features(aio, text.upper())
+    except Exception:
+        pass
+
     return {
         "provider": provider,
         "cached": cached,
         "aio": aio,
+        "p1_bucket": p1_bucket,
+        "p1_class": p1_class,
+        "p1_q": p1_q,
         "res": res,
         "source": source,
         "codec": codec,
@@ -6288,12 +6488,22 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         verify_rank = int(m.get("verify_rank") or 0)
         prov_idx = _provider_rank(prov)
         score = _tie_break_score(m, float(m.get('_mismatch_ratio') or 0.0))
+        # P1 Hybrid A+C ordering (bucket + qscore). Kept after instant/ready/cached/verify to preserve playability tiering.
+        p1_bucket = int(m.get("p1_bucket") or _P1_BUCKET_OTHER)
+        try:
+            p1_q = float(m.get("p1_q") or 0.0)
+        except Exception:
+            p1_q = 0.0
+        if P1_MODE != "ac":
+            p1_bucket = _P1_BUCKET_OTHER
+            p1_q = 0.0
+
         # Sort order: instant -> cached -> resolution -> size -> seeders -> provider rank
         # Sort order: instant -> cached -> resolution -> size -> seeders -> provider rank
         if iphone_usenet_mode and usenet_priority_set:
             usenet_rank = 0 if prov in usenet_priority_set else 1
-            return (usenet_rank, ready_val, instant_val, cached_val, verify_rank, -res, -size_b, -score, -seeders, prov_idx)
-        return (instant_val, ready_val, cached_val, verify_rank, -res, -size_b, -score, -seeders, prov_idx)  # Add: Swap for stronger ready (Usenet beats non-instant cached)
+            return (usenet_rank, ready_val, instant_val, cached_val, verify_rank, -res, p1_bucket, -p1_q, -size_b, -score, -seeders, prov_idx)
+        return (instant_val, ready_val, cached_val, verify_rank, -res, p1_bucket, -p1_q, -size_b, -score, -seeders, prov_idx)  # Add: Swap for stronger ready (Usenet beats non-instant cached)
 
     did_verify = False
     out_pairs.sort(key=sort_key)
@@ -6361,6 +6571,10 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 "cached_m": cached_m,
                 "premium_level": m.get("premium_level", None),
                 "ready": bool(m.get("ready", False)),
+                "p1_bucket": int(m.get("p1_bucket") or -1),
+                "p1_class": str(m.get("p1_class") or ""),
+                "p1_q": round(float(m.get("p1_q") or 0.0), 3),
+
                 "tagged_instant": bool(tagged_instant),
                 "sort_key": sort_key((s, m)),
             })
