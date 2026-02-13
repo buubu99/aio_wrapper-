@@ -3395,7 +3395,13 @@ def _p1_ac_labels(aio: Any) -> List[str]:
     return out
 
 def _p1_ac_bucket(aio: Any, text_upper: str) -> Tuple[int, str]:
-    """Return (bucket_rank, bucket_name)."""
+    """Return (bucket_rank, bucket_name).
+
+    NOTE: In real-world AIOStreams output, many debrid streams (including BluRay REMUX) may not carry RXM/RRXM labels,
+    and instead only expose RSEM concept tags (cached,4K,DV,hdr,hevc...). If we rely on rule-hit labels only, REMUX
+    can be misclassified as OTHER/BLURAY. So we add a conservative text-based override for REMUX and a light fallback
+    for BLURAY/WEB when labels are absent.
+    """
     # Low-quality guard first.
     try:
         for pat in _P1_LOWQ_PATTERNS:
@@ -3405,12 +3411,35 @@ def _p1_ac_bucket(aio: Any, text_upper: str) -> Tuple[int, str]:
         pass
 
     labels = _p1_ac_labels(aio)
+
+    # Strong override: if the stream text explicitly says REMUX, treat it as REMUX even if upstream labels are missing.
+    # This fixes common cases like "2160p BluRay REMUX ..." where RRXM/RXM are blank.
+    try:
+        if "REMUX" in text_upper and not any("REMUX" in lab for lab in labels):
+            return (0, "REMUX_TEXT")
+    except Exception:
+        pass
+
+    # Primary: rule-hit label mapping (if present)
     for key, b, name in _P1_CLASS_MAP:
         try:
             if any(key in lab for lab in labels):
                 return (b, name)
         except Exception:
             continue
+
+    # Fallback: text-based bucket when no rule labels exist at all
+    try:
+        t = text_upper
+        if "REMUX" in t:
+            return (0, "REMUX_TEXT")
+        if ("WEB-DL" in t) or ("WEBRIP" in t) or ("WEBDL" in t) or ("WEB RIP" in t):
+            return (4, "WEB_TEXT")
+        if ("BLURAY" in t) or ("BLU-RAY" in t) or re.search(r"BD", t):
+            return (2, "BLURAY_TEXT")
+    except Exception:
+        pass
+
     return (_P1_BUCKET_OTHER, "OTHER")
 
 def _p1_ac_qscore(aio: Any, bucket: int, text_upper: str) -> float:
@@ -6650,8 +6679,19 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # when multiple premium providers are present (e.g., TB + RD). This helps avoid "all green" / "all red"
     # swings when upstream ordering/caps change.
     if (not iphone_usenet_mode) and deliver_cap_eff >= 20 and len(PREMIUM_PRIORITY) >= 2:
+        # Quality-protect: keep the very top of the globally sorted list untouched.
+        # This preserves "best overall wins" (e.g., REMUX over BLURAY) while still allowing provider variety right after.
+        try:
+            _default_protect = "5" if P1_MODE == "ac" else "0"
+            protect_top = int(os.environ.get("PREMIUM_MIX_PROTECT_TOP", _default_protect) or _default_protect)
+        except Exception:
+            protect_top = 0
+        protect_top = max(0, min(20, int(protect_top or 0)))
+        protected_head = out_pairs[:protect_top] if protect_top else []
+        mix_base = out_pairs[protect_top:] if protect_top else out_pairs
+
         present_provs: set[str] = set()
-        for _s, _m in out_pairs:
+        for _s, _m in mix_base:
             pp = (_m.get("provider") or "").upper()
             if pp:
                 present_provs.add(pp)
@@ -6660,7 +6700,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         if len(active) >= 2:
             min_each = max(5, min(12, deliver_cap_eff // 6))  # 60 -> 10
             byp: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {p: [] for p in active}
-            for pair in out_pairs:
+            for pair in mix_base:
                 pp = (pair[1].get("provider") or "").upper()
                 if pp in byp:
                     byp[pp].append(pair)
@@ -6683,12 +6723,12 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
                 mixed: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
                 mixed.extend(head)
-                for pair in out_pairs:
+                for pair in mix_base:
                     if id(pair[0]) in picked_stream_ids:
                         continue
                     mixed.append(pair)
 
-                out_pairs = mixed
+                out_pairs = (protected_head + mixed) if protected_head else mixed
 
                 try:
                     top_by: Dict[str, int] = {}
