@@ -251,6 +251,15 @@ else:
     P1_MODE = "ac"
 P1_DEBUG = _parse_bool(os.environ.get("P1_DEBUG", "0"))
 
+# Sanity demotion: prevent obviously mis-sized "4K BluRay/REMUX" entries from floating above real high-quality options.
+# This does NOT drop streams; it only nudges suspicious entries lower in the sort.
+SANITY_DEMOTE = _parse_bool(os.environ.get("SANITY_DEMOTE", "1"), True)
+SANITY_4K_BLURAY_MIN_GB = _safe_float(os.environ.get("SANITY_4K_BLURAY_MIN_GB", "8"), 8.0)
+SANITY_4K_REMUX_MIN_GB  = _safe_float(os.environ.get("SANITY_4K_REMUX_MIN_GB", "20"), 20.0)
+# Apply sanity demotion only for movies (series can have smaller per-episode sizes and still be legit).
+SANITY_MOVIES_ONLY = _parse_bool(os.environ.get("SANITY_MOVIES_ONLY", "1"), True)
+
+
 WRAP_LOG_COUNTS = _parse_bool(os.environ.get("WRAP_LOG_COUNTS", "1"))
 WRAP_EMBED_DEBUG = _parse_bool(os.environ.get("WRAP_EMBED_DEBUG", "0"))
 
@@ -3435,7 +3444,7 @@ def _p1_ac_bucket(aio: Any, text_upper: str) -> Tuple[int, str]:
             return (0, "REMUX_TEXT")
         if ("WEB-DL" in t) or ("WEBRIP" in t) or ("WEBDL" in t) or ("WEB RIP" in t):
             return (4, "WEB_TEXT")
-        if ("BLURAY" in t) or ("BLU-RAY" in t) or re.search(r"BD", t):
+        if ("BLURAY" in t) or ("BLU-RAY" in t) or re.search(r"\bBD\b", t):
             return (2, "BLURAY_TEXT")
     except Exception:
         pass
@@ -6527,12 +6536,55 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             p1_bucket = _P1_BUCKET_OTHER
             p1_q = 0.0
 
-        # Sort order: instant -> cached -> resolution -> size -> seeders -> provider rank
+        # Sanity demotion: keep obviously mis-sized "4K BluRay/REMUX" from rising above real high-quality options.
+        # This primarily targets junk like "4K BluRay 1 GB" without dropping it outright.
+        sanity_val = 0
+        sanity_reason = ""
+        if SANITY_DEMOTE and (not SANITY_MOVIES_ONLY or type_ == "movie") and res >= 2160 and size_b:
+            try:
+                bh = s.get("behaviorHints") or {}
+                t_u = (f"{s.get('name', '')} {s.get('description', '')} {bh.get('filename', '')}").upper()
+            except Exception:
+                t_u = ""
+            src_u = str(m.get("source") or "").upper()
+            size_gb = float(size_b) / float(1024 ** 3) if size_b else 0.0
+            try:
+                if (("REMUX" in t_u) or ("REMUX" in src_u)) and size_gb > 0 and size_gb < SANITY_4K_REMUX_MIN_GB:
+                    sanity_val = 1
+                    sanity_reason = f"4k_remux_small<{SANITY_4K_REMUX_MIN_GB:g}gb"
+                elif (("BLURAY" in t_u) or ("BLU-RAY" in t_u) or ("UHD" in t_u) or re.search(r"\bBD\b", t_u) or ("BLURAY" in src_u)) and size_gb > 0 and size_gb < SANITY_4K_BLURAY_MIN_GB:
+                    sanity_val = 1
+                    sanity_reason = f"4k_bluray_small<{SANITY_4K_BLURAY_MIN_GB:g}gb"
+            except Exception:
+                sanity_val = 0
+                sanity_reason = ""
+        # Store for later debug logs (meta-only; not shown to clients)
+        try:
+            m["_sanity"] = sanity_val
+            m["_sanity_reason"] = sanity_reason
+        except Exception:
+            pass
+
+
+        
+        # Store core sort signals for debug logs (meta-only; not shown to clients)
+        try:
+            m["_instant_val"] = int(instant_val)
+            m["_ready_val"] = int(ready_val)
+            m["_cached_val"] = float(cached_val)
+            m["_verify_rank0"] = int(verify_rank)
+            m["_res_i"] = int(res)
+            m["_size_b"] = int(size_b)
+            m["_prov_u"] = str(prov)
+        except Exception:
+            pass
+
+# Sort order: instant -> cached -> resolution -> size -> seeders -> provider rank
         # Sort order: instant -> cached -> resolution -> size -> seeders -> provider rank
         if iphone_usenet_mode and usenet_priority_set:
             usenet_rank = 0 if prov in usenet_priority_set else 1
-            return (usenet_rank, ready_val, instant_val, cached_val, verify_rank, -res, p1_bucket, -p1_q, -size_b, -score, -seeders, prov_idx)
-        return (instant_val, ready_val, cached_val, verify_rank, -res, p1_bucket, -p1_q, -size_b, -score, -seeders, prov_idx)  # Add: Swap for stronger ready (Usenet beats non-instant cached)
+            return (usenet_rank, ready_val, instant_val, cached_val, verify_rank, -res, sanity_val, p1_bucket, -p1_q, -size_b, -score, -seeders, prov_idx)
+        return (instant_val, ready_val, cached_val, verify_rank, -res, sanity_val, p1_bucket, -p1_q, -size_b, -score, -seeders, prov_idx)  # Add: Swap for stronger ready (Usenet beats non-instant cached)
 
     did_verify = False
     out_pairs.sort(key=sort_key)
@@ -6605,8 +6657,22 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 "p1_q": round(float(m.get("p1_q") or 0.0), 3),
 
                 "tagged_instant": bool(tagged_instant),
+                "instant_val": int(m.get("_instant_val") or 0),
+                "ready_val": int(m.get("_ready_val") or 0),
+                "cached_val": float(m.get("_cached_val") or 0.0),
+                "verify_rank": int(m.get("_verify_rank0") or 0),
+                "sanity": int(m.get("_sanity") or 0),
+                "sanity_reason": str(m.get("_sanity_reason") or ""),
                 "sort_key": sort_key((s, m)),
             })
+        # Helpful positioning signal: where does the first REMUX land after primary sort?
+        try:
+            remux_pos = next((i + 1 for i, (_s0, _m0) in enumerate(out_pairs) if int(_m0.get("p1_bucket") or 99) == 0), None)
+            if remux_pos is not None:
+                logger.info("P1_REMUX_POS rid=%s pos=%s total=%s", _rid(), remux_pos, len(out_pairs))
+        except Exception:
+            pass
+
         logger.info("POST_SORT_TOP rid=%s topN=%s items=%s", _rid(), proof_n, topn)
     except Exception as _e:
         logger.debug("POST_SORT_TOP_ERR rid=%s err=%s", _rid(), _e)
