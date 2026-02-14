@@ -6673,7 +6673,22 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         except Exception:
             pass
 
-        logger.info("POST_SORT_TOP rid=%s topN=%s items=%s", _rid(), proof_n, topn)
+        logger.info("POST_SORT_TOP rid=%s mark=%s topN=%s", _rid(), req_mark, proof_n)
+        for x in topn:
+            sk = x.get("sort_key") or ()
+            sk0 = sk[0] if len(sk) > 0 else None
+            sk1 = sk[1] if len(sk) > 1 else None
+            sk2 = sk[2] if len(sk) > 2 else None
+            sk3 = sk[3] if len(sk) > 3 else None
+            logger.info(
+                "POST_SORT_ITEM rid=%s mark=%s r=%s prov=%s stack=%s res=%s size_gb=%s "
+                "b=%s p1=%s inst=%s ready=%s cached=%s tc=%s tp=%s cbh=%s pbh=%s cm=%s pm=%s "
+                "sk0=%s sk1=%s sk2=%s sk3=%s",
+                _rid(), req_mark, x.get("rank"), x.get("prov"), x.get("stack"), x.get("res"), x.get("size_gb"),
+                x.get("p1_bucket"), x.get("p1_class"), x.get("instant"), x.get("ready"), x.get("cached"),
+                x.get("tagged_cached"), x.get("tagged_proxied"), x.get("cached_bh"), x.get("proxied_bh"),
+                x.get("cached_m"), x.get("proxied_m"), sk0, sk1, sk2, sk3,
+            )
     except Exception as _e:
         logger.debug("POST_SORT_TOP_ERR rid=%s err=%s", _rid(), _e)
 
@@ -6706,7 +6721,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 aio_cached = None
                 aio_proxied = None
             if USE_AIO_READY and (aio_cached is not None) and (aio_proxied is not None):
-                super_instant = 0 if (aio_cached is True and aio_proxied is True) else 1
+                super_instant = 0 if ((aio_cached is True and aio_proxied is True) or ready_flag) else 1
             else:
                 super_instant = 0 if (("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) or ("C:TRUE" in desc_u and ("P:TRUE" in desc_u or _is_controlled_playback_url(s.get("url") if isinstance(s, dict) else None)))) else 1
             return (super_instant,) + k
