@@ -365,10 +365,14 @@ USE_NZBGEEK_READY = _parse_bool(os.environ.get("USE_NZBGEEK_READY", "1"), True)
 # Direct Usenet playability probe (replaces NZBGeek readiness as "source of truth" when enabled).
 # Uses a tiny byte-range GET to distinguish REAL vs STUB proxy links.
 USENET_PROBE_ENABLE = _parse_bool(os.environ.get("USENET_PROBE_ENABLE", "0"), False)
-USENET_PROBE_TOP_N = _safe_int(os.environ.get("USENET_PROBE_TOP_N", "50"), 50)
+USENET_PROBE_TOP_N = _safe_int(os.environ.get("USENET_PROBE_TOP_N", os.environ.get("USENET_PROBE_TOP", "50")), 50)
 # Stop early once we have this many REAL usenet links (keeps latency down).
 USENET_PROBE_TARGET_REAL = _safe_int(os.environ.get("USENET_PROBE_TARGET_REAL", "12"), 12)
 USENET_PROBE_TIMEOUT_S = _safe_float(os.environ.get("USENET_PROBE_TIMEOUT_S", "4.0"), 4.0)
+USENET_PROBE_BUDGET_S = _safe_float(os.environ.get("USENET_PROBE_BUDGET_S", "8.5"), 8.5)  # hard wall for /stream latency
+USENET_PROBE_DROP_FAILS = _parse_bool(os.environ.get("USENET_PROBE_DROP_FAILS", "1"), True)  # drop probed non-REAL links (STUB/ERR)
+USENET_PROBE_REAL_TOP10_PCT = _safe_float(os.environ.get("USENET_PROBE_REAL_TOP10_PCT", "0.5"), 0.5)
+USENET_PROBE_REAL_TOP20_N = _safe_int(os.environ.get("USENET_PROBE_REAL_TOP20_N", "20"), 20)
 USENET_PROBE_RETRIES = _safe_int(os.environ.get("USENET_PROBE_RETRIES", "2"), 2)
 USENET_PROBE_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY", "20"), 20)
 USENET_PROBE_RANGE_END = _safe_int(os.environ.get("USENET_PROBE_RANGE_END", "16440"), 16440)
@@ -1321,7 +1325,7 @@ def _probe_auth_headers_for_url(u: str) -> Dict[str, str]:
         pass
     return {}
 
-def _usenet_range_probe_is_real(url: str, *, timeout_s: float, range_end: int, stub_len: int, retries: int) -> Tuple[bool, str, int]:
+def _usenet_range_probe_is_real(url: str, *, timeout_s: float, range_end: int, stub_len: int, retries: int, deadline_ts: Optional[float] = None) -> Tuple[bool, str, int]:
     """Return (is_real, reason, bytes_read).
 
     Heuristic: request Range bytes=0-range_end and read up to (range_end+1) bytes.
@@ -1349,9 +1353,22 @@ def _usenet_range_probe_is_real(url: str, *, timeout_s: float, range_end: int, s
     last_bytes = 0
 
     for _attempt in range(max(1, int(retries) + 1)):
+        # Enforce an overall deadline so the probe can't blow past the /stream latency budget.
+        if deadline_ts is not None:
+            rem = float(deadline_ts) - float(time.monotonic())
+            if rem <= 0.15:
+                return (False, "BUDGET", int(last_bytes or 0))
+            # Cap per-request timeout by remaining time (and keep a small minimum so connect doesn't instantly fail).
+            timeout_eff = max(0.35, min(float(timeout_s), rem))
+            # If we don't have time for another attempt, stop now.
+            if timeout_eff <= 0.35 and _attempt > 0:
+                return (False, "BUDGET", int(last_bytes or 0))
+        else:
+            timeout_eff = float(timeout_s)
+
         try:
             sess = _tls_requests_session()
-            r = sess.get(u, headers=base_headers, timeout=float(timeout_s), allow_redirects=True, stream=True)
+            r = sess.get(u, headers=base_headers, timeout=float(timeout_eff), allow_redirects=True, stream=True)
             try:
                 st = int(getattr(r, "status_code", 0) or 0)
             except Exception:
@@ -1419,20 +1436,28 @@ def _apply_usenet_playability_probe(
     top_n: int,
     target_real: int,
     timeout_s: float,
+    budget_s: float,
     range_end: int,
     stub_len: int,
     retries: int,
     concurrency: int,
     drop_stubs: bool,
+    drop_fails: bool,
     mark_ready: bool,
     stats: Optional["PipeStats"] = None,
 ) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
-    """Probe top-N usenet candidates and mark/demote STUBs so REAL ones rise to the top.
+    """Probe top-N usenet candidates and mark/drop unplayable proxy links.
 
-    - Marks meta["usenet_probe"] = REAL/STUB/ERR
-    - Optionally sets meta["ready"]=True for REAL
-    - Demotes STUBs via meta["verify_rank"] bump (and optionally drops them from output)
-    - Stops early once `target_real` REAL links are found.
+    Goals:
+      - Keep /stream latency bounded via an overall budget (default ~8.5s).
+      - Identify REAL links (read exactly range_end+1 bytes).
+      - Mark REAL with meta["usenet_probe"]="REAL" and (optionally) meta["ready"]=True.
+      - Mark non-REAL with meta["usenet_probe"]="STUB"/"ERR" (unless we ran out of budget).
+      - Drop probed STUBs (and optionally drop probed ERR) from output so they don't occupy top spots.
+      - Stop early once `target_real` REAL links are found *or* we hit the budget.
+
+    IMPORTANT: Anything we *didn't* get to probe within the budget is treated as "not probed"
+    and stays in the normal sorting pack with debrid.
     """
     if not pairs:
         return pairs
@@ -1477,85 +1502,144 @@ def _apply_usenet_playability_probe(
             continue
         seen_url.add(u)
         cand.append(i)
+        if len(cand) >= tn:
+            break
 
     if not cand:
         return pairs
 
     max_workers = max(1, min(int(concurrency or 1), len(cand)))
     target = max(0, int(target_real or 0))
+    budget = max(0.5, float(budget_s or 0.0))
+    deadline = float(time.monotonic()) + float(budget)
 
     t0 = time.monotonic()
     real_idx: List[int] = []
     stub_idx: List[int] = []
     err_idx: List[int] = []
+    budget_idx: List[int] = []
 
-    # Probe in batches so we can stop early (keeps latency down).
-    ptr = 0
-    while ptr < len(cand) and (target == 0 or len(real_idx) < target):
-        batch = cand[ptr: ptr + max_workers]
-        ptr += len(batch)
+    # Use a single executor; avoid batch-level waits that can exceed the budget.
+    from collections import deque
+    q = deque(cand)
 
-        futs: List[Tuple[int, Any]] = []
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            for i in batch:
-                s, _m = pairs[i]
-                try:
-                    u = s.get("url") if isinstance(s, dict) else ""
-                except Exception:
-                    u = ""
-                futs.append((i, ex.submit(
-                    _usenet_range_probe_is_real,
-                    u,
-                    timeout_s=float(timeout_s),
-                    range_end=int(range_end),
-                    stub_len=int(stub_len),
-                    retries=int(retries),
-                )))
-            # Wait for batch completion.
-            wait([f for (_i, f) in futs], timeout=float(timeout_s) * max(1, int(retries) + 1) + 1.0)
+    ex = ThreadPoolExecutor(max_workers=max_workers)
+    in_flight: Dict[Any, int] = {}
 
-        for i, fut in futs:
-            try:
-                ok, reason, nbytes = fut.result(timeout=0)
-            except Exception:
-                ok, reason, nbytes = (False, "ERR", 0)
+    def _submit(i: int) -> None:
+        s, _m = pairs[i]
+        try:
+            u = s.get("url") if isinstance(s, dict) else ""
+        except Exception:
+            u = ""
+        # Pass the overall deadline down so the probe can't outlive the budget.
+        fut = ex.submit(
+            _usenet_range_probe_is_real,
+            u,
+            timeout_s=float(timeout_s),
+            range_end=int(range_end),
+            stub_len=int(stub_len),
+            retries=int(retries),
+            deadline_ts=float(deadline),
+        )
+        in_flight[fut] = i
 
-            s, m = pairs[i]
-            if not isinstance(m, dict):
-                continue
+    # Prime the pool
+    while q and len(in_flight) < max_workers and time.monotonic() < deadline:
+        _submit(q.popleft())
 
-            if ok:
-                real_idx.append(i)
-                m["usenet_probe"] = "REAL"
-                m["usenet_probe_bytes"] = int(nbytes or 0)
-                if mark_ready:
-                    m["ready"] = True
+    def _handle_done(fut) -> None:
+        i = in_flight.pop(fut, None)
+        if i is None:
+            return
+        try:
+            ok, reason, nbytes = fut.result(timeout=0)
+        except Exception:
+            ok, reason, nbytes = (False, "ERR", 0)
+
+        s, m = pairs[i]
+        if not isinstance(m, dict):
+            return
+
+        # Budget sentinel: treat as "not probed" (do not drop).
+        if str(reason) == "BUDGET":
+            budget_idx.append(i)
+            return
+
+        if ok:
+            real_idx.append(i)
+            m["usenet_probe"] = "REAL"
+            m["usenet_probe_bytes"] = int(nbytes or 0)
+            if mark_ready:
+                m["ready"] = True
+        else:
+            if reason == "STUB_LEN" or str(reason).startswith("SHORT_"):
+                stub_idx.append(i)
+                m["usenet_probe"] = "STUB"
             else:
-                if reason == "STUB_LEN" or str(reason).startswith("SHORT_"):
-                    stub_idx.append(i)
-                    m["usenet_probe"] = "STUB"
-                else:
-                    err_idx.append(i)
-                    m["usenet_probe"] = "ERR"
-                m["usenet_probe_reason"] = str(reason)
-                m["usenet_probe_bytes"] = int(nbytes or 0)
-                # Demote hard so these don't occupy top spots.
-                try:
-                    m["verify_rank"] = max(int(m.get("verify_rank") or 0), 9999)
-                except Exception:
-                    m["verify_rank"] = 9999
+                err_idx.append(i)
+                m["usenet_probe"] = "ERR"
+            m["usenet_probe_reason"] = str(reason)
+            m["usenet_probe_bytes"] = int(nbytes or 0)
+            # Demote hard so these don't occupy top spots.
+            try:
+                m["verify_rank"] = max(int(m.get("verify_rank") or 0), 9999)
+            except Exception:
+                m["verify_rank"] = 9999
 
-    # Optionally drop probed STUBs from output entirely (keeps list "reliable").
+    # Main completion loop
+    from concurrent.futures import FIRST_COMPLETED
+    while in_flight and time.monotonic() < deadline and (target == 0 or len(real_idx) < target):
+        rem = max(0.01, float(deadline) - float(time.monotonic()))
+        done, _not_done = wait(list(in_flight.keys()), timeout=rem, return_when=FIRST_COMPLETED)
+        if not done:
+            break
+        for fut in list(done):
+            _handle_done(fut)
+            if time.monotonic() >= deadline:
+                break
+            if target and len(real_idx) >= target:
+                break
+            if q and len(in_flight) < max_workers and time.monotonic() < deadline:
+                _submit(q.popleft())
+
+    # Small grace drain (do not extend budget): collect any completions already done right now.
+    try:
+        done, _ = wait(list(in_flight.keys()), timeout=0.01, return_when=FIRST_COMPLETED)
+        for fut in list(done):
+            _handle_done(fut)
+    except Exception:
+        pass
+
+    # Cancel anything still running; do not wait for full shutdown (avoid blowing /stream latency).
+    try:
+        for fut in list(in_flight.keys()):
+            try:
+                fut.cancel()
+            except Exception:
+                pass
+        ex.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        try:
+            ex.shutdown(wait=False)
+        except Exception:
+            pass
+
+    # Drop probed STUBs (and optionally ERR) from output entirely (keeps list reliable).
+    drop_idx: set[int] = set()
     if drop_stubs and stub_idx:
-        stub_set = set(stub_idx)
-        pairs = [p for j, p in enumerate(pairs) if j not in stub_set]
+        drop_idx.update(stub_idx)
+    if drop_fails and err_idx:
+        drop_idx.update(err_idx)
+    if drop_idx:
+        pairs = [p for j, p in enumerate(pairs) if j not in drop_idx]
 
     # Lightweight summary log (no URLs).
     try:
         ms = int((time.monotonic() - t0) * 1000)
         logger.info(
-            "USENET_PROBE rid=%s scanned=%s real=%s stub=%s err=%s ms=%s",
-            _rid(), int(min(len(cand), ptr)), int(len(real_idx)), int(len(stub_idx)), int(len(err_idx)), int(ms),
+            "USENET_PROBE rid=%s scanned=%s real=%s stub=%s err=%s budget=%s ms=%s",
+            _rid(), int(len(cand)), int(len(real_idx)), int(len(stub_idx)), int(len(err_idx)), int(len(budget_idx)), int(ms),
         )
         if stats is not None:
             try:
@@ -1563,12 +1647,189 @@ def _apply_usenet_playability_probe(
                 stats.counts_out["usenet_probe_real"] = int(len(real_idx))
                 stats.counts_out["usenet_probe_stub"] = int(len(stub_idx))
                 stats.counts_out["usenet_probe_err"] = int(len(err_idx))
+                stats.counts_out["usenet_probe_budget"] = int(len(budget_idx))
             except Exception:
                 pass
     except Exception:
         pass
 
     return pairs
+
+
+
+def _apply_usenet_real_priority_mix(
+    pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+    *,
+    deliver_cap: int,
+    top10_pct: float,
+    top20_n: int,
+    stats: Optional["PipeStats"] = None,
+) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    """Re-order *delivered slice* so probed REAL usenet links are prioritized deterministically.
+
+    Policy (defaults):
+      - Cap REAL usenet inside top-10 to ~50% (so debrid stays visible).
+      - Promote remaining REAL usenet into the rest of top-20.
+      - Everything else stays in original order (debrid sort order preserved).
+    """
+    if not pairs:
+        return pairs
+
+    try:
+        dc = int(deliver_cap or 0)
+    except Exception:
+        dc = 0
+    if dc <= 0:
+        return pairs
+
+    deliver_n = min(len(pairs), dc)
+    if deliver_n <= 0:
+        return pairs
+
+    # Identify usenet-like providers
+    usenet_provs = {str(p).upper() for p in (USENET_PROVIDERS or USENET_PRIORITY or [])}
+    usenet_provs.add("ND")
+
+    def _is_usenet_pair(pair: Tuple[Dict[str, Any], Dict[str, Any]]) -> bool:
+        _s, _m = pair
+        prov = str((_m or {}).get("provider") or "").upper().strip()
+        if prov in usenet_provs:
+            return True
+        aio = (_m or {}).get("aio")
+        try:
+            if USE_AIO_READY and isinstance(aio, dict) and (aio.get("type") == "usenet"):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _key_of(pair: Tuple[Dict[str, Any], Dict[str, Any]]) -> Tuple[str, str, str]:
+        s, m = pair
+        try:
+            u = (s.get("url") or s.get("externalUrl") or "").strip()
+        except Exception:
+            u = ""
+        try:
+            ih = (m.get("infoHash") or m.get("infohash") or s.get("infoHash") or s.get("infohash") or "").strip().lower()
+        except Exception:
+            ih = ""
+        try:
+            n = (s.get("name") or "").strip()
+        except Exception:
+            n = ""
+        return (u, ih, n)
+
+    # REAL usenet list (preserve current order)
+    real_usenet: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for p in pairs[:]:
+        s, m = p
+        if not isinstance(m, dict):
+            continue
+        if not _is_usenet_pair(p):
+            continue
+        if str(m.get("usenet_probe") or "") != "REAL":
+            continue
+        real_usenet.append(p)
+
+    if not real_usenet:
+        return pairs
+
+    top10_n = min(10, deliver_n)
+    top20_n_eff = min(max(0, int(top20_n or 20)), deliver_n)
+    try:
+        pct = float(top10_pct or 0.5)
+    except Exception:
+        pct = 0.5
+    pct = max(0.0, min(1.0, pct))
+    cap10 = int(float(top10_n) * pct)
+    cap10 = max(0, min(cap10, top10_n, len(real_usenet)))
+    cap20 = max(0, min(top20_n_eff, len(real_usenet)))
+
+    # Build head with a strict cap inside top10.
+    used = set()
+
+    head: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    # 1) Put first cap10 REAL usenet into the head.
+    for p in real_usenet[:cap10]:
+        k = _key_of(p)
+        if k in used:
+            continue
+        head.append(p)
+        used.add(k)
+
+    # 2) Fill remaining top10 slots with best non-REAL items (preserve current order),
+    #    and avoid accidentally adding more REAL usenet in top10 (strict cap).
+    for p in pairs:
+        if len(head) >= top10_n:
+            break
+        k = _key_of(p)
+        if k in used:
+            continue
+        # Strict cap: keep additional REAL usenet out of top10.
+        _m = p[1]
+        if isinstance(_m, dict) and str(_m.get("usenet_probe") or "") == "REAL" and _is_usenet_pair(p):
+            continue
+        head.append(p)
+        used.add(k)
+
+    # 3) Promote remaining REAL usenet into the rest of top20.
+    for p in real_usenet[cap10:cap20]:
+        if len(head) >= top20_n_eff:
+            break
+        k = _key_of(p)
+        if k in used:
+            continue
+        head.append(p)
+        used.add(k)
+
+    # 4) Fill to top20 with remaining items (preserve order).
+    for p in pairs:
+        if len(head) >= top20_n_eff:
+            break
+        k = _key_of(p)
+        if k in used:
+            continue
+        head.append(p)
+        used.add(k)
+
+    # 5) Append the remainder in original order (including extra REAL usenet beyond top20 if any).
+    tail: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for p in pairs:
+        k = _key_of(p)
+        if k in used:
+            continue
+        tail.append(p)
+
+    out = head + tail
+
+    try:
+        # Stats/log helper (no URLs)
+        in_top10 = 0
+        in_top20 = 0
+        for i, (_s0, _m0) in enumerate(out[:max(top20_n_eff, top10_n)], start=1):
+            if not isinstance(_m0, dict):
+                continue
+            if str(_m0.get("usenet_probe") or "") == "REAL":
+                if i <= top10_n:
+                    in_top10 += 1
+                if i <= top20_n_eff:
+                    in_top20 += 1
+        logger.info(
+            "USENET_REAL_MIX rid=%s real_total=%s real_top10=%s real_top20=%s cap10=%s top20=%s",
+            _rid(), int(len(real_usenet)), int(in_top10), int(in_top20), int(cap10), int(top20_n_eff),
+        )
+        if stats is not None:
+            try:
+                stats.counts_out = stats.counts_out or {}
+                stats.counts_out["usenet_real_total"] = int(len(real_usenet))
+                stats.counts_out["usenet_real_top10"] = int(in_top10)
+                stats.counts_out["usenet_real_top20"] = int(in_top20)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return out
 
 
 
@@ -2646,7 +2907,7 @@ logging.getLogger().addHandler(handler)
 logging.getLogger().setLevel(LOG_LEVEL)
 logging.getLogger().addFilter(RequestIdFilter())
 logger = logging.getLogger("aio-wrapper")
-logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S}")
+logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N}")
 
 
 def _debug_log_full_streams(type_: str, id_: str, platform: str, out_for_client: Optional[List[Dict[str, Any]]]) -> None:
@@ -6912,11 +7173,13 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 top_n=int(USENET_PROBE_TOP_N or 0),
                 target_real=int(USENET_PROBE_TARGET_REAL or 0),
                 timeout_s=float(USENET_PROBE_TIMEOUT_S or 4.0),
+                budget_s=float(USENET_PROBE_BUDGET_S or 8.5),
                 range_end=int(USENET_PROBE_RANGE_END or 16440),
                 stub_len=int(USENET_PROBE_STUB_LEN or 16440),
                 retries=int(USENET_PROBE_RETRIES or 0),
                 concurrency=int(USENET_PROBE_CONCURRENCY or 8),
                 drop_stubs=bool(USENET_PROBE_DROP_STUBS),
+                drop_fails=bool(USENET_PROBE_DROP_FAILS),
                 mark_ready=bool(USENET_PROBE_MARK_READY),
                 stats=stats,
             )
@@ -7953,6 +8216,22 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             stats.dropped_platform_specific += magnets
             logger.info("MOBILE_FILTER rid=%s platform=%s dropped_magnets=%s", _rid(), platform, magnets)
             candidates = kept
+
+
+    # --- Usenet REAL priority mix (final-order shaping)
+    # If we have probed REAL usenet links, ensure they are visible early without letting usenet dominate top-10.
+    # Policy: ~50% of top-10 from REAL usenet, and promote remaining REAL usenet into top-20.
+    if USENET_PROBE_ENABLE and candidates and deliver_cap_eff > 0:
+        try:
+            candidates = _apply_usenet_real_priority_mix(
+                candidates,
+                deliver_cap=int(deliver_cap_eff or 0),
+                top10_pct=float(USENET_PROBE_REAL_TOP10_PCT or 0.5),
+                top20_n=int(USENET_PROBE_REAL_TOP20_N or 20),
+                stats=stats,
+            )
+        except Exception:
+            pass
 
     # Format (last step)
     delivered: List[Dict[str, Any]] = []
