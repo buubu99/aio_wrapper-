@@ -105,6 +105,7 @@ class PipeStats:
     ms_py_dedup: int = 0           # dedup + best-pick loop
     ms_py_wrap_emit: int = 0       # wrapping /r/<token> URLs + building final delivered list
     ms_usenet_ready_match: int = 0 # difflib.SequenceMatcher comparisons for usenet readiness
+    ms_usenet_probe: int = 0      # direct usenet proxy byte-range probe (REAL vs STUB)
 
 
     # Per-filter timings (ms)
@@ -358,6 +359,25 @@ NZBGEEK_BASE = os.environ.get("NZBGEEK_BASE", "https://api.nzbgeek.info/api")
 NZBGEEK_TIMEOUT = _safe_float(os.environ.get("NZBGEEK_TIMEOUT", "5"), 5.0)
 NZBGEEK_TITLE_MATCH_MIN_RATIO = _safe_float(os.environ.get("NZBGEEK_TITLE_MATCH_MIN_RATIO", "0.80"), 0.80)
 NZBGEEK_TITLE_FALLBACK = _parse_bool(os.environ.get('NZBGEEK_TITLE_FALLBACK', 'false'))
+# Gate NZBGeek readiness calls (can be disabled if you switch to direct playability probing).
+USE_NZBGEEK_READY = _parse_bool(os.environ.get("USE_NZBGEEK_READY", "1"), True)
+
+# Direct Usenet playability probe (replaces NZBGeek readiness as "source of truth" when enabled).
+# Uses a tiny byte-range GET to distinguish REAL vs STUB proxy links.
+USENET_PROBE_ENABLE = _parse_bool(os.environ.get("USENET_PROBE_ENABLE", "0"), False)
+USENET_PROBE_TOP_N = _safe_int(os.environ.get("USENET_PROBE_TOP_N", "50"), 50)
+# Stop early once we have this many REAL usenet links (keeps latency down).
+USENET_PROBE_TARGET_REAL = _safe_int(os.environ.get("USENET_PROBE_TARGET_REAL", "12"), 12)
+USENET_PROBE_TIMEOUT_S = _safe_float(os.environ.get("USENET_PROBE_TIMEOUT_S", "4.0"), 4.0)
+USENET_PROBE_RETRIES = _safe_int(os.environ.get("USENET_PROBE_RETRIES", "2"), 2)
+USENET_PROBE_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY", "20"), 20)
+USENET_PROBE_RANGE_END = _safe_int(os.environ.get("USENET_PROBE_RANGE_END", "16440"), 16440)
+# If we read exactly this many bytes back from the range probe, treat it as a "stub".
+USENET_PROBE_STUB_LEN = _safe_int(os.environ.get("USENET_PROBE_STUB_LEN", "16440"), 16440)
+# Demote (and optionally drop) stubs aggressively so REAL usenet links float to the top.
+USENET_PROBE_DROP_STUBS = _parse_bool(os.environ.get("USENET_PROBE_DROP_STUBS", "1"), True)
+USENET_PROBE_MARK_READY = _parse_bool(os.environ.get("USENET_PROBE_MARK_READY", "1"), True)
+
 
 
 BUILD_ID = os.environ.get("BUILD_ID", "1.0")
@@ -1257,6 +1277,299 @@ def _verify_stream_url(
         return (True, pen_risky, "RISKY_CT_OR_SERVER")
 
     return (True, 0, "OK")
+
+
+# ---------------------------
+# Usenet playability probe (proxy-range heuristic)
+# ---------------------------
+
+_VERIFY_TLS = threading.local()
+
+def _tls_requests_session() -> requests.Session:
+    """Thread-local requests.Session (safe for ThreadPoolExecutor)."""
+    s = getattr(_VERIFY_TLS, "sess", None)
+    if s is None:
+        s = requests.Session()
+        setattr(_VERIFY_TLS, "sess", s)
+    return s
+
+def _basic_auth_header(userpass: str) -> Dict[str, str]:
+    """Build a Basic Authorization header from 'user:pass'."""
+    try:
+        up = (userpass or "").strip()
+        if not up or ":" not in up:
+            return {}
+        tok = base64.b64encode(up.encode("utf-8")).decode("ascii")
+        return {"Authorization": f"Basic {tok}"}
+    except Exception:
+        return {}
+
+def _probe_auth_headers_for_url(u: str) -> Dict[str, str]:
+    """Attach Basic auth for AIOStreams proxy hosts when needed (AIO_BASE / PROV2_BASE)."""
+    try:
+        from urllib.parse import urlparse
+        netloc = (urlparse(u).netloc or "").lower().split("@")[-1]
+        if not netloc:
+            return {}
+        aio_host = (urlparse(AIO_BASE).netloc or "").lower().split("@")[-1]
+        p2_host = (urlparse(PROV2_BASE).netloc or "").lower().split("@")[-1]
+        if aio_host and netloc == aio_host and AIO_AUTH:
+            return _basic_auth_header(AIO_AUTH)
+        if p2_host and netloc == p2_host and PROV2_AUTH:
+            return _basic_auth_header(PROV2_AUTH)
+    except Exception:
+        pass
+    return {}
+
+def _usenet_range_probe_is_real(url: str, *, timeout_s: float, range_end: int, stub_len: int, retries: int) -> Tuple[bool, str, int]:
+    """Return (is_real, reason, bytes_read).
+
+    Heuristic: request Range bytes=0-range_end and read up to (range_end+1) bytes.
+    If we read exactly `stub_len` bytes, treat as STUB. If we read exactly (range_end+1), treat as REAL.
+    Anything else is treated as not-real (short read, range ignored, auth, etc.).
+    """
+    u = url or ""
+    try:
+        # If caller passed a short /r/<token> URL, unwrap to upstream.
+        if "/r/" in u:
+            long_u = _unwrap_short_url(u)
+            if long_u:
+                u = long_u
+    except Exception:
+        pass
+
+    expected = int(range_end) + 1
+    ua = globals().get("VERIFY_UA", "Mozilla/5.0")
+    base_headers = {"User-Agent": ua, "Range": f"bytes=0-{int(range_end)}", "Accept": "*/*"}
+    auth_h = _probe_auth_headers_for_url(u)
+    if auth_h:
+        base_headers.update(auth_h)
+
+    last_err = ""
+    last_bytes = 0
+
+    for _attempt in range(max(1, int(retries) + 1)):
+        try:
+            sess = _tls_requests_session()
+            r = sess.get(u, headers=base_headers, timeout=float(timeout_s), allow_redirects=True, stream=True)
+            try:
+                st = int(getattr(r, "status_code", 0) or 0)
+            except Exception:
+                st = 0
+            if st in (401, 403):
+                try:
+                    r.close()
+                except Exception:
+                    pass
+                return (False, "AUTH", 0)
+            if st < 200 or st >= 400:
+                last_err = f"HTTP_{st}"
+                try:
+                    r.close()
+                except Exception:
+                    pass
+                continue
+
+            ct = (r.headers.get("Content-Type") or "").lower()
+            if ct.startswith("text/") or ("json" in ct) or ("xml" in ct) or ("html" in ct):
+                try:
+                    r.close()
+                except Exception:
+                    pass
+                return (False, "CT_TEXT", 0)
+
+            # Read up to expected bytes (and stop). Guard against servers ignoring Range.
+            total = 0
+            max_allow = expected + 2  # tiny slack
+            for chunk in r.iter_content(chunk_size=4096):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total >= expected:
+                    break
+                if total > max_allow:
+                    break
+
+            try:
+                r.close()
+            except Exception:
+                pass
+
+            last_bytes = int(total)
+
+            if total == int(stub_len):
+                return (False, "STUB_LEN", int(total))
+            if total == expected:
+                return (True, "REAL", int(total))
+
+            if total > expected:
+                return (False, "RANGE_IGNORED", int(total))
+            return (False, f"SHORT_{int(total)}", int(total))
+
+        except requests.Timeout:
+            last_err = "TIMEOUT"
+        except Exception as e:
+            last_err = f"ERR:{type(e).__name__}"
+
+    return (False, last_err or "ERR", int(last_bytes or 0))
+
+def _apply_usenet_playability_probe(
+    pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+    *,
+    top_n: int,
+    target_real: int,
+    timeout_s: float,
+    range_end: int,
+    stub_len: int,
+    retries: int,
+    concurrency: int,
+    drop_stubs: bool,
+    mark_ready: bool,
+    stats: Optional["PipeStats"] = None,
+) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    """Probe top-N usenet candidates and mark/demote STUBs so REAL ones rise to the top.
+
+    - Marks meta["usenet_probe"] = REAL/STUB/ERR
+    - Optionally sets meta["ready"]=True for REAL
+    - Demotes STUBs via meta["verify_rank"] bump (and optionally drops them from output)
+    - Stops early once `target_real` REAL links are found.
+    """
+    if not pairs:
+        return pairs
+
+    tn = max(0, int(top_n or 0))
+    if tn <= 0:
+        return pairs
+
+    # Identify usenet-like providers
+    usenet_provs = {str(p).upper() for p in (USENET_PROVIDERS or USENET_PRIORITY or [])}
+    usenet_provs.add("ND")
+
+    def _is_usenet_pair(pair: Tuple[Dict[str, Any], Dict[str, Any]]) -> bool:
+        _s, _m = pair
+        prov = str((_m or {}).get("provider") or "").upper().strip()
+        if prov in usenet_provs:
+            return True
+        aio = (_m or {}).get("aio")
+        try:
+            if USE_AIO_READY and isinstance(aio, dict) and (aio.get("type") == "usenet"):
+                return True
+        except Exception:
+            pass
+        return False
+
+    # Candidate indices within an extended window so we can stop early once we found enough REAL links.
+    window = min(len(pairs), max(tn, int(target_real or 0) + 20))
+    cand: List[int] = []
+    seen_url: set[str] = set()
+    for i in range(window):
+        s, m = pairs[i]
+        if not _is_usenet_pair((s, m)):
+            continue
+        u = ""
+        try:
+            u = (s.get("url") or "") if isinstance(s, dict) else ""
+        except Exception:
+            u = ""
+        if not u:
+            continue
+        if u in seen_url:
+            continue
+        seen_url.add(u)
+        cand.append(i)
+
+    if not cand:
+        return pairs
+
+    max_workers = max(1, min(int(concurrency or 1), len(cand)))
+    target = max(0, int(target_real or 0))
+
+    t0 = time.monotonic()
+    real_idx: List[int] = []
+    stub_idx: List[int] = []
+    err_idx: List[int] = []
+
+    # Probe in batches so we can stop early (keeps latency down).
+    ptr = 0
+    while ptr < len(cand) and (target == 0 or len(real_idx) < target):
+        batch = cand[ptr: ptr + max_workers]
+        ptr += len(batch)
+
+        futs: List[Tuple[int, Any]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for i in batch:
+                s, _m = pairs[i]
+                try:
+                    u = s.get("url") if isinstance(s, dict) else ""
+                except Exception:
+                    u = ""
+                futs.append((i, ex.submit(
+                    _usenet_range_probe_is_real,
+                    u,
+                    timeout_s=float(timeout_s),
+                    range_end=int(range_end),
+                    stub_len=int(stub_len),
+                    retries=int(retries),
+                )))
+            # Wait for batch completion.
+            wait([f for (_i, f) in futs], timeout=float(timeout_s) * max(1, int(retries) + 1) + 1.0)
+
+        for i, fut in futs:
+            try:
+                ok, reason, nbytes = fut.result(timeout=0)
+            except Exception:
+                ok, reason, nbytes = (False, "ERR", 0)
+
+            s, m = pairs[i]
+            if not isinstance(m, dict):
+                continue
+
+            if ok:
+                real_idx.append(i)
+                m["usenet_probe"] = "REAL"
+                m["usenet_probe_bytes"] = int(nbytes or 0)
+                if mark_ready:
+                    m["ready"] = True
+            else:
+                if reason == "STUB_LEN" or str(reason).startswith("SHORT_"):
+                    stub_idx.append(i)
+                    m["usenet_probe"] = "STUB"
+                else:
+                    err_idx.append(i)
+                    m["usenet_probe"] = "ERR"
+                m["usenet_probe_reason"] = str(reason)
+                m["usenet_probe_bytes"] = int(nbytes or 0)
+                # Demote hard so these don't occupy top spots.
+                try:
+                    m["verify_rank"] = max(int(m.get("verify_rank") or 0), 9999)
+                except Exception:
+                    m["verify_rank"] = 9999
+
+    # Optionally drop probed STUBs from output entirely (keeps list "reliable").
+    if drop_stubs and stub_idx:
+        stub_set = set(stub_idx)
+        pairs = [p for j, p in enumerate(pairs) if j not in stub_set]
+
+    # Lightweight summary log (no URLs).
+    try:
+        ms = int((time.monotonic() - t0) * 1000)
+        logger.info(
+            "USENET_PROBE rid=%s scanned=%s real=%s stub=%s err=%s ms=%s",
+            _rid(), int(min(len(cand), ptr)), int(len(real_idx)), int(len(stub_idx)), int(len(err_idx)), int(ms),
+        )
+        if stats is not None:
+            try:
+                stats.counts_out = stats.counts_out or {}
+                stats.counts_out["usenet_probe_real"] = int(len(real_idx))
+                stats.counts_out["usenet_probe_stub"] = int(len(stub_idx))
+                stats.counts_out["usenet_probe_err"] = int(len(err_idx))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return pairs
+
 
 
 def _provider_rank(prov: str) -> int:
@@ -2333,7 +2646,7 @@ logging.getLogger().addHandler(handler)
 logging.getLogger().setLevel(LOG_LEVEL)
 logging.getLogger().addFilter(RequestIdFilter())
 logger = logging.getLogger("aio-wrapper")
-logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK}")
+logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S}")
 
 
 def _debug_log_full_streams(type_: str, id_: str, platform: str, out_for_client: Optional[List[Dict[str, Any]]]) -> None:
@@ -6195,7 +6508,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         imdbid = ""
 
         # Only call NZBGeek when we actually have Usenet streams and the API key is configured.
-        if has_usenet and NZBGEEK_APIKEY:
+        if has_usenet and NZBGEEK_APIKEY and USE_NZBGEEK_READY and (not USENET_PROBE_ENABLE):
             imdbid = _extract_imdbid_for_nzbgeek(id_, type_=type_)
 
             # Maintain: Usenet NZBGeek API (not affected by RD heuristics—keep readiness)
@@ -6588,6 +6901,29 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     did_verify = False
     out_pairs.sort(key=sort_key)
+
+    # Direct Usenet playability probe (REAL vs STUB) - replaces NZBGeek readiness when enabled.
+    # This runs AFTER global sort/dedup and marks/demotes stubs so playable links float upward.
+    if (not fast_mode) and has_usenet and USENET_PROBE_ENABLE:
+        try:
+            t_up0 = time.monotonic()
+            out_pairs = _apply_usenet_playability_probe(
+                out_pairs,
+                top_n=int(USENET_PROBE_TOP_N or 0),
+                target_real=int(USENET_PROBE_TARGET_REAL or 0),
+                timeout_s=float(USENET_PROBE_TIMEOUT_S or 4.0),
+                range_end=int(USENET_PROBE_RANGE_END or 16440),
+                stub_len=int(USENET_PROBE_STUB_LEN or 16440),
+                retries=int(USENET_PROBE_RETRIES or 0),
+                concurrency=int(USENET_PROBE_CONCURRENCY or 8),
+                drop_stubs=bool(USENET_PROBE_DROP_STUBS),
+                mark_ready=bool(USENET_PROBE_MARK_READY),
+                stats=stats,
+            )
+            stats.ms_usenet_probe = int((time.monotonic() - t_up0) * 1000)
+            out_pairs.sort(key=sort_key)
+        except Exception as _e:
+            logger.debug("USENET_PROBE_ERR rid=%s err=%s", rid, _e)
 
     # Parallel verification (batched for speed; only verify top-N after global sort)
     if (not fast_mode) and VERIFY_STREAM and (not (is_android and ANDROID_VERIFY_OFF)):
@@ -8198,6 +8534,7 @@ def stream(type_: str, id_: str):
                                     "py_dedup": int(getattr(stats, "ms_py_dedup", 0) or 0),
                                     "py_wrap_emit": int(getattr(stats, "ms_py_wrap_emit", 0) or 0),
                                     "usenet_ready_match": int(getattr(stats, "ms_usenet_ready_match", 0) or 0),
+                                    "usenet_probe": int(getattr(stats, "ms_usenet_probe", 0) or 0),
                                 },
                                 "remote_ms": {"aio": aio_remote_ms, "p2": p2_remote_ms},
                                 "wait_ms": {"aio": aio_wait_ms, "p2": p2_wait_ms},
@@ -8344,7 +8681,7 @@ def stream(type_: str, id_: str):
             pass
 
         logger.info(
-            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s platform=%s ua_tok=%s ua_family=%s type=%s id=%s served_cache=%s aio_wait_ms=%s p2_wait_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s ms_py_ff=%s ms_py_dedup=%s ms_py_wrap_emit=%s ms_usenet_ready_match=%s",
+            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s platform=%s ua_tok=%s ua_family=%s type=%s id=%s served_cache=%s aio_wait_ms=%s p2_wait_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s ms_py_ff=%s ms_py_dedup=%s ms_py_wrap_emit=%s ms_usenet_ready_match=%s ms_usenet_probe=%s",
             _rid(), _mark(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
             platform,
             getattr(g, "_cached_ua_tok", ""),
@@ -8362,6 +8699,7 @@ def stream(type_: str, id_: str):
             int(getattr(stats, 'ms_py_dedup', 0) or 0),
             int(getattr(stats, 'ms_py_wrap_emit', 0) or 0),
             int(getattr(stats, 'ms_usenet_ready_match', 0) or 0),
+            int(getattr(stats, 'ms_usenet_probe', 0) or 0),
         )
         # New: Approximate output size (bytes) for debugging response bloat
         try:
