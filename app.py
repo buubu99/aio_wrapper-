@@ -5093,7 +5093,7 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
       - tag, ok, status, bytes, count, ms, err
     """
     meta: dict[str, Any] = {"tag": str(tag), "ok": False, "status": 0, "bytes": 0, "count": 0, "ms": 0, "err": ""}
-    t0 = time.time()
+    t0 = time.monotonic()  # wall-clock for this request (monotonic)
     if not base:
         meta["err"] = "no_base"
         return [], meta
@@ -7346,7 +7346,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         except Exception:
             pass
 
-        logger.info("POST_SORT_TOP rid=%s mark=%s topN=%s", _rid(), mark, proof_n)
+        logger.info("POST_SORT_TOP rid=%s mark=%s topN=%s", _rid(), _mark(), proof_n)
         for x in topn:
             sk = x.get("sort_key") or ()
             sk0 = sk[0] if len(sk) > 0 else None
@@ -7357,7 +7357,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 "POST_SORT_ITEM rid=%s mark=%s r=%s prov=%s stack=%s res=%s size_gb=%s "
                 "b=%s p1=%s inst=%s ready=%s cached=%s tc=%s tp=%s cbh=%s pbh=%s cm=%s pm=%s "
                 "sk0=%s sk1=%s sk2=%s sk3=%s",
-                _rid(), mark, x.get("rank"), x.get("prov"), x.get("stack"), x.get("res"), x.get("size_gb"),
+                _rid(), _mark(), x.get("rank"), x.get("prov"), x.get("stack"), x.get("res"), x.get("size_gb"),
                 x.get("p1_bucket"), x.get("p1_class"), x.get("instant"), x.get("ready"), x.get("cached"),
                 x.get("tagged_cached"), x.get("tagged_proxied"), x.get("cached_bh"), x.get("proxied_bh"),
                 x.get("cached_m"), x.get("proxied_m"), sk0, sk1, sk2, sk3,
@@ -7393,9 +7393,13 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             except Exception:
                 aio_cached = None
                 aio_proxied = None
+            ready_flag = False
             if USE_AIO_READY and (aio_cached is not None) and (aio_proxied is not None):
-                ready_flag = bool(m.get("ready"))
-        super_instant = 0 if ((aio_cached is True and aio_proxied is True) or ready_flag) else 1
+                try:
+                    ready_flag = bool(aio.get('ready', False)) if isinstance(aio, dict) else False
+                except Exception:
+                    ready_flag = False
+                super_instant = 0 if ((aio_cached is True and aio_proxied is True) or ready_flag) else 1
             else:
                 super_instant = 0 if (("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) or ("C:TRUE" in desc_u and ("P:TRUE" in desc_u or _is_controlled_playback_url(s.get("url") if isinstance(s, dict) else None)))) else 1
             return (super_instant,) + k
@@ -8339,7 +8343,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 })
         except Exception:
             _wrapped_url_map = {}
-    t_wrap0 = time.monotonic()
+    t_pre_wrap = time.monotonic()
+    stats.ms_py_pre_wrap = int((t_pre_wrap - t_ff0) * 1000)
+    t_wrap0 = t_pre_wrap
     for s, m in candidates[:deliver_cap_eff]:
         h = (m.get("infohash") or "").lower().strip()
         cached_marker = m.get("cached")
@@ -8477,7 +8483,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 d.get("name"),
             )
 
-    stats.ms_py_wrap_emit = int((time.monotonic() - t_wrap0) * 1000)
+    t_after_wrap = time.monotonic()
+    stats.ms_py_wrap_emit = int((t_after_wrap - t_wrap0) * 1000)
     stats.delivered = len(delivered)
 
     # Cache summary (delivered streams only): keep WRAP_STATS aligned with WRAP_COUNTS out.cached
@@ -8564,6 +8571,22 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         pass
 
     stats.ms_py_ff = int((time.monotonic() - t_ff0) * 1000)
+    # Derived: make py_ff math integer-perfect
+    try:
+        stats.ms_py_tail = max(
+            0,
+            int(stats.ms_py_ff) - int(stats.ms_py_pre_wrap or 0) - int(stats.ms_py_wrap_emit or 0),
+        )
+        known_inside_pre = (
+            int(stats.ms_title_mismatch or 0)
+            + int(stats.ms_uncached_check or 0)
+            + int(stats.ms_py_dedup or 0)
+            + int(stats.ms_usenet_ready_match or 0)
+            + int(stats.ms_usenet_probe or 0)
+        )
+        stats.ms_py_pre_wrap_other = max(0, int(stats.ms_py_pre_wrap or 0) - known_inside_pre)
+    except Exception:
+        pass
     # Clear TLS stats pointer to avoid leaking across requests
     try:
         if hasattr(_TLS, "stats"):
@@ -8735,7 +8758,6 @@ def stream(type_: str, id_: str):
         mem_start = 0
 
     t0 = time.time()
-    t0_mono = time.monotonic()
     stats = PipeStats()
 
     is_android = is_android_client()
@@ -8752,6 +8774,7 @@ def stream(type_: str, id_: str):
     want_dbg = WRAP_EMBED_DEBUG or (isinstance(dbg_q, str) and dbg_q.strip() not in ("", "0", "false", "False"))
 
     try:
+        t_fetch_wall0 = time.monotonic()
         streams, aio_in, prov2_in, ms_aio, ms_p2, prefiltered, pre_stats, fetch_meta = get_streams(
             type_,
             id_,
@@ -8759,6 +8782,7 @@ def stream(type_: str, id_: str):
             is_iphone=is_iphone,
             client_timeout_s=(ANDROID_STREAM_TIMEOUT if (is_android or is_iphone) else DESKTOP_STREAM_TIMEOUT),
         )
+        stats.ms_fetch_wall = int((time.monotonic() - t_fetch_wall0) * 1000)
 
         if prefiltered:
             out = streams
@@ -8866,8 +8890,8 @@ def stream(type_: str, id_: str):
             p2_remote_ms  = int(stats.ms_fetch_p2_remote or 0)
 
             # What we "report" as timing_ms.* (used by smoke tests): remote when we have it, otherwise wait.
-            aio_ms = aio_remote_ms or aio_wait_ms
-            p2_ms  = p2_remote_ms or p2_wait_ms
+            aio_ms = aio_remote_ms
+            p2_ms  = p2_remote_ms
 
             tmdb_ms = int(stats.ms_tmdb or 0)
             tb_api_ms = int(stats.ms_tb_api or 0)
@@ -9030,22 +9054,13 @@ def stream(type_: str, id_: str):
         except Exception:
             pass
 
-        ms_total = int((time.monotonic() - t0_mono) * 1000)
-        ms_fetch_wait = int(stats.ms_fetch_aio or 0)
-        ms_py_ff = int(stats.ms_py_ff or 0)
-        ms_other = max(0, ms_total - ms_fetch_wait - ms_py_ff)
-        ms_sum = ms_fetch_wait + ms_py_ff + ms_other
-        ms_delta = ms_total - ms_sum
-        logger.info(
-            "WRAP_MATH rid=%s mark=%s ms_total=%s fetch_wait_ms=%s py_ff_ms=%s other_ms=%s delta_ms=%s",
-            _rid(),
-            _mark(),
-            ms_total,
-            ms_fetch_wait,
-            ms_py_ff,
-            ms_other,
-            ms_delta,
-        )
+        ms_total = int((time.monotonic() - t0) * 1000)
+        stats.ms_total = ms_total
+        # Residual overhead so (fetch_wall + tmdb + py_ff + overhead) == total (integer-perfect)
+        try:
+            stats.ms_overhead = max(0, int(ms_total) - int(stats.ms_fetch_wall or 0) - int(stats.ms_tmdb or 0) - int(stats.ms_py_ff or 0))
+        except Exception:
+            pass
 
         # Global stats update
         _update_global_stats(
@@ -9065,26 +9080,46 @@ def stream(type_: str, id_: str):
         except Exception:
             pass
 
+        rid = _rid()
+        mark = _mark()
         logger.info(
-            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s platform=%s ua_tok=%s ua_family=%s type=%s id=%s served_cache=%s aio_wait_ms=%s p2_wait_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s tmdb_ms=%s tb_api_ms=%s tb_wd_ms=%s tb_usenet_ms=%s ms_title_mismatch=%s ms_uncached_check=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s memory_peak_kb=%s ms_py_ff=%s ms_py_dedup=%s ms_py_wrap_emit=%s ms_usenet_ready_match=%s ms_usenet_probe=%s",
-            _rid(), _mark(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
+            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s platform=%s "
+            "ua_tok=%s ua_family=%s type=%s id=%s served_cache=%s "
+            "fetch_wall_ms=%s aio_wait_ms=%s p2_wait_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s "
+            "tmdb_ms=%s "
+            "py_ff_ms=%s py_pre_wrap_ms=%s py_pre_wrap_other_ms=%s py_dedup_ms=%s "
+            "usenet_ready_match_ms=%s usenet_probe_ms=%s py_wrap_emit_ms=%s py_tail_ms=%s "
+            "overhead_ms=%s total_ms=%s sum_ms=%s delta_ms=%s",
+            rid,
+            mark,
+            BUILD,
+            GIT_COMMIT,
+            request.path,
+            ua_class,
             platform,
-            getattr(g, "_cached_ua_tok", ""),
-            getattr(g, "_cached_ua_family", ""),
-            type_, id_,
-            int(1 if served_from_cache else 0),
-            int(stats.ms_fetch_aio or 0), int(stats.ms_fetch_p2 or 0),
-            int(getattr(stats, 'ms_fetch_aio_remote', 0) or 0), int(getattr(stats, 'ms_fetch_p2_remote', 0) or 0),
+            ua_tok,
+            ua_family,
+            type_,
+            id_,
+            served_cache,
+            int(stats.ms_fetch_wall or 0),
+            int(stats.ms_fetch_aio or 0),
+            int(stats.ms_fetch_p2 or 0),
+            int(stats.ms_fetch_aio_remote or 0),
+            int(stats.ms_fetch_p2_remote or 0),
             int(stats.ms_tmdb or 0),
-            int(stats.ms_tb_api or 0), int(stats.ms_tb_webdav or 0), int(stats.ms_tb_usenet or 0),
-            int(stats.ms_title_mismatch or 0), int(stats.ms_uncached_check or 0),
-            int(stats.tb_api_hashes or 0), int(stats.tb_webdav_hashes or 0), int(stats.tb_usenet_hashes or 0),
-            int(stats.memory_peak_kb or 0),
-            int(getattr(stats, 'ms_py_ff', 0) or 0),
-            int(getattr(stats, 'ms_py_dedup', 0) or 0),
-            int(getattr(stats, 'ms_py_wrap_emit', 0) or 0),
-            int(getattr(stats, 'ms_usenet_ready_match', 0) or 0),
-            int(getattr(stats, 'ms_usenet_probe', 0) or 0),
+            int(stats.ms_py_ff or 0),
+            int(stats.ms_py_pre_wrap or 0),
+            int(stats.ms_py_pre_wrap_other or 0),
+            int(stats.ms_py_dedup or 0),
+            int(stats.ms_usenet_ready_match or 0),
+            int(stats.ms_usenet_probe or 0),
+            int(stats.ms_py_wrap_emit or 0),
+            int(stats.ms_py_tail or 0),
+            int(stats.ms_overhead or 0),
+            int(stats.ms_total or ms_total or 0),
+            int((int(stats.ms_fetch_wall or 0) + int(stats.ms_tmdb or 0) + int(stats.ms_py_ff or 0) + int(stats.ms_overhead or 0))),
+            int((int(stats.ms_total or ms_total or 0) - (int(stats.ms_fetch_wall or 0) + int(stats.ms_tmdb or 0) + int(stats.ms_py_ff or 0) + int(stats.ms_overhead or 0)))),
         )
         # New: Approximate output size (bytes) for debugging response bloat
         try:
