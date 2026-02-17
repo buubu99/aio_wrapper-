@@ -336,16 +336,16 @@ REQUEST_TIMEOUT = _safe_float(os.environ.get('REQUEST_TIMEOUT', '30'), 30.0)
 CACHE_TTL = _safe_int(os.environ.get('CACHE_TTL', '600'), 600)
 
 # Client-side time budgets (seconds). These are upper bounds; we return as soon as we have results.
-ANDROID_STREAM_TIMEOUT = _safe_float(os.environ.get('ANDROID_STREAM_TIMEOUT', '20'), 20.0)  # FIXED: increase default
-DESKTOP_STREAM_TIMEOUT = _safe_float(os.environ.get('DESKTOP_STREAM_TIMEOUT', '30'), 30.0)  # FIXED: increase default
+ANDROID_STREAM_TIMEOUT = _safe_float(os.environ.get('ANDROID_STREAM_TIMEOUT', '20'), 20.0)
+DESKTOP_STREAM_TIMEOUT = _safe_float(os.environ.get('DESKTOP_STREAM_TIMEOUT', '15'), 15.0)
 EMPTY_UA_IS_ANDROID = _parse_bool(os.environ.get('EMPTY_UA_IS_ANDROID', 'false'), False)  # treat blank UA as Android
 
 # Upstream fetch timeouts (seconds) used inside /stream.
 # We keep P2 tighter because it can hang and trigger Gunicorn worker aborts if retries are enabled.
-ANDROID_AIO_TIMEOUT = _safe_float(os.environ.get('ANDROID_AIO_TIMEOUT', '18'), 18.0)  # FIXED: increase default
-ANDROID_P2_TIMEOUT = _safe_float(os.environ.get('ANDROID_P2_TIMEOUT', '12'), 12.0)  # FIXED: increase default
-DESKTOP_AIO_TIMEOUT = _safe_float(os.environ.get('DESKTOP_AIO_TIMEOUT', '28'), 28.0)  # FIXED: increase default
-DESKTOP_P2_TIMEOUT = _safe_float(os.environ.get('DESKTOP_P2_TIMEOUT', '15'), 15.0)  # FIXED: increase default
+ANDROID_AIO_TIMEOUT = _safe_float(os.environ.get('ANDROID_AIO_TIMEOUT', '18'), 18.0)
+ANDROID_P2_TIMEOUT = _safe_float(os.environ.get('ANDROID_P2_TIMEOUT', '8'), 8.0)
+DESKTOP_AIO_TIMEOUT = _safe_float(os.environ.get('DESKTOP_AIO_TIMEOUT', '18'), 18.0)
+DESKTOP_P2_TIMEOUT = _safe_float(os.environ.get('DESKTOP_P2_TIMEOUT', '6'), 6.0)
 
 # TorBox API call timeout (seconds) used during cache checks.
 TB_API_TIMEOUT = _safe_float(os.environ.get('TB_API_TIMEOUT', '8'), 8.0)
@@ -9083,45 +9083,48 @@ def stream(type_: str, id_: str):
 
         rid = _rid()
         mark = _mark()
-        logger.info(
-            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s platform=%s "
-            "ua_tok=%s ua_family=%s type=%s id=%s served_cache=%s "
-            "fetch_wall_ms=%s aio_wait_ms=%s p2_wait_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s "
-            "tmdb_ms=%s "
-            "py_ff_ms=%s py_pre_wrap_ms=%s py_pre_wrap_other_ms=%s py_dedup_ms=%s "
-            "usenet_ready_match_ms=%s usenet_probe_ms=%s py_wrap_emit_ms=%s py_tail_ms=%s "
-            "overhead_ms=%s total_ms=%s sum_ms=%s delta_ms=%s",
-            rid,
-            mark,
-            BUILD,
-            GIT_COMMIT,
-            request.path,
-            ua_class,
-            platform,
-            ua_tok,
-            ua_family,
-            type_,
-            id_,
-            served_cache,
-            int(stats.ms_fetch_wall or 0),
-            int(stats.ms_fetch_aio or 0),
-            int(stats.ms_fetch_p2 or 0),
-            int(stats.ms_fetch_aio_remote or 0),
-            int(stats.ms_fetch_p2_remote or 0),
-            int(stats.ms_tmdb or 0),
-            int(stats.ms_py_ff or 0),
-            int(stats.ms_py_pre_wrap or 0),
-            int(stats.ms_py_pre_wrap_other or 0),
-            int(stats.ms_py_dedup or 0),
-            int(stats.ms_usenet_ready_match or 0),
-            int(stats.ms_usenet_probe or 0),
-            int(stats.ms_py_wrap_emit or 0),
-            int(stats.ms_py_tail or 0),
-            int(stats.ms_overhead or 0),
-            int(stats.ms_total or ms_total or 0),
-            int((int(stats.ms_fetch_wall or 0) + int(stats.ms_tmdb or 0) + int(stats.ms_py_ff or 0) + int(stats.ms_overhead or 0))),
-            int((int(stats.ms_total or ms_total or 0) - (int(stats.ms_fetch_wall or 0) + int(stats.ms_tmdb or 0) + int(stats.ms_py_ff or 0) + int(stats.ms_overhead or 0)))),
-        )
+        try:
+            logger.info(
+                "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s platform=%s "
+                "ua_tok=%s ua_family=%s type=%s id=%s served_cache=%s "
+                "fetch_wall_ms=%s aio_wait_ms=%s p2_wait_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s "
+                "tmdb_ms=%s "
+                "py_ff_ms=%s py_pre_wrap_ms=%s py_pre_wrap_other_ms=%s py_dedup_ms=%s "
+                "usenet_ready_match_ms=%s usenet_probe_ms=%s py_wrap_emit_ms=%s py_tail_ms=%s "
+                "overhead_ms=%s total_ms=%s sum_ms=%s delta_ms=%s",
+                rid,
+                mark,
+                BUILD,
+                GIT_COMMIT,
+                request.path,
+                ua_class,
+                platform,
+                getattr(g, "_cached_ua_tok", ""),
+                getattr(g, "_cached_ua_family", ""),
+                type_,
+                id_,
+                bool(served_from_cache),
+                int(stats.ms_fetch_wall or 0),
+                int(stats.ms_fetch_aio or 0),
+                int(stats.ms_fetch_p2 or 0),
+                int(stats.ms_fetch_aio_remote or 0),
+                int(stats.ms_fetch_p2_remote or 0),
+                int(stats.ms_tmdb or 0),
+                int(stats.ms_py_ff or 0),
+                int(stats.ms_py_pre_wrap or 0),
+                int(stats.ms_py_pre_wrap_other or 0),
+                int(stats.ms_py_dedup or 0),
+                int(stats.ms_usenet_ready_match or 0),
+                int(stats.ms_usenet_probe or 0),
+                int(stats.ms_py_wrap_emit or 0),
+                int(stats.ms_py_tail or 0),
+                int(stats.ms_overhead or 0),
+                int(stats.ms_total or ms_total or 0),
+                int((int(stats.ms_fetch_wall or 0) + int(stats.ms_tmdb or 0) + int(stats.ms_py_ff or 0) + int(stats.ms_overhead or 0))),
+                int((int(stats.ms_total or ms_total or 0) - (int(stats.ms_fetch_wall or 0) + int(stats.ms_tmdb or 0) + int(stats.ms_py_ff or 0) + int(stats.ms_overhead or 0)))),
+            )
+        except Exception as e:
+            logger.debug("WRAP_TIMING_LOG_FAIL rid=%s err=%s", rid, e)
         # New: Approximate output size (bytes) for debugging response bloat
         try:
             out_size = len(json.dumps(out_for_client, separators=(",", ":"))) if out_for_client else 0
