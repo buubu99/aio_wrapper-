@@ -1325,6 +1325,48 @@ def _probe_auth_headers_for_url(u: str) -> Dict[str, str]:
         pass
     return {}
 
+
+def shannon_entropy(data: bytes) -> float:
+    """Shannon entropy (bits/byte) for small byte buffers."""
+    try:
+        if not data:
+            return 0.0
+        # Limit work (probe buffers are already small, but be safe).
+        buf = data[:65536]
+        from collections import Counter
+        import math
+        n = float(len(buf))
+        c = Counter(buf)
+        ent = 0.0
+        for cnt in c.values():
+            p = float(cnt) / n
+            if p > 0.0:
+                ent -= p * math.log(p, 2)
+        return float(ent)
+    except Exception:
+        return 0.0
+
+
+def sniff_magic(data: bytes) -> str:
+    """Very cheap content sniffing for proxy stubs (HTML/JSON/XML-ish vs unknown)."""
+    try:
+        if not data:
+            return "unknown"
+        head = data[:512].lstrip()
+        lo = head.lower()
+        if lo.startswith(b"<!doctype html") or lo.startswith(b"<html") or b"<html" in lo[:128]:
+            return "html"
+        if lo.startswith(b"{") or lo.startswith(b"["):
+            return "json"
+        if lo.startswith(b"<?xml"):
+            return "xml/htmlish"
+        if lo.startswith(b"<"):
+            # Common for HTML error pages / nginx / cloudflare etc.
+            return "xml/htmlish"
+        return "unknown"
+    except Exception:
+        return "unknown"
+
 def _usenet_range_probe_is_real(url: str, *, timeout_s: float, range_end: int, stub_len: int, retries: int, deadline_ts: Optional[float] = None) -> Tuple[bool, str, int]:
     """Return (is_real, reason, bytes_read).
 
@@ -1352,81 +1394,86 @@ def _usenet_range_probe_is_real(url: str, *, timeout_s: float, range_end: int, s
     last_err = ""
     last_bytes = 0
 
-    for _attempt in range(max(1, int(retries) + 1)):
-        # Enforce an overall deadline so the probe can't blow past the /stream latency budget.
-        if deadline_ts is not None:
-            rem = float(deadline_ts) - float(time.monotonic())
-            if rem <= 0.15:
-                return (False, "BUDGET", int(last_bytes or 0))
-            # Cap per-request timeout by remaining time (and keep a small minimum so connect doesn't instantly fail).
-            timeout_eff = max(0.35, min(float(timeout_s), rem))
-            # If we don't have time for another attempt, stop now.
-            if timeout_eff <= 0.35 and _attempt > 0:
-                return (False, "BUDGET", int(last_bytes or 0))
-        else:
-            timeout_eff = float(timeout_s)
+    # No retry loop for fast (retries=0 via env)
+    # Enforce an overall deadline so the probe can't blow past the /stream latency budget.
+    if deadline_ts is not None:
+        rem = float(deadline_ts) - float(time.monotonic())
+        if rem <= 0.15:
+            return (False, "BUDGET", int(last_bytes or 0))
+        # Cap per-request timeout by remaining time (and keep a small minimum so connect doesn't instantly fail).
+        timeout_eff = max(0.35, min(float(timeout_s), rem))
+    else:
+        timeout_eff = float(timeout_s)
 
+    try:
+        sess = _tls_requests_session()
+        r = sess.get(u, headers=base_headers, timeout=float(timeout_eff), allow_redirects=True, stream=True)
         try:
-            sess = _tls_requests_session()
-            r = sess.get(u, headers=base_headers, timeout=float(timeout_eff), allow_redirects=True, stream=True)
-            try:
-                st = int(getattr(r, "status_code", 0) or 0)
-            except Exception:
-                st = 0
-            if st in (401, 403):
-                try:
-                    r.close()
-                except Exception:
-                    pass
-                return (False, "AUTH", 0)
-            if st < 200 or st >= 400:
-                last_err = f"HTTP_{st}"
-                try:
-                    r.close()
-                except Exception:
-                    pass
-                continue
-
-            ct = (r.headers.get("Content-Type") or "").lower()
-            if ct.startswith("text/") or ("json" in ct) or ("xml" in ct) or ("html" in ct):
-                try:
-                    r.close()
-                except Exception:
-                    pass
-                return (False, "CT_TEXT", 0)
-
-            # Read up to expected bytes (and stop). Guard against servers ignoring Range.
-            total = 0
-            max_allow = expected + 2  # tiny slack
-            for chunk in r.iter_content(chunk_size=4096):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total >= expected:
-                    break
-                if total > max_allow:
-                    break
-
+            st = int(getattr(r, "status_code", 0) or 0)
+        except Exception:
+            st = 0
+        if st in (401, 403):
             try:
                 r.close()
             except Exception:
                 pass
+            return (False, "AUTH", 0)
+        if st < 200 or st >= 400:
+            last_err = f"HTTP_{st}"
+            try:
+                r.close()
+            except Exception:
+                pass
+            return (False, last_err, 0)
 
-            last_bytes = int(total)
+        ct = (r.headers.get("Content-Type") or "").lower()
+        if ct.startswith("text/") or ("json" in ct) or ("xml" in ct) or ("html" in ct):
+            try:
+                r.close()
+            except Exception:
+                pass
+            return (False, "CT_TEXT", 0)
 
-            if total == int(stub_len):
-                return (False, "STUB_LEN", int(total))
-            if total == expected:
-                return (True, "REAL", int(total))
+        # Read up to expected bytes (and stop). Guard against servers ignoring Range.
+        total = 0
+        max_allow = expected + 2  # tiny slack
+        body = b""
+        for chunk in r.iter_content(chunk_size=4096):
+            if not chunk:
+                continue
+            body += chunk
+            total += len(chunk)
+            if total >= expected:
+                break
+            if total > max_allow:
+                break
 
-            if total > expected:
-                return (False, "RANGE_IGNORED", int(total))
-            return (False, f"SHORT_{int(total)}", int(total))
+        try:
+            r.close()
+        except Exception:
+            pass
 
-        except requests.Timeout:
-            last_err = "TIMEOUT"
-        except Exception as e:
-            last_err = f"ERR:{type(e).__name__}"
+        last_bytes = int(total)
+
+        # Fast probe checks (entropy/magic for stubs)
+        magic = sniff_magic(body)
+        ent = shannon_entropy(body)
+        if total <= stub_len:  # Tiny/stub size
+            return (False, "STUB_LEN", int(total))
+        if magic in ("html", "json", "xml/htmlish"):  # Bad content
+            return (False, f"BAD_MAGIC_{magic}", int(total))
+        if ent < 3.0:  # Low entropy stub
+            return (False, f"LOW_ENT_{ent:.2f}", int(total))
+        if total == expected and (magic != "unknown" or ent >= 4.5):
+            return (True, "REAL", int(total))
+        if total > expected:
+            return (False, "RANGE_IGNORED", int(total))
+        return (False, f"SHORT_{int(total)}", int(total))
+
+    except requests.Timeout:
+        last_err = "TIMEOUT"
+    except Exception as e:
+        last_err = f"ERR:{type(e).__name__}"
 
     return (False, last_err or "ERR", int(last_bytes or 0))
 
@@ -1483,12 +1530,12 @@ def _apply_usenet_playability_probe(
             pass
         return False
 
-    # Candidate indices within an extended window so we can stop early once we found enough REAL links.
-    window = min(len(pairs), max(tn, int(target_real or 0) + 20))
+    # Candidate indices: first N usenet items by current order (not first N overall).
+    # We scan the full list until we collect tn unique usenet URLs. This ensures usenet
+    # candidates that would otherwise sit below debrid in the global sort still get probed.
     cand: List[int] = []
     seen_url: set[str] = set()
-    for i in range(window):
-        s, m = pairs[i]
+    for i, (s, m) in enumerate(pairs):
         if not _is_usenet_pair((s, m)):
             continue
         u = ""
@@ -1504,6 +1551,7 @@ def _apply_usenet_playability_probe(
         cand.append(i)
         if len(cand) >= tn:
             break
+
 
     if not cand:
         return pairs
@@ -2360,6 +2408,31 @@ def _wrap_url_load(token: str) -> Optional[str]:
             return None
         return url
 
+
+
+def _unwrap_short_url(u: str) -> Optional[str]:
+    """Best-effort: convert our short /r/<token> URLs back to the stored upstream URL."""
+    try:
+        if not u:
+            return None
+        token = ""
+        if u.startswith("/r/"):
+            token = u.split("/r/", 1)[1]
+        else:
+            # Handle absolute URLs that contain /r/<token>
+            from urllib.parse import urlparse
+            p = urlparse(u)
+            path = p.path or ""
+            if "/r/" in path:
+                token = path.split("/r/", 1)[1]
+        if not token:
+            return None
+        token = token.split("?", 1)[0].split("#", 1)[0].strip()
+        if not token:
+            return None
+        return _wrap_url_load(token)
+    except Exception:
+        return None
 
 def _wrap_url_meta_load(token: str) -> Optional[Dict[str, Any]]:
     """Load stored metadata for a short token (best-effort)."""
@@ -8343,6 +8416,21 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 if isinstance(_bh, dict):
                     _bh["noHash"] = True  # Add flag for direct play (bypasses popup)
                     _out_s["behaviorHints"] = _bh
+
+            # Expose usenet probe result/type in behaviorHints for debugging/tests.
+            # (Stremio typically ignores unknown behaviorHints keys.)
+            try:
+                _bh2 = _out_s.get("behaviorHints", {})
+                if isinstance(_bh2, dict):
+                    _up = m.get("usenet_probe")
+                    if _up:
+                        _bh2["usenetProbe"] = str(_up)
+                    _aio2 = m.get("aio")
+                    if isinstance(_aio2, dict) and _aio2.get("type"):
+                        _bh2["aioType"] = str(_aio2.get("type"))
+                    _out_s["behaviorHints"] = _bh2
+            except Exception:
+                pass
             delivered.append(_out_s)
 
         else:
@@ -9052,6 +9140,12 @@ def handle_unhandled_exception(e):
 
     # Last-resort safety net so Stremio doesn't get HTML 500s (which break jq/tests).
     logger.exception("UNHANDLED %s %s: %s", request.method, request.path, e)
+    try:
+        if hasattr(g, 'stats') and isinstance(g.stats, PipeStats):
+            logger.info("UNHANDLED_STATS rid=%s errors=%s flags=%s", _rid(), ",".join(g.stats.error_reasons[:3]), ",".join(g.stats.flag_issues[:3]))
+    except Exception:
+        pass
+
     try:
         if "timeout" in str(e).lower():
             logger.warning("EXEC_ISSUE rid=%s: timeout in %s", _rid(), request.path)
