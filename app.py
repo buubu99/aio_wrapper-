@@ -56,10 +56,14 @@ from dataclasses import dataclass, field
 # Pipeline stats (required)
 # ---------------------------
 @dataclass
+@dataclass
 class PipeStats:
+    # Input counts
     aio_in: int = 0
     prov2_in: int = 0
     merged_in: int = 0
+
+    # Drop counters
     dropped_error: int = 0
     dropped_missing_url: int = 0
     dropped_pollution: int = 0
@@ -73,94 +77,83 @@ class PipeStats:
     dropped_blacklist: int = 0
     dropped_fakes_db: int = 0
     dropped_title_mismatch: int = 0
-    skipped_title_mismatch: int = 0  # title/ep-title validation skipped (quality-only titles)
+    skipped_title_mismatch: int = 0
     dropped_dead_url: int = 0
     dropped_uncached: int = 0
     dropped_uncached_tb: int = 0
     dropped_android_magnets: int = 0
     dropped_iphone_magnets: int = 0
-    dropped_low_size_iphone: int = 0  # iPhone size gate drops (min size)
-    dropped_platform_specific: int = 0  # Total platform-specific drops (android+iphone)
-    client_platform: str = ""
+    dropped_low_size_iphone: int = 0
+    dropped_platform_specific: int = 0
+
+    # Dedup/output
     deduped: int = 0
     delivered: int = 0
 
-
-    # Cache summary (delivered only)
+    # Cache summary (delivered)
     cache_hit: int = 0
     cache_miss: int = 0
-    cache_rate: float = 0.0  # cache_hit/(cache_hit+cache_miss)
-    # Timing/diagnostics (ms). ms_fetch_* are wait times in this request (blocking time).
-    ms_fetch_aio: int = 0
-    ms_fetch_p2: int = 0
-    # Provider-reported fetch times (from provider meta); useful when ms_fetch_* is 0 due to cache.
-    ms_fetch_aio_remote: int = 0
-    ms_fetch_p2_remote: int = 0
+    cache_rate: float = 0.0
+
+    # Platform
+    client_platform: str = ""
+    platform: str = ""
+
+    # Timing (ms) — all monotonic based
+    ms_fetch_wall: int = 0           # wall time spent in get_streams()
+    ms_fetch_aio: int = 0            # wait time on AIO future (local)
+    ms_fetch_p2: int = 0             # wait time on P2 future (local)
+    ms_fetch_aio_remote: int = 0     # HTTP duration for AIO request (local)
+    ms_fetch_p2_remote: int = 0      # HTTP duration for P2 request (local)
+
     ms_tmdb: int = 0
-    ms_tb_api: int = 0
-    ms_tb_webdav: int = 0
-    ms_tb_usenet: int = 0
-    # Local processing timings (measured inside Python; includes CPU work after fetches)
-    ms_py_ff: int = 0              # total time inside filter_and_format
-    ms_py_dedup: int = 0           # dedup + best-pick loop
-    ms_py_wrap_emit: int = 0       # wrapping /r/<token> URLs + building final delivered list
-    ms_usenet_ready_match: int = 0 # difflib.SequenceMatcher comparisons for usenet readiness
-    ms_usenet_probe: int = 0      # direct usenet proxy byte-range probe (REAL vs STUB)
-
-
-    # Per-filter timings (ms)
     ms_title_mismatch: int = 0
     ms_uncached_check: int = 0
 
-    memory_peak_kb: int = 0  # ru_maxrss delta during request (kb on Linux)
+    ms_tb_api: int = 0
+    ms_tb_webdav: int = 0
+    ms_tb_usenet: int = 0
 
-    # Hash counts (diagnostics)
+    ms_usenet_ready_match: int = 0
+    ms_usenet_probe: int = 0
+
+    ms_py_ff: int = 0
+    ms_py_pre_wrap: int = 0
+    ms_py_pre_wrap_other: int = 0
+    ms_py_dedup: int = 0
+    ms_py_wrap_emit: int = 0
+    ms_py_tail: int = 0
+
+    ms_overhead: int = 0
+    ms_total: int = 0
+
+    # TorBox counters
     tb_api_hashes: int = 0
     tb_webdav_hashes: int = 0
     tb_usenet_hashes: int = 0
 
-    # RD heuristic marker counters (per-request; proves heuristic ran)
+    # RD heuristic counters
     rd_heur_calls: int = 0
     rd_heur_true: int = 0
     rd_heur_false: int = 0
     rd_heur_conf_sum: float = 0.0
 
-    # Debug/summary objects (kept small; used for logs and optional debug responses)
-    fetch_aio: Dict[str, Any] = field(default_factory=dict)
-    fetch_p2: Dict[str, Any] = field(default_factory=dict)
-    counts_in: Dict[str, Any] = field(default_factory=dict)
-    counts_out: Dict[str, Any] = field(default_factory=dict)
+    # Structured debug payloads
+    fetch_aio: dict = field(default_factory=dict)
+    fetch_p2: dict = field(default_factory=dict)
+    counts_in: dict = field(default_factory=dict)
+    counts_out: dict = field(default_factory=dict)
 
-    # Captured issues for weekly review
-    # Error breakdown (fetch/meta + exceptions)
+    # Flags & errors
+    flag_issues: list = field(default_factory=list)
+    error_reasons: list = field(default_factory=list)
     errors_timeout: int = 0
     errors_parse: int = 0
     errors_api: int = 0
 
-    error_reasons: List[str] = field(default_factory=list)
-    flag_issues: List[str] = field(default_factory=list)
+    # Memory (optional)
+    memory_peak_kb: int = 0
 
-
-    @property
-    def platform(self) -> str:
-        """Backward-compatible alias for older log strings that expect stats.platform."""
-        return self.client_platform
-
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, wait
-from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple
-import requests
-
-
-# Optional UA parsing (tiny pure-Python dep: `ua-parser`)
-try:
-    from ua_parser import parse as ua_parse  # pip install ua-parser
-    UA_PARSER_AVAILABLE = True
-except Exception:
-    ua_parse = None
-    UA_PARSER_AVAILABLE = False
-from flask import Flask, jsonify, g, has_request_context, request, make_response, Response, send_from_directory, abort
-from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from werkzeug.exceptions import HTTPException
@@ -5151,7 +5144,7 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
         meta["err"] = type(e).__name__
         return [], meta
     finally:
-        meta["ms"] = int((time.time() - t0) * 1000)
+        meta["ms"] = int((time.monotonic() - t0) * 1000)
 
 
 def get_streams_single(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float = REQUEST_TIMEOUT, no_retry: bool = False) -> tuple[list[dict[str, Any]], int, int, dict[str, Any]]:
@@ -6362,9 +6355,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         expected = {}
         stats.ms_tmdb = 0
     else:
-        t_tmdb0 = time.monotonic()
+        t_tmdb0 = time.time()
         expected = get_expected_metadata(type_, id_)
-        stats.ms_tmdb = int((time.monotonic() - t_tmdb0) * 1000)
+        stats.ms_tmdb = int((time.time() - t_tmdb0) * 1000)
 
 
     # parse season/episode from id for series (tmdb:123:1:3 or tt..:1:3)
@@ -6731,7 +6724,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # Optional: title/year validation gate (local similarity; useful to drop obvious mismatches)
     # Uses parsed title from classify() when available (streams often have empty s['title']).
     if (not fast_mode) and (not VALIDATE_OFF) and (TRAKT_VALIDATE_TITLES or TRAKT_STRICT_YEAR):
-        t_title0 = time.monotonic()
+        t_title0 = time.time()
         expected_title = (expected.get('title') or '').lower().strip()
         expected_ep_title = (expected.get('episode_title') or '').lower().strip()
         expected_year = expected.get('year')
@@ -6817,7 +6810,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         out_pairs = filtered_pairs
 
         try:
-            stats.ms_title_mismatch += int((time.monotonic() - t_title0) * 1000)
+            stats.ms_title_mismatch += int((time.time() - t_title0) * 1000)
         except Exception:
             pass
 
@@ -7714,9 +7707,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         if tb_hashes:
             try:
                 stats.tb_webdav_hashes = len(tb_hashes)
-                t_wd0 = time.monotonic()
+                t_wd0 = time.time()
                 webdav_ok = tb_webdav_batch_check(tb_hashes, stats)  # set of ok hashes
-                stats.ms_tb_webdav = int((time.monotonic() - t_wd0) * 1000)
+                stats.ms_tb_webdav = int((time.time() - t_wd0) * 1000)
             except _WebDavUnauthorized:
                 # Credentials missing/wrong in environment. Do NOT drop TB results.
                 webdav_ok = None
@@ -7831,7 +7824,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 t0 = time.monotonic()
                 # If both TorBox torrent and TorBox usenet checks are queued, run them concurrently.
                 if tb_usenet_should_run and tb_usenet_hashes_list:
-                    t_u0 = time.monotonic()
+                    t_u0 = time.time()
                     try:
                         _ex = ThreadPoolExecutor(max_workers=2)
                         _f_t = _ex.submit(tb_get_cached, tb_hashes_api)
@@ -7869,7 +7862,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                                 _ex.shutdown(wait=False, cancel_futures=True)
                             except Exception:
                                 pass
-                        stats.ms_tb_usenet = int((time.monotonic() - t_u0) * 1000)
+                        stats.ms_tb_usenet = int((time.time() - t_u0) * 1000)
                         tb_usenet_should_run = False
                     except Exception:
                         cached_map_raw = tb_get_cached(tb_hashes_api)
@@ -7917,9 +7910,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # If TorBox usenet cached check was deferred and not executed alongside TB torrent cached checks, run it now.
     if tb_usenet_should_run and tb_usenet_hashes_list:
         try:
-            t_u0 = time.monotonic()
+            t_u0 = time.time()
             usenet_cached_map = tb_get_usenet_cached(tb_usenet_hashes_list)
-            stats.ms_tb_usenet = int((time.monotonic() - t_u0) * 1000)
+            stats.ms_tb_usenet = int((time.time() - t_u0) * 1000)
         except Exception:
             pass
         tb_usenet_should_run = False
@@ -7984,7 +7977,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         # TorBox API cached check is performed above (runs even when VERIFY_CACHED_ONLY=false).
         # Here we only attach cached markers / enforce policy based on `cached_map`.
         # Attach cached markers to meta; in loose mode we do NOT hard-drop.
-        t_unc0 = time.monotonic()
+        t_unc0 = time.time()
         kept = []
         dropped_uncached = 0
         dropped_uncached_tb = 0
@@ -8102,7 +8095,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         stats.dropped_uncached_tb += dropped_uncached_tb
 
         try:
-            stats.ms_uncached_check += int((time.monotonic() - t_unc0) * 1000)
+            stats.ms_uncached_check += int((time.time() - t_unc0) * 1000)
         except Exception:
             pass
 
@@ -8783,7 +8776,7 @@ def stream(type_: str, id_: str):
             is_iphone=is_iphone,
             client_timeout_s=(ANDROID_STREAM_TIMEOUT if (is_android or is_iphone) else DESKTOP_STREAM_TIMEOUT),
         )
-        stats.ms_fetch_wall = int((time.monotonic() - t_fetch_wall0) * 1000)
+        fetch_wall_ms = int((time.monotonic() - t_fetch_wall0) * 1000)
 
         if prefiltered:
             out = streams
@@ -8798,6 +8791,10 @@ def stream(type_: str, id_: str):
                 is_android=is_android,
                 is_iphone=is_iphone,
             )
+
+        # get_streams() wall time (keep even when we short-circuit with cached/prefiltered stats)
+        stats.ms_fetch_wall = int(fetch_wall_ms or 0)
+
 
         # Ensure platform info survives prefiltered stats
         stats.client_platform = platform
