@@ -3021,6 +3021,7 @@ def _debug_log_full_streams(type_: str, id_: str, platform: str, out_for_client:
 @app.before_request
 def _before_request() -> None:
     g.request_id = str(uuid.uuid4())[:8]
+    logger.info("REQ_IN %s %s rid=%s mark=%s", request.method, request.path, _rid(), _mark())
     rl = _enforce_rate_limit()
     if rl:
         body, code = rl
