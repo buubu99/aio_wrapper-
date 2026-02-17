@@ -9082,6 +9082,9 @@ def stream(type_: str, id_: str):
 
         rid = _rid()
         mark = _mark()
+        ua_tok = getattr(g, "_cached_ua_tok", "")
+        ua_family = getattr(g, "_cached_ua_family", "")
+        ua_class = str(getattr(stats, "client_class", "") or platform or "unknown")
         logger.info(
             "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s platform=%s "
             "ua_tok=%s ua_family=%s type=%s id=%s served_cache=%s "
