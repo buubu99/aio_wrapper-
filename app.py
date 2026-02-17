@@ -8765,6 +8765,7 @@ def stream(type_: str, id_: str):
     platform = client_platform(is_android, is_iphone)
     stats.client_platform = platform
 
+    ua_class = platform  # for legacy logs/metrics
     cache_key = f"{type_}:{id_}"
     served_from_cache = False
     is_error = False
@@ -9082,9 +9083,6 @@ def stream(type_: str, id_: str):
 
         rid = _rid()
         mark = _mark()
-        ua_tok = getattr(g, "_cached_ua_tok", "")
-        ua_family = getattr(g, "_cached_ua_family", "")
-        ua_class = str(getattr(stats, "client_class", "") or platform or "unknown")
         logger.info(
             "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s platform=%s "
             "ua_tok=%s ua_family=%s type=%s id=%s served_cache=%s "
