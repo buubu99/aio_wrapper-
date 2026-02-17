@@ -6362,9 +6362,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         expected = {}
         stats.ms_tmdb = 0
     else:
-        t_tmdb0 = time.time()
+        t_tmdb0 = time.monotonic()
         expected = get_expected_metadata(type_, id_)
-        stats.ms_tmdb = int((time.time() - t_tmdb0) * 1000)
+        stats.ms_tmdb = int((time.monotonic() - t_tmdb0) * 1000)
 
 
     # parse season/episode from id for series (tmdb:123:1:3 or tt..:1:3)
@@ -6731,7 +6731,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # Optional: title/year validation gate (local similarity; useful to drop obvious mismatches)
     # Uses parsed title from classify() when available (streams often have empty s['title']).
     if (not fast_mode) and (not VALIDATE_OFF) and (TRAKT_VALIDATE_TITLES or TRAKT_STRICT_YEAR):
-        t_title0 = time.time()
+        t_title0 = time.monotonic()
         expected_title = (expected.get('title') or '').lower().strip()
         expected_ep_title = (expected.get('episode_title') or '').lower().strip()
         expected_year = expected.get('year')
@@ -6817,7 +6817,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         out_pairs = filtered_pairs
 
         try:
-            stats.ms_title_mismatch += int((time.time() - t_title0) * 1000)
+            stats.ms_title_mismatch += int((time.monotonic() - t_title0) * 1000)
         except Exception:
             pass
 
@@ -6858,7 +6858,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 if tmdb_id:
                     imdbid = _tmdb_external_imdb_id(type_, tmdb_id)
 
-            t0_ready = time.time()
+            t0_ready = time.monotonic()
             mode = "skip"
             if imdbid:
                 ready_titles = check_nzbgeek_readiness(imdbid)
@@ -6898,7 +6898,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     except Exception:
                         pass
 
-            stats.ms_tb_usenet += int((time.time() - t0_ready) * 1000)
+            stats.ms_tb_usenet += int((time.monotonic() - t0_ready) * 1000)
             try:
                 logger.info(
                     "NZBGEEK_DONE rid=%s mode=%s imdb=%s ready_titles=%s ms_tb_usenet=%s",
@@ -7714,9 +7714,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         if tb_hashes:
             try:
                 stats.tb_webdav_hashes = len(tb_hashes)
-                t_wd0 = time.time()
+                t_wd0 = time.monotonic()
                 webdav_ok = tb_webdav_batch_check(tb_hashes, stats)  # set of ok hashes
-                stats.ms_tb_webdav = int((time.time() - t_wd0) * 1000)
+                stats.ms_tb_webdav = int((time.monotonic() - t_wd0) * 1000)
             except _WebDavUnauthorized:
                 # Credentials missing/wrong in environment. Do NOT drop TB results.
                 webdav_ok = None
@@ -7828,10 +7828,10 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             tb_api_reason = "min_hashes"
         else:
             try:
-                t0 = time.time()
+                t0 = time.monotonic()
                 # If both TorBox torrent and TorBox usenet checks are queued, run them concurrently.
                 if tb_usenet_should_run and tb_usenet_hashes_list:
-                    t_u0 = time.time()
+                    t_u0 = time.monotonic()
                     try:
                         _ex = ThreadPoolExecutor(max_workers=2)
                         _f_t = _ex.submit(tb_get_cached, tb_hashes_api)
@@ -7869,7 +7869,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                                 _ex.shutdown(wait=False, cancel_futures=True)
                             except Exception:
                                 pass
-                        stats.ms_tb_usenet = int((time.time() - t_u0) * 1000)
+                        stats.ms_tb_usenet = int((time.monotonic() - t_u0) * 1000)
                         tb_usenet_should_run = False
                     except Exception:
                         cached_map_raw = tb_get_cached(tb_hashes_api)
@@ -7884,7 +7884,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                         cached_map[_nk] = v
                         if v:
                             _tb_known_cached_refresh(_nk, now_epoch, int(TB_KNOWN_CACHED_TTL or 0))
-                stats.ms_tb_api = int((time.time() - t0) * 1000)
+                stats.ms_tb_api = int((time.monotonic() - t0) * 1000)
                 stats.tb_api_hashes = len(tb_hashes_api)
                 tb_api_ran = True
                 tb_api_reason = "ok"
@@ -7917,9 +7917,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # If TorBox usenet cached check was deferred and not executed alongside TB torrent cached checks, run it now.
     if tb_usenet_should_run and tb_usenet_hashes_list:
         try:
-            t_u0 = time.time()
+            t_u0 = time.monotonic()
             usenet_cached_map = tb_get_usenet_cached(tb_usenet_hashes_list)
-            stats.ms_tb_usenet = int((time.time() - t_u0) * 1000)
+            stats.ms_tb_usenet = int((time.monotonic() - t_u0) * 1000)
         except Exception:
             pass
         tb_usenet_should_run = False
@@ -7984,7 +7984,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         # TorBox API cached check is performed above (runs even when VERIFY_CACHED_ONLY=false).
         # Here we only attach cached markers / enforce policy based on `cached_map`.
         # Attach cached markers to meta; in loose mode we do NOT hard-drop.
-        t_unc0 = time.time()
+        t_unc0 = time.monotonic()
         kept = []
         dropped_uncached = 0
         dropped_uncached_tb = 0
@@ -8102,7 +8102,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         stats.dropped_uncached_tb += dropped_uncached_tb
 
         try:
-            stats.ms_uncached_check += int((time.time() - t_unc0) * 1000)
+            stats.ms_uncached_check += int((time.monotonic() - t_unc0) * 1000)
         except Exception:
             pass
 
@@ -8757,7 +8757,7 @@ def stream(type_: str, id_: str):
     except Exception:
         mem_start = 0
 
-    t0 = time.time()
+    t0 = time.monotonic()
     stats = PipeStats()
 
     is_android = is_android_client()
