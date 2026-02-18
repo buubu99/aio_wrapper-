@@ -51,25 +51,15 @@ import threading
 import resource  # For memory tracking (ru_maxrss)
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, TimeoutError as FuturesTimeoutError
-import requests
-from flask import Flask, request, jsonify, make_response, Response, send_from_directory, g, has_request_context
-from flask_cors import CORS
-
-from functools import lru_cache
-
 
 # ---------------------------
 # Pipeline stats (required)
 # ---------------------------
 @dataclass
 class PipeStats:
-    # Input counts
     aio_in: int = 0
     prov2_in: int = 0
     merged_in: int = 0
-
-    # Drop counters
     dropped_error: int = 0
     dropped_missing_url: int = 0
     dropped_pollution: int = 0
@@ -83,83 +73,100 @@ class PipeStats:
     dropped_blacklist: int = 0
     dropped_fakes_db: int = 0
     dropped_title_mismatch: int = 0
-    skipped_title_mismatch: int = 0
+    skipped_title_mismatch: int = 0  # title/ep-title validation skipped (quality-only titles)
     dropped_dead_url: int = 0
     dropped_uncached: int = 0
     dropped_uncached_tb: int = 0
     dropped_android_magnets: int = 0
     dropped_iphone_magnets: int = 0
-    dropped_low_size_iphone: int = 0
-    dropped_platform_specific: int = 0
-
-    # Dedup/output
+    dropped_low_size_iphone: int = 0  # iPhone size gate drops (min size)
+    dropped_platform_specific: int = 0  # Total platform-specific drops (android+iphone)
+    client_platform: str = ""
+    platform: str = ""
     deduped: int = 0
     delivered: int = 0
 
-    # Cache summary (delivered)
+
+    # Cache summary (delivered only)
     cache_hit: int = 0
     cache_miss: int = 0
-    cache_rate: float = 0.0
-
-    # Platform
-    client_platform: str = ""
-    platform: str = ""
-
-    # Timing (ms) — all monotonic based
-    ms_fetch_wall: int = 0           # wall time spent in get_streams()
-    ms_fetch_aio: int = 0            # wait time on AIO future (local)
-    ms_fetch_p2: int = 0             # wait time on P2 future (local)
-    ms_fetch_aio_remote: int = 0     # HTTP duration for AIO request (local)
-    ms_fetch_p2_remote: int = 0      # HTTP duration for P2 request (local)
-
+    cache_rate: float = 0.0  # cache_hit/(cache_hit+cache_miss)
+    # Timing/diagnostics (ms). ms_fetch_* are wait times in this request (blocking time).
+    ms_fetch_aio: int = 0
+    ms_fetch_p2: int = 0
+    # Provider-reported fetch times (from provider meta); useful when ms_fetch_* is 0 due to cache.
+    ms_fetch_aio_remote: int = 0
+    ms_fetch_p2_remote: int = 0
     ms_tmdb: int = 0
-    ms_title_mismatch: int = 0
-    ms_uncached_check: int = 0
-
     ms_tb_api: int = 0
     ms_tb_webdav: int = 0
     ms_tb_usenet: int = 0
+    # Local processing timings (measured inside Python; includes CPU work after fetches)
+    ms_py_ff: int = 0              # total time inside filter_and_format
+    ms_py_dedup: int = 0           # dedup + best-pick loop
+    ms_py_wrap_emit: int = 0       # wrapping /r/<token> URLs + building final delivered list
+    ms_fetch_wall: int = 0         # wall-clock time around provider fetch phase
+    ms_overhead: int = 0           # ms_total minus known phases (approx)
+    ms_total: int = 0              # total request duration (monotonic)
+    ms_usenet_ready_match: int = 0 # difflib.SequenceMatcher comparisons for usenet readiness
+    ms_usenet_probe: int = 0      # direct usenet proxy byte-range probe (REAL vs STUB)
 
-    ms_usenet_ready_match: int = 0
-    ms_usenet_probe: int = 0
+    ms_usenet_probe_fail_reasons: dict = field(default_factory=dict)  # e.g., {'STUB_LEN': 5}
 
-    ms_py_ff: int = 0
-    ms_py_pre_wrap: int = 0
-    ms_py_pre_wrap_other: int = 0
-    ms_py_dedup: int = 0
-    ms_py_wrap_emit: int = 0
-    ms_py_tail: int = 0
 
-    ms_overhead: int = 0
-    ms_total: int = 0
+    # Per-filter timings (ms)
+    ms_title_mismatch: int = 0
+    ms_uncached_check: int = 0
 
-    # TorBox counters
+    memory_peak_kb: int = 0  # ru_maxrss delta during request (kb on Linux)
+
+    # Hash counts (diagnostics)
     tb_api_hashes: int = 0
     tb_webdav_hashes: int = 0
     tb_usenet_hashes: int = 0
 
-    # RD heuristic counters
+    # RD heuristic marker counters (per-request; proves heuristic ran)
     rd_heur_calls: int = 0
     rd_heur_true: int = 0
     rd_heur_false: int = 0
     rd_heur_conf_sum: float = 0.0
 
-    # Structured debug payloads
-    fetch_aio: dict = field(default_factory=dict)
-    fetch_p2: dict = field(default_factory=dict)
-    counts_in: dict = field(default_factory=dict)
-    counts_out: dict = field(default_factory=dict)
+    # Debug/summary objects (kept small; used for logs and optional debug responses)
+    fetch_aio: Dict[str, Any] = field(default_factory=dict)
+    fetch_p2: Dict[str, Any] = field(default_factory=dict)
+    counts_in: Dict[str, Any] = field(default_factory=dict)
+    counts_out: Dict[str, Any] = field(default_factory=dict)
 
-    # Flags & errors
-    flag_issues: list = field(default_factory=list)
-    error_reasons: list = field(default_factory=list)
+    # Captured issues for weekly review
+    # Error breakdown (fetch/meta + exceptions)
     errors_timeout: int = 0
     errors_parse: int = 0
     errors_api: int = 0
 
-    # Memory (optional)
-    memory_peak_kb: int = 0
+    error_reasons: List[str] = field(default_factory=list)
+    flag_issues: List[str] = field(default_factory=list)
 
+def _set_stats_platform(stats: PipeStats, platform: str) -> None:
+    """Keep platform fields in sync (client_platform + platform)."""
+    stats.client_platform = platform
+    stats.platform = platform
+
+
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, wait
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Tuple
+import requests
+
+
+# Optional UA parsing (tiny pure-Python dep: `ua-parser`)
+try:
+    from ua_parser import parse as ua_parse  # pip install ua-parser
+    UA_PARSER_AVAILABLE = True
+except Exception:
+    ua_parse = None
+    UA_PARSER_AVAILABLE = False
+from flask import Flask, jsonify, g, has_request_context, request, make_response, Response, send_from_directory, abort
+from flask_cors import CORS
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from werkzeug.exceptions import HTTPException
@@ -335,16 +342,16 @@ REQUEST_TIMEOUT = _safe_float(os.environ.get('REQUEST_TIMEOUT', '30'), 30.0)
 CACHE_TTL = _safe_int(os.environ.get('CACHE_TTL', '600'), 600)
 
 # Client-side time budgets (seconds). These are upper bounds; we return as soon as we have results.
-ANDROID_STREAM_TIMEOUT = _safe_float(os.environ.get('ANDROID_STREAM_TIMEOUT', '20'), 20.0)
-DESKTOP_STREAM_TIMEOUT = _safe_float(os.environ.get('DESKTOP_STREAM_TIMEOUT', '15'), 15.0)
+ANDROID_STREAM_TIMEOUT = _safe_float(os.environ.get('ANDROID_STREAM_TIMEOUT', '20'), 20.0)  # FIXED: increase default
+DESKTOP_STREAM_TIMEOUT = _safe_float(os.environ.get('DESKTOP_STREAM_TIMEOUT', '30'), 30.0)  # FIXED: increase default
 EMPTY_UA_IS_ANDROID = _parse_bool(os.environ.get('EMPTY_UA_IS_ANDROID', 'false'), False)  # treat blank UA as Android
 
 # Upstream fetch timeouts (seconds) used inside /stream.
 # We keep P2 tighter because it can hang and trigger Gunicorn worker aborts if retries are enabled.
-ANDROID_AIO_TIMEOUT = _safe_float(os.environ.get('ANDROID_AIO_TIMEOUT', '18'), 18.0)
-ANDROID_P2_TIMEOUT = _safe_float(os.environ.get('ANDROID_P2_TIMEOUT', '8'), 8.0)
-DESKTOP_AIO_TIMEOUT = _safe_float(os.environ.get('DESKTOP_AIO_TIMEOUT', '18'), 18.0)
-DESKTOP_P2_TIMEOUT = _safe_float(os.environ.get('DESKTOP_P2_TIMEOUT', '6'), 6.0)
+ANDROID_AIO_TIMEOUT = _safe_float(os.environ.get('ANDROID_AIO_TIMEOUT', '18'), 18.0)  # FIXED: increase default
+ANDROID_P2_TIMEOUT = _safe_float(os.environ.get('ANDROID_P2_TIMEOUT', '12'), 12.0)  # FIXED: increase default
+DESKTOP_AIO_TIMEOUT = _safe_float(os.environ.get('DESKTOP_AIO_TIMEOUT', '28'), 28.0)  # FIXED: increase default
+DESKTOP_P2_TIMEOUT = _safe_float(os.environ.get('DESKTOP_P2_TIMEOUT', '15'), 15.0)  # FIXED: increase default
 
 # TorBox API call timeout (seconds) used during cache checks.
 TB_API_TIMEOUT = _safe_float(os.environ.get('TB_API_TIMEOUT', '8'), 8.0)
@@ -372,7 +379,7 @@ USENET_PROBE_BUDGET_S = _safe_float(os.environ.get("USENET_PROBE_BUDGET_S", "8.5
 USENET_PROBE_DROP_FAILS = _parse_bool(os.environ.get("USENET_PROBE_DROP_FAILS", "1"), True)  # drop probed non-REAL links (STUB/ERR)
 USENET_PROBE_REAL_TOP10_PCT = _safe_float(os.environ.get("USENET_PROBE_REAL_TOP10_PCT", "0.5"), 0.5)
 USENET_PROBE_REAL_TOP20_N = _safe_int(os.environ.get("USENET_PROBE_REAL_TOP20_N", "20"), 20)
-USENET_PROBE_RETRIES = _safe_int(os.environ.get("USENET_PROBE_RETRIES", "2"), 2)
+USENET_PROBE_RETRIES = _safe_int(os.environ.get("USENET_PROBE_RETRIES", str(VERIFY_RETRIES)), int(VERIFY_RETRIES))
 USENET_PROBE_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY", "20"), 20)
 USENET_PROBE_RANGE_END = _safe_int(os.environ.get("USENET_PROBE_RANGE_END", "16440"), 16440)
 # If we read exactly this many bytes back from the range probe, treat it as a "stub".
@@ -451,6 +458,16 @@ WRAPPER_DEDUP = _parse_bool(os.environ.get("WRAPPER_DEDUP", "true"), True)
 VERIFY_STREAM = _parse_bool(os.environ.get("VERIFY_STREAM", "false"), False)  # env-driven; default off
 VERIFY_STREAM_TIMEOUT = _safe_float(os.environ.get('VERIFY_STREAM_TIMEOUT', '4'), 4.0)
 
+# Probe/verify tuning knobs (shared)
+VERIFY_RETRIES = _safe_int(os.environ.get("VERIFY_RETRIES", "0"), 0)  # 0 for fast/no-retry
+VERIFY_MAX_WORKERS = _safe_int(os.environ.get("VERIFY_MAX_WORKERS", "32"), 32)
+VERIFY_SNIFF_BYTES = _safe_int(os.environ.get("VERIFY_SNIFF_BYTES", "64"), 64)
+
+# Extra verify controls (optional; used for placeholder/stub protection)
+VERIFY_DROP_STUBS = _parse_bool(os.environ.get("VERIFY_DROP_STUBS", "0"), False)
+VERIFY_STUB_MAX_BYTES_RAW = (os.environ.get("VERIFY_STUB_MAX_BYTES", "") or "").strip()
+VERIFY_STUB_MAX_BYTES = _safe_int(VERIFY_STUB_MAX_BYTES_RAW or "16384", 16384)
+
 # Stronger playback verification (catches upstream /static/500.mp4 placeholders)
 VERIFY_RANGE = _parse_bool(os.environ.get("VERIFY_RANGE", "true"), True)
 ANDROID_VERIFY_TOP_N = _safe_int(os.environ.get('ANDROID_VERIFY_TOP_N', '6'), 6)
@@ -474,6 +491,17 @@ FAKES_DB_URL = os.environ.get("FAKES_DB_URL", "")
 
 # Optional: simple rate-limit (e.g. "30/m", "5/s"). Blank disables it.
 RATE_LIMIT = (os.environ.get("RATE_LIMIT", "") or "").strip()
+# Validate critical env (makes missing config obvious in Render logs)
+if not AIO_BASE:
+    logger.error("Missing AIO_BASE - app will have no streams")
+if not TB_API_KEY:
+    logger.warning("Missing TB_API_KEY - TB features disabled")
+if VERIFY_DROP_STUBS and not VERIFY_STUB_MAX_BYTES_RAW:
+    logger.warning(
+        "VERIFY_DROP_STUBS enabled but no VERIFY_STUB_MAX_BYTES - using default %s",
+        VERIFY_STUB_MAX_BYTES,
+    )
+
 
 
 # ---------- FETCH EXECUTOR + AIO CACHE ----------
@@ -955,9 +983,9 @@ def _verify_stream_url(
     pen_stub = _safe_int(os.environ.get("VERIFY_PEN_STUB", "120"), 120)
     pen_atoms_bad = _safe_int(os.environ.get("VERIFY_PEN_MP4_ATOMS_BAD", "60"), 60)
 
-    # STUB threshold: default 2MB unless overridden (tune later)
-    stub_max = _safe_int(os.environ.get("VERIFY_STUB_MAX_BYTES", "2097152"), 2097152)
-    drop_stubs = str(os.environ.get("VERIFY_DROP_STUBS", "0")).strip() in {"1", "true", "yes", "on"}
+    # STUB threshold (bytes). Small default keeps verification fast.
+    stub_max = VERIFY_STUB_MAX_BYTES
+    drop_stubs = VERIFY_DROP_STUBS
 
     risky_servers = [
         t.strip().lower()
@@ -969,7 +997,7 @@ def _verify_stream_url(
     # Resolve short /r token if needed
     if not url:
         return (False, 0, "EMPTY_URL")
-    if url.startswith("/r/"):
+    if "/r/" in url:
         u2 = _unwrap_short_url(url)
         if u2:
             url = u2
@@ -1326,25 +1354,28 @@ def _probe_auth_headers_for_url(u: str) -> Dict[str, str]:
 
 
 def shannon_entropy(data: bytes) -> float:
-    """Shannon entropy (bits/byte) for small byte buffers."""
+    """Shannon entropy in bits/byte (0..8) for small byte buffers.
+
+    Very low entropy (roughly <~3.0) often indicates structured stubs (HTML/JSON error pages, proxy placeholders),
+    while higher entropy tends to look more like real media bytes.
+    """
     try:
         if not data:
             return 0.0
-        # Limit work (probe buffers are already small, but be safe).
         buf = data[:65536]
-        from collections import Counter
-        import math
+        counts = [0] * 256
+        for b in buf:
+            counts[b] += 1
         n = float(len(buf))
-        c = Counter(buf)
+        import math
         ent = 0.0
-        for cnt in c.values():
-            p = float(cnt) / n
-            if p > 0.0:
+        for cnt in counts:
+            if cnt:
+                p = float(cnt) / n
                 ent -= p * math.log(p, 2)
         return float(ent)
     except Exception:
         return 0.0
-
 
 def sniff_magic(data: bytes) -> str:
     """Very cheap content sniffing for proxy stubs (HTML/JSON/XML-ish vs unknown)."""
@@ -1555,7 +1586,7 @@ def _apply_usenet_playability_probe(
     if not cand:
         return pairs
 
-    max_workers = max(1, min(int(concurrency or 1), len(cand)))
+    max_workers = max(1, min(int(concurrency or 1), len(cand), int(VERIFY_MAX_WORKERS or 1)))
     target = max(0, int(target_real or 0))
     budget = max(0.5, float(budget_s or 0.0))
     deadline = float(time.monotonic()) + float(budget)
@@ -1627,6 +1658,15 @@ def _apply_usenet_playability_probe(
                 err_idx.append(i)
                 m["usenet_probe"] = "ERR"
             m["usenet_probe_reason"] = str(reason)
+            # Track why probes failed (counts by reason) for debugging/metrics.
+            if stats is not None:
+                try:
+                    _d = getattr(stats, "ms_usenet_probe_fail_reasons", None)
+                    if isinstance(_d, dict):
+                        _r = str(reason)
+                        _d[_r] = int(_d.get(_r, 0)) + 1
+                except Exception:
+                    pass
             m["usenet_probe_bytes"] = int(nbytes or 0)
             # Demote hard so these don't occupy top spots.
             try:
@@ -2410,25 +2450,49 @@ def _wrap_url_load(token: str) -> Optional[str]:
 
 
 def _unwrap_short_url(u: str) -> Optional[str]:
-    """Best-effort: convert our short /r/<token> URLs back to the stored upstream URL."""
+    """Best-effort: convert our short /r/<token> URLs back to the stored upstream URL.
+
+    Only meaningful when WRAP_URL_SHORT is enabled; otherwise returns None.
+    Handles either a relative '/r/<token>' or an absolute URL whose path contains '/r/<token>'.
+    """
     try:
         if not u:
             return None
+        # If short URLs are disabled, nothing to unwrap.
+        if not globals().get("WRAP_URL_SHORT", True):
+            return None
+
         token = ""
+
+        # Relative form
         if u.startswith("/r/"):
             token = u.split("/r/", 1)[1]
         else:
-            # Handle absolute URLs that contain /r/<token>
+            # Absolute URLs that contain /r/<token> in their path
             from urllib.parse import urlparse
             p = urlparse(u)
             path = p.path or ""
             if "/r/" in path:
                 token = path.split("/r/", 1)[1]
+
         if not token:
             return None
-        token = token.split("?", 1)[0].split("#", 1)[0].strip()
+
+        # Drop query/hash and any additional path segments after the token
+        token = token.split("?", 1)[0].split("#", 1)[0].split("/", 1)[0].strip()
         if not token:
             return None
+
+        # Token may be URL-encoded in some clients
+        try:
+            from urllib.parse import unquote
+            token = unquote(token)
+        except Exception:
+            pass
+
+        if not token:
+            return None
+
         return _wrap_url_load(token)
     except Exception:
         return None
@@ -3020,7 +3084,7 @@ def _debug_log_full_streams(type_: str, id_: str, platform: str, out_for_client:
 @app.before_request
 def _before_request() -> None:
     g.request_id = str(uuid.uuid4())[:8]
-    logger.info("REQ_IN %s %s rid=%s mark=%s", request.method, request.path, _rid(), _mark())
+    logger.info("REQ_IN %s %s rid=%s mark=%s ua=%s", request.method, request.path, _rid(), _mark(), _safe_ua(request.headers.get("User-Agent")) )
     rl = _enforce_rate_limit()
     if rl:
         body, code = rl
@@ -5092,7 +5156,7 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
       - tag, ok, status, bytes, count, ms, err
     """
     meta: dict[str, Any] = {"tag": str(tag), "ok": False, "status": 0, "bytes": 0, "count": 0, "ms": 0, "err": ""}
-    t0 = time.monotonic()  # wall-clock for this request (monotonic)
+    t0 = time.monotonic()
     if not base:
         meta["err"] = "no_base"
         return [], meta
@@ -6309,7 +6373,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     stats.merged_in = len(streams)
     # Client platform + per-request TorBox hash budget
     platform = stats.client_platform or client_platform(is_android=is_android, is_iphone=is_iphone)
-    stats.client_platform = platform
+    _set_stats_platform(stats, platform)
     tb_max_hashes = _choose_tb_max_hashes(platform)
 
     iphone_usenet_mode = bool(is_iphone and IPHONE_USENET_ONLY)
@@ -6361,9 +6425,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         expected = {}
         stats.ms_tmdb = 0
     else:
-        t_tmdb0 = time.time()
+        t_tmdb0 = time.monotonic()
         expected = get_expected_metadata(type_, id_)
-        stats.ms_tmdb = int((time.time() - t_tmdb0) * 1000)
+        stats.ms_tmdb = int((time.monotonic() - t_tmdb0) * 1000)
 
 
     # parse season/episode from id for series (tmdb:123:1:3 or tt..:1:3)
@@ -6730,7 +6794,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # Optional: title/year validation gate (local similarity; useful to drop obvious mismatches)
     # Uses parsed title from classify() when available (streams often have empty s['title']).
     if (not fast_mode) and (not VALIDATE_OFF) and (TRAKT_VALIDATE_TITLES or TRAKT_STRICT_YEAR):
-        t_title0 = time.time()
+        t_title0 = time.monotonic()
         expected_title = (expected.get('title') or '').lower().strip()
         expected_ep_title = (expected.get('episode_title') or '').lower().strip()
         expected_year = expected.get('year')
@@ -6816,7 +6880,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         out_pairs = filtered_pairs
 
         try:
-            stats.ms_title_mismatch += int((time.time() - t_title0) * 1000)
+            stats.ms_title_mismatch += int((time.monotonic() - t_title0) * 1000)
         except Exception:
             pass
 
@@ -7345,7 +7409,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         except Exception:
             pass
 
-        logger.info("POST_SORT_TOP rid=%s mark=%s topN=%s", _rid(), _mark(), proof_n)
+        logger.info("POST_SORT_TOP rid=%s mark=%s topN=%s", _rid(), req_mark, proof_n)
         for x in topn:
             sk = x.get("sort_key") or ()
             sk0 = sk[0] if len(sk) > 0 else None
@@ -7356,7 +7420,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 "POST_SORT_ITEM rid=%s mark=%s r=%s prov=%s stack=%s res=%s size_gb=%s "
                 "b=%s p1=%s inst=%s ready=%s cached=%s tc=%s tp=%s cbh=%s pbh=%s cm=%s pm=%s "
                 "sk0=%s sk1=%s sk2=%s sk3=%s",
-                _rid(), _mark(), x.get("rank"), x.get("prov"), x.get("stack"), x.get("res"), x.get("size_gb"),
+                _rid(), req_mark, x.get("rank"), x.get("prov"), x.get("stack"), x.get("res"), x.get("size_gb"),
                 x.get("p1_bucket"), x.get("p1_class"), x.get("instant"), x.get("ready"), x.get("cached"),
                 x.get("tagged_cached"), x.get("tagged_proxied"), x.get("cached_bh"), x.get("proxied_bh"),
                 x.get("cached_m"), x.get("proxied_m"), sk0, sk1, sk2, sk3,
@@ -7392,12 +7456,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             except Exception:
                 aio_cached = None
                 aio_proxied = None
-            ready_flag = False
             if USE_AIO_READY and (aio_cached is not None) and (aio_proxied is not None):
-                try:
-                    ready_flag = bool(aio.get('ready', False)) if isinstance(aio, dict) else False
-                except Exception:
-                    ready_flag = False
                 super_instant = 0 if ((aio_cached is True and aio_proxied is True) or ready_flag) else 1
             else:
                 super_instant = 0 if (("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) or ("C:TRUE" in desc_u and ("P:TRUE" in desc_u or _is_controlled_playback_url(s.get("url") if isinstance(s, dict) else None)))) else 1
@@ -7713,9 +7772,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         if tb_hashes:
             try:
                 stats.tb_webdav_hashes = len(tb_hashes)
-                t_wd0 = time.time()
+                t_wd0 = time.monotonic()
                 webdav_ok = tb_webdav_batch_check(tb_hashes, stats)  # set of ok hashes
-                stats.ms_tb_webdav = int((time.time() - t_wd0) * 1000)
+                stats.ms_tb_webdav = int((time.monotonic() - t_wd0) * 1000)
             except _WebDavUnauthorized:
                 # Credentials missing/wrong in environment. Do NOT drop TB results.
                 webdav_ok = None
@@ -7830,7 +7889,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 t0 = time.monotonic()
                 # If both TorBox torrent and TorBox usenet checks are queued, run them concurrently.
                 if tb_usenet_should_run and tb_usenet_hashes_list:
-                    t_u0 = time.time()
+                    t_u0 = time.monotonic()
                     try:
                         _ex = ThreadPoolExecutor(max_workers=2)
                         _f_t = _ex.submit(tb_get_cached, tb_hashes_api)
@@ -7868,7 +7927,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                                 _ex.shutdown(wait=False, cancel_futures=True)
                             except Exception:
                                 pass
-                        stats.ms_tb_usenet = int((time.time() - t_u0) * 1000)
+                        stats.ms_tb_usenet = int((time.monotonic() - t_u0) * 1000)
                         tb_usenet_should_run = False
                     except Exception:
                         cached_map_raw = tb_get_cached(tb_hashes_api)
@@ -7916,9 +7975,9 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # If TorBox usenet cached check was deferred and not executed alongside TB torrent cached checks, run it now.
     if tb_usenet_should_run and tb_usenet_hashes_list:
         try:
-            t_u0 = time.time()
+            t_u0 = time.monotonic()
             usenet_cached_map = tb_get_usenet_cached(tb_usenet_hashes_list)
-            stats.ms_tb_usenet = int((time.time() - t_u0) * 1000)
+            stats.ms_tb_usenet = int((time.monotonic() - t_u0) * 1000)
         except Exception:
             pass
         tb_usenet_should_run = False
@@ -7983,7 +8042,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         # TorBox API cached check is performed above (runs even when VERIFY_CACHED_ONLY=false).
         # Here we only attach cached markers / enforce policy based on `cached_map`.
         # Attach cached markers to meta; in loose mode we do NOT hard-drop.
-        t_unc0 = time.time()
+        t_unc0 = time.monotonic()
         kept = []
         dropped_uncached = 0
         dropped_uncached_tb = 0
@@ -8101,7 +8160,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         stats.dropped_uncached_tb += dropped_uncached_tb
 
         try:
-            stats.ms_uncached_check += int((time.time() - t_unc0) * 1000)
+            stats.ms_uncached_check += int((time.monotonic() - t_unc0) * 1000)
         except Exception:
             pass
 
@@ -8342,9 +8401,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 })
         except Exception:
             _wrapped_url_map = {}
-    t_pre_wrap = time.monotonic()
-    stats.ms_py_pre_wrap = int((t_pre_wrap - t_ff0) * 1000)
-    t_wrap0 = t_pre_wrap
+    t_wrap0 = time.monotonic()
     for s, m in candidates[:deliver_cap_eff]:
         h = (m.get("infohash") or "").lower().strip()
         cached_marker = m.get("cached")
@@ -8482,8 +8539,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 d.get("name"),
             )
 
-    t_after_wrap = time.monotonic()
-    stats.ms_py_wrap_emit = int((t_after_wrap - t_wrap0) * 1000)
+    stats.ms_py_wrap_emit = int((time.monotonic() - t_wrap0) * 1000)
     stats.delivered = len(delivered)
 
     # Cache summary (delivered streams only): keep WRAP_STATS aligned with WRAP_COUNTS out.cached
@@ -8570,22 +8626,6 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         pass
 
     stats.ms_py_ff = int((time.monotonic() - t_ff0) * 1000)
-    # Derived: make py_ff math integer-perfect
-    try:
-        stats.ms_py_tail = max(
-            0,
-            int(stats.ms_py_ff) - int(stats.ms_py_pre_wrap or 0) - int(stats.ms_py_wrap_emit or 0),
-        )
-        known_inside_pre = (
-            int(stats.ms_title_mismatch or 0)
-            + int(stats.ms_uncached_check or 0)
-            + int(stats.ms_py_dedup or 0)
-            + int(stats.ms_usenet_ready_match or 0)
-            + int(stats.ms_usenet_probe or 0)
-        )
-        stats.ms_py_pre_wrap_other = max(0, int(stats.ms_py_pre_wrap or 0) - known_inside_pre)
-    except Exception:
-        pass
     # Clear TLS stats pointer to avoid leaking across requests
     try:
         if hasattr(_TLS, "stats"):
@@ -8757,14 +8797,13 @@ def stream(type_: str, id_: str):
         mem_start = 0
 
     t0 = time.monotonic()
+    fetch_wall_ms = 0
     stats = PipeStats()
 
     is_android = is_android_client()
     is_iphone = is_iphone_client()
     platform = client_platform(is_android, is_iphone)
-    stats.client_platform = platform
-
-    ua_class = platform  # for legacy logs/metrics
+    _set_stats_platform(stats, platform)
     cache_key = f"{type_}:{id_}"
     served_from_cache = False
     is_error = False
@@ -8782,6 +8821,7 @@ def stream(type_: str, id_: str):
             is_iphone=is_iphone,
             client_timeout_s=(ANDROID_STREAM_TIMEOUT if (is_android or is_iphone) else DESKTOP_STREAM_TIMEOUT),
         )
+
         fetch_wall_ms = int((time.monotonic() - t_fetch_wall0) * 1000)
 
         if prefiltered:
@@ -8798,13 +8838,8 @@ def stream(type_: str, id_: str):
                 is_iphone=is_iphone,
             )
 
-        # get_streams() wall time (keep even when we short-circuit with cached/prefiltered stats)
-        stats.ms_fetch_wall = int(fetch_wall_ms or 0)
-
-
         # Ensure platform info survives prefiltered stats
-        stats.client_platform = platform
-
+        _set_stats_platform(stats, platform)
         # Memory tracking (ru_maxrss delta; kb on Linux)
         try:
             mem_end = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss or 0)
@@ -8933,6 +8968,9 @@ def stream(type_: str, id_: str):
                                     "py_wrap_emit": int(getattr(stats, "ms_py_wrap_emit", 0) or 0),
                                     "usenet_ready_match": int(getattr(stats, "ms_usenet_ready_match", 0) or 0),
                                     "usenet_probe": int(getattr(stats, "ms_usenet_probe", 0) or 0),
+                                    "usenet_probe": int(getattr(stats, "ms_fetch_wall", 0) or 0),
+                                    "usenet_probe": max(int(getattr(stats, "ms_py_ff", 0) or 0) - int(getattr(stats, "ms_py_wrap_emit", 0) or 0), 0),
+                                    "usenet_probe": int(getattr(stats, "ms_overhead", 0) or 0),
                                 },
                                 "remote_ms": {"aio": aio_remote_ms, "p2": p2_remote_ms},
                                 "wait_ms": {"aio": aio_wait_ms, "p2": p2_wait_ms},
@@ -9037,6 +9075,11 @@ def stream(type_: str, id_: str):
         return jsonify(payload), 200
 
     finally:
+        try:
+            stats.ms_fetch_wall = int(fetch_wall_ms or 0)
+        except Exception:
+            pass
+
         # Slow-phase flags (add late so ms_fetch_* is filled)
         try:
             if int(stats.ms_fetch_aio or 0) >= int(FLAG_SLOW_AIO_MS):
@@ -9059,12 +9102,29 @@ def stream(type_: str, id_: str):
             pass
 
         ms_total = int((time.monotonic() - t0) * 1000)
-        stats.ms_total = ms_total
-        # Residual overhead so (fetch_wall + tmdb + py_ff + overhead) == total (integer-perfect)
+
         try:
-            stats.ms_overhead = max(0, int(ms_total) - int(stats.ms_fetch_wall or 0) - int(stats.ms_tmdb or 0) - int(stats.ms_py_ff or 0))
+            stats.ms_total = int(ms_total or 0)
         except Exception:
             pass
+        try:
+            _sum = 0
+            _sum += int(getattr(stats, "ms_fetch_wall", 0) or 0)
+            _sum += int(getattr(stats, "ms_py_ff", 0) or 0)
+            _sum += int(getattr(stats, "ms_py_dedup", 0) or 0)
+            _sum += int(getattr(stats, "ms_py_wrap_emit", 0) or 0)
+            _sum += int(getattr(stats, "ms_tmdb", 0) or 0)
+            _sum += int(getattr(stats, "ms_tb_api", 0) or 0)
+            _sum += int(getattr(stats, "ms_tb_webdav", 0) or 0)
+            _sum += int(getattr(stats, "ms_tb_usenet", 0) or 0)
+            _sum += int(getattr(stats, "ms_title_mismatch", 0) or 0)
+            _sum += int(getattr(stats, "ms_uncached_check", 0) or 0)
+            _sum += int(getattr(stats, "ms_usenet_ready_match", 0) or 0)
+            _sum += int(getattr(stats, "ms_usenet_probe", 0) or 0)
+            stats.ms_overhead = max(0, int(ms_total) - int(_sum))
+        except Exception:
+            pass
+
 
         # Global stats update
         _update_global_stats(
@@ -9084,57 +9144,42 @@ def stream(type_: str, id_: str):
         except Exception:
             pass
 
-        rid = _rid()
-        mark = _mark()
-        try:
-            logger.info(
-                "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s ua_class=%s platform=%s "
-                "ua_tok=%s ua_family=%s type=%s id=%s served_cache=%s "
-                "fetch_wall_ms=%s aio_wait_ms=%s p2_wait_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s "
-                "tmdb_ms=%s "
-                "py_ff_ms=%s py_pre_wrap_ms=%s py_pre_wrap_other_ms=%s py_dedup_ms=%s "
-                "usenet_ready_match_ms=%s usenet_probe_ms=%s py_wrap_emit_ms=%s py_tail_ms=%s "
-                "overhead_ms=%s total_ms=%s sum_ms=%s delta_ms=%s",
-                rid,
-                mark,
-                BUILD,
-                GIT_COMMIT,
-                request.path,
-                ua_class,
-                platform,
-                getattr(g, "_cached_ua_tok", ""),
-                getattr(g, "_cached_ua_family", ""),
-                type_,
-                id_,
-                bool(served_from_cache),
-                int(stats.ms_fetch_wall or 0),
-                int(stats.ms_fetch_aio or 0),
-                int(stats.ms_fetch_p2 or 0),
-                int(stats.ms_fetch_aio_remote or 0),
-                int(stats.ms_fetch_p2_remote or 0),
-                int(stats.ms_tmdb or 0),
-                int(stats.ms_py_ff or 0),
-                int(stats.ms_py_pre_wrap or 0),
-                int(stats.ms_py_pre_wrap_other or 0),
-                int(stats.ms_py_dedup or 0),
-                int(stats.ms_usenet_ready_match or 0),
-                int(stats.ms_usenet_probe or 0),
-                int(stats.ms_py_wrap_emit or 0),
-                int(stats.ms_py_tail or 0),
-                int(stats.ms_overhead or 0),
-                int(stats.ms_total or ms_total or 0),
-                int((int(stats.ms_fetch_wall or 0) + int(stats.ms_tmdb or 0) + int(stats.ms_py_ff or 0) + int(stats.ms_overhead or 0))),
-                int((int(stats.ms_total or ms_total or 0) - (int(stats.ms_fetch_wall or 0) + int(stats.ms_tmdb or 0) + int(stats.ms_py_ff or 0) + int(stats.ms_overhead or 0)))),
-            )
-        except Exception as e:
-            logger.debug("WRAP_TIMING_LOG_FAIL rid=%s err=%s", rid, e)
+        logger.info(
+            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s client_platform=%s platform=%s ua_tok=%s ua_family=%s type=%s id=%s cache=%s aio_wait_ms=%s p2_wait_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s tmdb_ms=%s tb_api_ms=%s tb_webdav_ms=%s tb_usenet_ms=%s title_mismatch_ms=%s uncached_ms=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s mem_kb=%s ms_py_ff=%s ms_py_dedup=%s ms_py_wrap_emit=%s ms_usenet_ready_match=%s ms_usenet_probe=%s fetch_wall_ms=%s py_pre_wrap_ms=%s overhead_ms=%s",
+            _rid(), _mark(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
+            platform,
+            getattr(g, "_cached_ua_tok", ""),
+            getattr(g, "_cached_ua_family", ""),
+            type_, id_,
+            int(1 if served_from_cache else 0),
+            int(stats.ms_fetch_aio or 0), int(stats.ms_fetch_p2 or 0),
+            int(getattr(stats, 'ms_fetch_aio_remote', 0) or 0), int(getattr(stats, 'ms_fetch_p2_remote', 0) or 0),
+            int(stats.ms_tmdb or 0),
+            int(stats.ms_tb_api or 0), int(stats.ms_tb_webdav or 0), int(stats.ms_tb_usenet or 0),
+            int(stats.ms_title_mismatch or 0), int(stats.ms_uncached_check or 0),
+            int(stats.tb_api_hashes or 0), int(stats.tb_webdav_hashes or 0), int(stats.tb_usenet_hashes or 0),
+            int(stats.memory_peak_kb or 0),
+            int(getattr(stats, 'ms_py_ff', 0) or 0),
+            int(getattr(stats, 'ms_py_dedup', 0) or 0),
+            int(getattr(stats, 'ms_py_wrap_emit', 0) or 0),
+            int(getattr(stats, 'ms_usenet_ready_match', 0) or 0),
+            int(getattr(stats, 'ms_usenet_probe', 0) or 0),
+            int(getattr(stats, "ms_fetch_wall", 0) or 0),
+            max(int(getattr(stats, "ms_py_ff", 0) or 0) - int(getattr(stats, "ms_py_wrap_emit", 0) or 0), 0),
+            int(getattr(stats, "ms_overhead", 0) or 0),
+        )
         # New: Approximate output size (bytes) for debugging response bloat
         try:
             out_size = len(json.dumps(out_for_client, separators=(",", ":"))) if out_for_client else 0
         except Exception:
             out_size = 0
+            try:
+                total_streams = len(out_for_client) if out_for_client else 0
+            except Exception:
+                total_streams = 0
+
         logger.info(
-            "WRAP_STATS rid=%s mark=%s build=%s git=%s path=%s ua_class=%s ua_tok=%s ua_family=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_placeholder=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s android_magnets=%s iphone_magnets=%s dropped_platform_specific=%s dropped_magnet=%s deduped=%s dedup=%s delivered=%s out=%s cache_hit=%s cache_miss=%s cache_rate=%.2f platform=%s flags=%s errors=%s errors_timeout=%s errors_parse=%s errors_api=%s ms=%s",
+            "WRAP_STATS rid=%s mark=%s build=%s git=%s path=%s client_platform=%s ua_tok=%s ua_family=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_placeholder=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s dropped_android_magnets=%s dropped_iphone_magnets=%s dropped_platform_specific=%s dropped_magnet=%s deduped=%s dedup=%s delivered=%s out_bytes=%s cache_hit=%s cache_miss=%s cache_rate=%s platform=%s flags=%s errors=%s errors_timeout=%s errors_parse=%s errors_api=%s ms=%s total_streams=%s",
             _rid(), _mark(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
             getattr(g, "_cached_ua_tok", ""),
             getattr(g, "_cached_ua_family", ""),
@@ -9161,6 +9206,7 @@ def stream(type_: str, id_: str):
             ",".join(list(stats.error_reasons)[:6]) if isinstance(stats.error_reasons, list) else "",
             int(stats.errors_timeout or 0), int(stats.errors_parse or 0), int(stats.errors_api or 0),
             ms_total,
+            int(total_streams or 0),
         )
 # NEW: Flag slow fetches with high seeders (diagnose buffering despite peers)
         try:
@@ -9202,7 +9248,12 @@ def handle_unhandled_exception(e):
     logger.exception("UNHANDLED %s %s: %s", request.method, request.path, e)
     try:
         if hasattr(g, 'stats') and isinstance(g.stats, PipeStats):
-            logger.info("UNHANDLED_STATS rid=%s errors=%s flags=%s", _rid(), ",".join(g.stats.error_reasons[:3]), ",".join(g.stats.flag_issues[:3]))
+            logger.info(
+                "UNHANDLED_STATS rid=%s errors=%s flags=%s",
+                _rid(),
+                ",".join(list(g.stats.error_reasons)[:3]) if isinstance(g.stats.error_reasons, list) else "",
+                ",".join(list(g.stats.flag_issues)[:3]) if isinstance(g.stats.flag_issues, list) else "",
+            )
     except Exception:
         pass
 
