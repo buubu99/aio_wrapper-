@@ -5278,14 +5278,14 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
     p2_fut = None
 
     if AIO_BASE and not iphone_usenet_mode:
-        aio_fut = FETCH_EXECUTOR.submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, upstream_id, AIO_TAG, (ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT), no_retry=True)
+        aio_fut = FETCH_EXECUTOR.submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, upstream_id, AIO_TAG, (ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT))
     elif iphone_usenet_mode:
         logger.info("AIO skipped rid=%s reason=iphone_usenet_only", _rid())
     else:
         aio_meta = {'tag': AIO_TAG, 'ok': False, 'err': 'no_base'}
         logger.warning("AIO disabled rid=%s reason=no_base", _rid())
     if PROV2_BASE:
-        p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, upstream_id, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT), no_retry=True)
+        p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, upstream_id, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT))
     def _harvest_p2():
         nonlocal p2_streams, prov2_in, p2_meta, p2_wait_ms
         if not p2_fut:
@@ -5295,11 +5295,6 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
         try:
             p2_streams, prov2_in, _p2_remote_ms, p2_meta = p2_fut.result(timeout=remaining)
         except FuturesTimeoutError:
-            try:
-                if p2_fut is not None:
-                    p2_fut.cancel()
-            except Exception:
-                pass
             p2_streams, prov2_in, _p2_remote_ms, p2_meta = [], 0, 0, {'tag': PROV2_TAG, 'ok': False, 'err': 'timeout'}
         except Exception as e:
             p2_streams, prov2_in, _p2_remote_ms, p2_meta = [], 0, 0, {'tag': PROV2_TAG, 'ok': False, 'err': f'error:{type(e).__name__}'}
@@ -5358,11 +5353,6 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                 aio_streams, aio_in, aio_ms, aio_meta = aio_fut.result(timeout=remaining)
                 aio_wait_ms = int((time.monotonic() - t_aio_wait0) * 1000)
             except FuturesTimeoutError:
-                try:
-                    if aio_fut is not None:
-                        aio_fut.cancel()
-                except Exception:
-                    pass
                 try:
                     aio_wait_ms = int((time.monotonic() - t_aio_wait0) * 1000)
                 except Exception:
@@ -6371,7 +6361,6 @@ def check_nzbgeek_readiness_title(title_query: str) -> List[str]:
     return ready_titles
 
 def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0, is_android: bool = False, is_iphone: bool = False, fast_mode: bool = False, deliver_cap: Optional[int] = None) -> Tuple[List[Dict[str, Any]], PipeStats]:
-    ties_resolved = 0
     stats = PipeStats()
     rid = _rid()
     t_ff0 = time.monotonic()
@@ -6990,6 +6979,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # Dedup (Point 11): choose best candidate per stable dedup_key using insta readiness + title match ratio.
     # - Keeps ordering stable by preserving the first-seen index for each key.
     # - Replaces the stored entry when a later duplicate has a higher tie-break score.
+    ties_resolved = 0
     if WRAPPER_DEDUP and out_pairs:
         t_dedup0 = time.monotonic()
         deduped: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
@@ -7421,8 +7411,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         except Exception:
             pass
 
-        mark = _mark()
-        logger.info("POST_SORT_TOP rid=%s mark=%s topN=%s", _rid(), mark, proof_n)
+        logger.info("POST_SORT_TOP rid=%s mark=%s topN=%s", _rid(), _mark(), proof_n)
         for x in topn:
             sk = x.get("sort_key") or ()
             sk0 = sk[0] if len(sk) > 0 else None
@@ -7433,7 +7422,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 "POST_SORT_ITEM rid=%s mark=%s r=%s prov=%s stack=%s res=%s size_gb=%s "
                 "b=%s p1=%s inst=%s ready=%s cached=%s tc=%s tp=%s cbh=%s pbh=%s cm=%s pm=%s "
                 "sk0=%s sk1=%s sk2=%s sk3=%s",
-                _rid(), mark, x.get("rank"), x.get("prov"), x.get("stack"), x.get("res"), x.get("size_gb"),
+                _rid(), req_mark, x.get("rank"), x.get("prov"), x.get("stack"), x.get("res"), x.get("size_gb"),
                 x.get("p1_bucket"), x.get("p1_class"), x.get("instant"), x.get("ready"), x.get("cached"),
                 x.get("tagged_cached"), x.get("tagged_proxied"), x.get("cached_bh"), x.get("proxied_bh"),
                 x.get("cached_m"), x.get("proxied_m"), sk0, sk1, sk2, sk3,
@@ -7469,6 +7458,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             except Exception:
                 aio_cached = None
                 aio_proxied = None
+            ready_flag = bool((m.get('ready') if isinstance(m, dict) else False) or (aio.get('ready') if isinstance(aio, dict) else False))
             if USE_AIO_READY and (aio_cached is not None) and (aio_proxied is not None):
                 super_instant = 0 if ((aio_cached is True and aio_proxied is True) or ready_flag) else 1
             else:
@@ -9183,15 +9173,12 @@ def stream(type_: str, id_: str):
         )
         # New: Approximate output size (bytes) for debugging response bloat
         total_streams = 0
+        out_size = 0
         try:
-            if isinstance(out_for_client, dict):
-                total_streams = len(out_for_client.get('streams') or [])
+            total_streams = len(out_for_client) if out_for_client else 0
+            out_size = len(json.dumps(out_for_client, separators=(",", ":"))) if out_for_client else 0
         except Exception:
             total_streams = 0
-
-        try:
-            out_size = len(json.dumps(out_for_client, separators=(',', ':'))) if out_for_client else 0
-        except Exception:
             out_size = 0
 
         logger.info(
