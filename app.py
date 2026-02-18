@@ -5278,14 +5278,14 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
     p2_fut = None
 
     if AIO_BASE and not iphone_usenet_mode:
-        aio_fut = FETCH_EXECUTOR.submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, upstream_id, AIO_TAG, (ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT))
+        aio_fut = FETCH_EXECUTOR.submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, upstream_id, AIO_TAG, (ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT), no_retry=True)
     elif iphone_usenet_mode:
         logger.info("AIO skipped rid=%s reason=iphone_usenet_only", _rid())
     else:
         aio_meta = {'tag': AIO_TAG, 'ok': False, 'err': 'no_base'}
         logger.warning("AIO disabled rid=%s reason=no_base", _rid())
     if PROV2_BASE:
-        p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, upstream_id, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT))
+        p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, upstream_id, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT), no_retry=True)
     def _harvest_p2():
         nonlocal p2_streams, prov2_in, p2_meta, p2_wait_ms
         if not p2_fut:
@@ -5295,6 +5295,11 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
         try:
             p2_streams, prov2_in, _p2_remote_ms, p2_meta = p2_fut.result(timeout=remaining)
         except FuturesTimeoutError:
+            try:
+                if p2_fut is not None:
+                    p2_fut.cancel()
+            except Exception:
+                pass
             p2_streams, prov2_in, _p2_remote_ms, p2_meta = [], 0, 0, {'tag': PROV2_TAG, 'ok': False, 'err': 'timeout'}
         except Exception as e:
             p2_streams, prov2_in, _p2_remote_ms, p2_meta = [], 0, 0, {'tag': PROV2_TAG, 'ok': False, 'err': f'error:{type(e).__name__}'}
@@ -5353,6 +5358,11 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                 aio_streams, aio_in, aio_ms, aio_meta = aio_fut.result(timeout=remaining)
                 aio_wait_ms = int((time.monotonic() - t_aio_wait0) * 1000)
             except FuturesTimeoutError:
+                try:
+                    if aio_fut is not None:
+                        aio_fut.cancel()
+                except Exception:
+                    pass
                 try:
                     aio_wait_ms = int((time.monotonic() - t_aio_wait0) * 1000)
                 except Exception:
@@ -6361,6 +6371,7 @@ def check_nzbgeek_readiness_title(title_query: str) -> List[str]:
     return ready_titles
 
 def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0, is_android: bool = False, is_iphone: bool = False, fast_mode: bool = False, deliver_cap: Optional[int] = None) -> Tuple[List[Dict[str, Any]], PipeStats]:
+    ties_resolved = 0
     stats = PipeStats()
     rid = _rid()
     t_ff0 = time.monotonic()
@@ -7410,7 +7421,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         except Exception:
             pass
 
-        logger.info("POST_SORT_TOP rid=%s mark=%s topN=%s", _rid(), req_mark, proof_n)
+        mark = _mark()
+        logger.info("POST_SORT_TOP rid=%s mark=%s topN=%s", _rid(), mark, proof_n)
         for x in topn:
             sk = x.get("sort_key") or ()
             sk0 = sk[0] if len(sk) > 0 else None
@@ -7421,7 +7433,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 "POST_SORT_ITEM rid=%s mark=%s r=%s prov=%s stack=%s res=%s size_gb=%s "
                 "b=%s p1=%s inst=%s ready=%s cached=%s tc=%s tp=%s cbh=%s pbh=%s cm=%s pm=%s "
                 "sk0=%s sk1=%s sk2=%s sk3=%s",
-                _rid(), req_mark, x.get("rank"), x.get("prov"), x.get("stack"), x.get("res"), x.get("size_gb"),
+                _rid(), mark, x.get("rank"), x.get("prov"), x.get("stack"), x.get("res"), x.get("size_gb"),
                 x.get("p1_bucket"), x.get("p1_class"), x.get("instant"), x.get("ready"), x.get("cached"),
                 x.get("tagged_cached"), x.get("tagged_proxied"), x.get("cached_bh"), x.get("proxied_bh"),
                 x.get("cached_m"), x.get("proxied_m"), sk0, sk1, sk2, sk3,
@@ -9170,14 +9182,17 @@ def stream(type_: str, id_: str):
             int(getattr(stats, "ms_overhead", 0) or 0),
         )
         # New: Approximate output size (bytes) for debugging response bloat
+        total_streams = 0
         try:
-            out_size = len(json.dumps(out_for_client, separators=(",", ":"))) if out_for_client else 0
+            if isinstance(out_for_client, dict):
+                total_streams = len(out_for_client.get('streams') or [])
+        except Exception:
+            total_streams = 0
+
+        try:
+            out_size = len(json.dumps(out_for_client, separators=(',', ':'))) if out_for_client else 0
         except Exception:
             out_size = 0
-            try:
-                total_streams = len(out_for_client) if out_for_client else 0
-            except Exception:
-                total_streams = 0
 
         logger.info(
             "WRAP_STATS rid=%s mark=%s build=%s git=%s path=%s client_platform=%s ua_tok=%s ua_family=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_placeholder=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s dropped_android_magnets=%s dropped_iphone_magnets=%s dropped_platform_specific=%s dropped_magnet=%s deduped=%s dedup=%s delivered=%s out_bytes=%s cache_hit=%s cache_miss=%s cache_rate=%s platform=%s flags=%s errors=%s errors_timeout=%s errors_parse=%s errors_api=%s ms=%s total_streams=%s",
