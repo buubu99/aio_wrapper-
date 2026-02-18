@@ -12,6 +12,7 @@ import uuid
 import difflib
 import random
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, TimeoutError as FuturesTimeoutError
 
 # ---------------------------
 # Build / version metadata (logging)
