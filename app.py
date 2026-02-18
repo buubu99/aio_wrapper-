@@ -56,7 +56,6 @@ from dataclasses import dataclass, field
 # Pipeline stats (required)
 # ---------------------------
 @dataclass
-@dataclass
 class PipeStats:
     # Input counts
     aio_in: int = 0
