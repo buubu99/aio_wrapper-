@@ -12,7 +12,6 @@ import uuid
 import difflib
 import random
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, TimeoutError as FuturesTimeoutError
 
 # ---------------------------
 # Build / version metadata (logging)
@@ -52,6 +51,13 @@ import threading
 import resource  # For memory tracking (ru_maxrss)
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, TimeoutError as FuturesTimeoutError
+import requests
+from flask import Flask, request, jsonify, make_response, Response, send_from_directory, g, has_request_context
+from flask_cors import CORS
+
+from functools import lru_cache
+
 
 # ---------------------------
 # Pipeline stats (required)
