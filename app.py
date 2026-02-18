@@ -379,7 +379,8 @@ USENET_PROBE_BUDGET_S = _safe_float(os.environ.get("USENET_PROBE_BUDGET_S", "8.5
 USENET_PROBE_DROP_FAILS = _parse_bool(os.environ.get("USENET_PROBE_DROP_FAILS", "1"), True)  # drop probed non-REAL links (STUB/ERR)
 USENET_PROBE_REAL_TOP10_PCT = _safe_float(os.environ.get("USENET_PROBE_REAL_TOP10_PCT", "0.5"), 0.5)
 USENET_PROBE_REAL_TOP20_N = _safe_int(os.environ.get("USENET_PROBE_REAL_TOP20_N", "20"), 20)
-USENET_PROBE_RETRIES = _safe_int(os.environ.get("USENET_PROBE_RETRIES", str(VERIFY_RETRIES)), int(VERIFY_RETRIES))
+_tmp_verify_retries = _safe_int(os.environ.get("VERIFY_RETRIES", "0"), 0)
+USENET_PROBE_RETRIES = _safe_int(os.environ.get("USENET_PROBE_RETRIES", str(_tmp_verify_retries)), _tmp_verify_retries)
 USENET_PROBE_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY", "20"), 20)
 USENET_PROBE_RANGE_END = _safe_int(os.environ.get("USENET_PROBE_RANGE_END", "16440"), 16440)
 # If we read exactly this many bytes back from the range probe, treat it as a "stub".
