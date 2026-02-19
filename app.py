@@ -7522,7 +7522,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 "POST_SORT_ITEM rid=%s mark=%s r=%s prov=%s stack=%s res=%s size_gb=%s "
                 "b=%s p1=%s inst=%s ready=%s cached=%s tc=%s tp=%s cbh=%s pbh=%s cm=%s pm=%s "
                 "sk0=%s sk1=%s sk2=%s sk3=%s",
-                _rid(), req_mark, x.get("rank"), x.get("prov"), x.get("stack"), x.get("res"), x.get("size_gb"),
+                _rid(), _mark(), x.get("rank"), x.get("prov"), x.get("stack"), x.get("res"), x.get("size_gb"),
                 x.get("p1_bucket"), x.get("p1_class"), x.get("instant"), x.get("ready"), x.get("cached"),
                 x.get("tagged_cached"), x.get("tagged_proxied"), x.get("cached_bh"), x.get("proxied_bh"),
                 x.get("cached_m"), x.get("proxied_m"), sk0, sk1, sk2, sk3,
@@ -9319,6 +9319,14 @@ def stream(type_: str, id_: str):
                 stats.flag_issues.append(f"platform_drops:{_bd}")
         except Exception:
             pass
+
+
+        # Derived: py_pre_wrap_ms = py_ff_ms - py_wrap_emit_ms (kept for continuity with prior logs)
+        py_pre_wrap_ms = 0
+        try:
+            py_pre_wrap_ms = max(0, int(getattr(stats, "ms_py_ff", 0) or 0) - int(getattr(stats, "ms_py_wrap_emit", 0) or 0))
+        except Exception:
+            py_pre_wrap_ms = 0
 
         logger.info(
                 "WRAP_TIMING rid=%s total_ms=%s fetch_wall_ms=%s "
