@@ -91,10 +91,12 @@ class PipeStats:
     cache_hit: int = 0
     cache_miss: int = 0
     cache_rate: float = 0.0  # cache_hit/(cache_hit+cache_miss)
-    # Timing/diagnostics (ms). ms_fetch_* are wait times in this request (blocking time).
+    # Timing/diagnostics (ms).
+    # ms_fetch_* are local wrapper durations for each provider fetch (HTTP + decode + light tagging).
+    # Use ms_fetch_wall to see total wall time spent in the parallel fetch phase for this request.
     ms_fetch_aio: int = 0
     ms_fetch_p2: int = 0
-    # Provider-reported fetch times (from provider meta); useful when ms_fetch_* is 0 due to cache.
+    # Provider-reported/internal fetch times (when provided by upstream JSON; extracted into meta['ms_provider']).
     ms_fetch_aio_remote: int = 0
     ms_fetch_p2_remote: int = 0
     ms_tmdb: int = 0
@@ -556,7 +558,7 @@ def _make_aio_cache_update_cb(aio_key: str):
     """Return a Future callback that updates the AIO cache when the fetch completes."""
     def _cb(fut):
         try:
-            s, cnt, _ms, _meta = fut.result()
+            s, cnt, _ms, _meta, _local_ms = fut.result()
             if s:
                 _aio_cache_set(aio_key, s, cnt, int(_ms or 0))
         except Exception:
@@ -1604,144 +1606,153 @@ def _apply_usenet_playability_probe(
 
     ex = ThreadPoolExecutor(max_workers=max_workers)
     in_flight: Dict[Any, int] = {}
+    try:
 
-    def _submit(i: int) -> None:
-        s, _m = pairs[i]
-        try:
-            u = s.get("url") if isinstance(s, dict) else ""
-        except Exception:
-            u = ""
-        # Pass the overall deadline down so the probe can't outlive the budget.
-        fut = ex.submit(
-            _usenet_range_probe_is_real,
-            u,
-            timeout_s=float(timeout_s),
-            range_end=int(range_end),
-            stub_len=int(stub_len),
-            retries=int(retries),
-            deadline_ts=float(deadline),
-        )
-        in_flight[fut] = i
+        def _submit(i: int) -> None:
+            s, _m = pairs[i]
+            try:
+                u = s.get("url") if isinstance(s, dict) else ""
+            except Exception:
+                u = ""
+            # Pass the overall deadline down so the probe can't outlive the budget.
+            fut = ex.submit(
+                _usenet_range_probe_is_real,
+                u,
+                timeout_s=float(timeout_s),
+                range_end=int(range_end),
+                stub_len=int(stub_len),
+                retries=int(retries),
+                deadline_ts=float(deadline),
+            )
+            in_flight[fut] = i
 
-    # Prime the pool
-    while q and len(in_flight) < max_workers and time.monotonic() < deadline:
-        _submit(q.popleft())
+        # Prime the pool
+        while q and len(in_flight) < max_workers and time.monotonic() < deadline:
+            _submit(q.popleft())
 
-    def _handle_done(fut) -> None:
-        i = in_flight.pop(fut, None)
-        if i is None:
-            return
-        try:
-            ok, reason, nbytes = fut.result(timeout=0)
-        except Exception:
-            ok, reason, nbytes = (False, "ERR", 0)
+        def _handle_done(fut) -> None:
+            i = in_flight.pop(fut, None)
+            if i is None:
+                return
+            try:
+                ok, reason, nbytes = fut.result(timeout=0)
+            except Exception:
+                ok, reason, nbytes = (False, "ERR", 0)
 
-        s, m = pairs[i]
-        if not isinstance(m, dict):
-            return
+            s, m = pairs[i]
+            if not isinstance(m, dict):
+                return
 
-        # Budget sentinel: treat as "not probed" (do not drop).
-        if str(reason) == "BUDGET":
-            budget_idx.append(i)
-            return
+            # Budget sentinel: treat as "not probed" (do not drop).
+            if str(reason) == "BUDGET":
+                budget_idx.append(i)
+                return
 
-        if ok:
-            real_idx.append(i)
-            m["usenet_probe"] = "REAL"
-            m["usenet_probe_bytes"] = int(nbytes or 0)
-            if mark_ready:
-                m["ready"] = True
-        else:
-            if reason == "STUB_LEN" or str(reason).startswith("SHORT_"):
-                stub_idx.append(i)
-                m["usenet_probe"] = "STUB"
+            if ok:
+                real_idx.append(i)
+                m["usenet_probe"] = "REAL"
+                m["usenet_probe_bytes"] = int(nbytes or 0)
+                if mark_ready:
+                    m["ready"] = True
             else:
-                err_idx.append(i)
-                m["usenet_probe"] = "ERR"
-            m["usenet_probe_reason"] = str(reason)
-            # Track why probes failed (counts by reason) for debugging/metrics.
-            if stats is not None:
+                if reason == "STUB_LEN" or str(reason).startswith("SHORT_"):
+                    stub_idx.append(i)
+                    m["usenet_probe"] = "STUB"
+                else:
+                    err_idx.append(i)
+                    m["usenet_probe"] = "ERR"
+                m["usenet_probe_reason"] = str(reason)
+                # Track why probes failed (counts by reason) for debugging/metrics.
+                if stats is not None:
+                    try:
+                        _d = getattr(stats, "ms_usenet_probe_fail_reasons", None)
+                        if isinstance(_d, dict):
+                            _r = str(reason)
+                            _d[_r] = int(_d.get(_r, 0)) + 1
+                    except Exception:
+                        pass
+                m["usenet_probe_bytes"] = int(nbytes or 0)
+                # Demote hard so these don't occupy top spots.
                 try:
-                    _d = getattr(stats, "ms_usenet_probe_fail_reasons", None)
-                    if isinstance(_d, dict):
-                        _r = str(reason)
-                        _d[_r] = int(_d.get(_r, 0)) + 1
+                    m["verify_rank"] = max(int(m.get("verify_rank") or 0), 9999)
                 except Exception:
-                    pass
-            m["usenet_probe_bytes"] = int(nbytes or 0)
-            # Demote hard so these don't occupy top spots.
-            try:
-                m["verify_rank"] = max(int(m.get("verify_rank") or 0), 9999)
-            except Exception:
-                m["verify_rank"] = 9999
+                    m["verify_rank"] = 9999
 
-    # Main completion loop
-    from concurrent.futures import FIRST_COMPLETED
-    while in_flight and time.monotonic() < deadline and (target == 0 or len(real_idx) < target):
-        rem = max(0.01, float(deadline) - float(time.monotonic()))
-        done, _not_done = wait(list(in_flight.keys()), timeout=rem, return_when=FIRST_COMPLETED)
-        if not done:
-            break
-        for fut in list(done):
-            _handle_done(fut)
-            if time.monotonic() >= deadline:
+        # Main completion loop
+        from concurrent.futures import FIRST_COMPLETED
+        while in_flight and time.monotonic() < deadline and (target == 0 or len(real_idx) < target):
+            rem = max(0.01, float(deadline) - float(time.monotonic()))
+            done, _not_done = wait(list(in_flight.keys()), timeout=rem, return_when=FIRST_COMPLETED)
+            if not done:
                 break
-            if target and len(real_idx) >= target:
-                break
-            if q and len(in_flight) < max_workers and time.monotonic() < deadline:
-                _submit(q.popleft())
+            for fut in list(done):
+                _handle_done(fut)
+                if time.monotonic() >= deadline:
+                    break
+                if target and len(real_idx) >= target:
+                    break
+                if q and len(in_flight) < max_workers and time.monotonic() < deadline:
+                    _submit(q.popleft())
 
-    # Small grace drain (do not extend budget): collect any completions already done right now.
-    try:
-        done, _ = wait(list(in_flight.keys()), timeout=0.01, return_when=FIRST_COMPLETED)
-        for fut in list(done):
-            _handle_done(fut)
-    except Exception:
-        pass
-
-    # Cancel anything still running; do not wait for full shutdown (avoid blowing /stream latency).
-    try:
-        for fut in list(in_flight.keys()):
-            try:
-                fut.cancel()
-            except Exception:
-                pass
-        ex.shutdown(wait=False, cancel_futures=True)
-    except Exception:
+        # Small grace drain (do not extend budget): collect any completions already done right now.
         try:
-            ex.shutdown(wait=False)
+            done, _ = wait(list(in_flight.keys()), timeout=0.01, return_when=FIRST_COMPLETED)
+            for fut in list(done):
+                _handle_done(fut)
         except Exception:
             pass
 
-    # Drop probed STUBs (and optionally ERR) from output entirely (keeps list reliable).
-    drop_idx: set[int] = set()
-    if drop_stubs and stub_idx:
-        drop_idx.update(stub_idx)
-    if drop_fails and err_idx:
-        drop_idx.update(err_idx)
-    if drop_idx:
-        pairs = [p for j, p in enumerate(pairs) if j not in drop_idx]
-
-    # Lightweight summary log (no URLs).
-    try:
-        ms = int((time.monotonic() - t0) * 1000)
-        logger.info(
-            "USENET_PROBE rid=%s scanned=%s real=%s stub=%s err=%s budget=%s ms=%s",
-            _rid(), int(len(cand)), int(len(real_idx)), int(len(stub_idx)), int(len(err_idx)), int(len(budget_idx)), int(ms),
-        )
-        if stats is not None:
+        # Cancel anything still running; do not wait for full shutdown (avoid blowing /stream latency).
+        try:
+            for fut in list(in_flight.keys()):
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+            ex.shutdown(wait=False, cancel_futures=True)
+        except Exception:
             try:
-                stats.counts_out = stats.counts_out or {}
-                stats.counts_out["usenet_probe_real"] = int(len(real_idx))
-                stats.counts_out["usenet_probe_stub"] = int(len(stub_idx))
-                stats.counts_out["usenet_probe_err"] = int(len(err_idx))
-                stats.counts_out["usenet_probe_budget"] = int(len(budget_idx))
+                ex.shutdown(wait=False)
             except Exception:
                 pass
-    except Exception:
-        pass
 
-    return pairs
+        # Drop probed STUBs (and optionally ERR) from output entirely (keeps list reliable).
+        drop_idx: set[int] = set()
+        if drop_stubs and stub_idx:
+            drop_idx.update(stub_idx)
+        if drop_fails and err_idx:
+            drop_idx.update(err_idx)
+        if drop_idx:
+            pairs = [p for j, p in enumerate(pairs) if j not in drop_idx]
+
+        # Lightweight summary log (no URLs).
+        try:
+            ms = int((time.monotonic() - t0) * 1000)
+            logger.info(
+                "USENET_PROBE rid=%s scanned=%s real=%s stub=%s err=%s budget=%s ms=%s",
+                _rid(), int(len(cand)), int(len(real_idx)), int(len(stub_idx)), int(len(err_idx)), int(len(budget_idx)), int(ms),
+            )
+            if stats is not None:
+                try:
+                    stats.counts_out = stats.counts_out or {}
+                    stats.counts_out["usenet_probe_real"] = int(len(real_idx))
+                    stats.counts_out["usenet_probe_stub"] = int(len(stub_idx))
+                    stats.counts_out["usenet_probe_err"] = int(len(err_idx))
+                    stats.counts_out["usenet_probe_budget"] = int(len(budget_idx))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        return pairs
+    finally:
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            # Python < 3.9: cancel_futures not supported
+            ex.shutdown(wait=False)
+        except Exception:
+            pass
 
 
 
@@ -5154,9 +5165,9 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
     """Fetch provider streams and return (streams, meta).
 
     meta keys (safe for logs/debug):
-      - tag, ok, status, bytes, count, ms, err
+      - tag, ok, status, bytes, count, ms, http_ms, json_ms, ms_provider, err
     """
-    meta: dict[str, Any] = {"tag": str(tag), "ok": False, "status": 0, "bytes": 0, "count": 0, "ms": 0, "err": ""}
+    meta: dict[str, Any] = {"tag": str(tag), "ok": False, "status": 0, "bytes": 0, "count": 0, "ms": 0, "http_ms": 0, "json_ms": 0, "ms_provider": 0, "err": ""}
     t0 = time.monotonic()
     if not base:
         meta["err"] = "no_base"
@@ -5165,13 +5176,24 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
     headers = _auth_headers(auth)
     try:
         sess = fast_session if no_retry else session
+        t_http0 = time.monotonic()
         resp = sess.get(url, headers=headers, timeout=timeout)
+        meta["http_ms"] = int((time.monotonic() - t_http0) * 1000)
         meta["status"] = int(getattr(resp, "status_code", 0) or 0)
         meta["bytes"] = int(len(getattr(resp, "content", b"") or b""))
         if meta["status"] != 200:
             meta["err"] = f"http_{meta['status']}"
             return [], meta
+        t_json0 = time.monotonic()
         data = resp.json() if resp.content else {}
+        meta["json_ms"] = int((time.monotonic() - t_json0) * 1000)
+        provider_ms = 0
+        try:
+            if isinstance(data, dict):
+                provider_ms = int(data.get("ms") or (data.get("meta") or {}).get("ms") or 0)
+        except Exception:
+            provider_ms = 0
+        meta["ms_provider"] = provider_ms
         streams = (data.get("streams") or [])[:INPUT_CAP]
         # Lightweight tagging for debug (does not expose tokens)
         for s in streams:
@@ -5218,11 +5240,13 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
         meta["ms"] = int((time.monotonic() - t0) * 1000)
 
 
-def get_streams_single(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float = REQUEST_TIMEOUT, no_retry: bool = False) -> tuple[list[dict[str, Any]], int, int, dict[str, Any]]:
-    """Fetch a single provider and return (streams, count, ms, meta)."""
+def get_streams_single(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float = REQUEST_TIMEOUT, no_retry: bool = False) -> tuple[list[dict[str, Any]], int, int, dict[str, Any], int]:
+    """Fetch a single provider and return (streams, count, ms_remote, meta, local_ms)."""
+    t0 = time.monotonic()
     streams, meta = _fetch_streams_from_base_with_meta(base, auth, type_, id_, tag, timeout=timeout, no_retry=no_retry)
-    ms = int(meta.get("ms") or 0)
-    return streams, int(len(streams)), ms, meta
+    local_ms = int((time.monotonic() - t0) * 1000)
+    ms_remote = int(meta.get("ms") or 0)
+    return streams, int(len(streams)), ms_remote, meta, local_ms
 
 def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bool = False, client_timeout_s: float | None = None):
     """
@@ -5257,10 +5281,10 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
     p2_streams: List[Dict[str, Any]] = []
     aio_in = 0
     prov2_in = 0
-    aio_ms = 0
-    # Wait times (how long we blocked on futures in *this* request)
-    aio_wait_ms = 0
-    p2_wait_ms = 0
+    aio_ms_remote = 0
+    p2_ms_remote = 0
+    aio_ms_local = 0
+    p2_ms_local = 0
 
     aio_meta: dict[str, Any] = {}
     p2_meta: dict[str, Any] = {}
@@ -5287,27 +5311,25 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
     if PROV2_BASE:
         p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, upstream_id, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT))
     def _harvest_p2():
-        nonlocal p2_streams, prov2_in, p2_meta, p2_wait_ms
+        nonlocal p2_streams, prov2_in, p2_meta, p2_ms_remote, p2_ms_local
         if not p2_fut:
             return
         remaining = max(0.05, deadline - time.monotonic())
-        t_wait0 = time.monotonic()
         try:
-            p2_streams, prov2_in, _p2_remote_ms, p2_meta = p2_fut.result(timeout=remaining)
+            p2_streams, prov2_in, p2_ms_remote, p2_meta, p2_ms_local = p2_fut.result(timeout=remaining)
         except FuturesTimeoutError:
-            p2_streams, prov2_in, _p2_remote_ms, p2_meta = [], 0, 0, {'tag': PROV2_TAG, 'ok': False, 'err': 'timeout'}
+            p2_streams, prov2_in, p2_ms_remote, p2_meta, p2_ms_local = [], 0, 0, {'tag': PROV2_TAG, 'ok': False, 'err': 'timeout'}, 0
         except Exception as e:
-            p2_streams, prov2_in, _p2_remote_ms, p2_meta = [], 0, 0, {'tag': PROV2_TAG, 'ok': False, 'err': f'error:{type(e).__name__}'}
-        finally:
-            p2_wait_ms = int((time.monotonic() - t_wait0) * 1000)
+            p2_streams, prov2_in, p2_ms_remote, p2_meta, p2_ms_local = [], 0, 0, {'tag': PROV2_TAG, 'ok': False, 'err': f'error:{type(e).__name__}'}, 0
 
     mode = AIO_CACHE_MODE
 
     if mode == "swr" and cached is not None:
         # Use cached AIO instantly; refresh in background
         aio_streams, aio_in, cached_ms = cached
-        aio_ms = int(cached_ms or 0)
-        aio_meta = {'tag': AIO_TAG, 'ok': True, 'err': 'cache_hit', 'count': int(aio_in or 0), 'ms': int(aio_ms or 0)}
+        aio_ms_remote = int(cached_ms or 0)
+        aio_ms_local = 0
+        aio_meta = {'tag': AIO_TAG, 'ok': True, 'err': 'cache_hit', 'count': int(aio_in or 0), 'ms': int(aio_ms_remote or 0)}
 
         if aio_fut:
             aio_fut.add_done_callback(_make_aio_cache_update_cb(aio_key))
@@ -5321,23 +5343,18 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
             soft = max(0.05, deadline - time.monotonic())
 
         try:
-            t_aio_wait0 = time.monotonic()
-            aio_streams, aio_in, aio_ms, aio_meta = aio_fut.result(timeout=min(soft, max(0.05, deadline - time.monotonic())))
-            aio_wait_ms = int((time.monotonic() - t_aio_wait0) * 1000)
+            aio_streams, aio_in, aio_ms_remote, aio_meta, aio_ms_local = aio_fut.result(timeout=min(soft, max(0.05, deadline - time.monotonic())))
         except FuturesTimeoutError:
-            try:
-                aio_wait_ms = int((time.monotonic() - t_aio_wait0) * 1000)
-            except Exception:
-                aio_wait_ms = int(float(soft or 0) * 1000)
             if cached is not None:
                 aio_streams, aio_in, cached_ms = cached
-                aio_ms = int(cached_ms or 0)
-                aio_meta = {'tag': AIO_TAG, 'ok': True, 'err': 'soft_timeout_cache' if float(soft or 0) > 0 else 'cache_hit', 'count': int(aio_in or 0), 'ms': int(aio_ms or 0), 'soft_timeout_ms': int(float(soft or 0) * 1000)}
+                aio_ms_remote = int(cached_ms or 0)
+                aio_ms_local = 0
+                aio_meta = {'tag': AIO_TAG, 'ok': True, 'err': 'soft_timeout_cache' if float(soft or 0) > 0 else 'cache_hit', 'count': int(aio_in or 0), 'ms': int(aio_ms_remote or 0), 'soft_timeout_ms': int(float(soft or 0) * 1000)}
             else:
                 aio_streams, aio_in = [], 0
-                aio_ms = 0
+                aio_ms_remote = 0
+                aio_ms_local = 0
                 aio_meta = {'tag': AIO_TAG, 'ok': False, 'err': 'timeout', 'count': 0, 'ms': 0, 'soft_timeout_ms': int(float(soft or 0) * 1000)}
-            pass  # aio_ms set per-branch
 
             # refresh cache when AIO finishes
             aio_fut.add_done_callback(_make_aio_cache_update_cb(aio_key))
@@ -5349,20 +5366,14 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
         if aio_fut:
             remaining = max(0.05, deadline - time.monotonic())
             try:
-                t_aio_wait0 = time.monotonic()
-                aio_streams, aio_in, aio_ms, aio_meta = aio_fut.result(timeout=remaining)
-                aio_wait_ms = int((time.monotonic() - t_aio_wait0) * 1000)
+                aio_streams, aio_in, aio_ms_remote, aio_meta, aio_ms_local = aio_fut.result(timeout=remaining)
             except FuturesTimeoutError:
-                try:
-                    aio_wait_ms = int((time.monotonic() - t_aio_wait0) * 1000)
-                except Exception:
-                    aio_wait_ms = int((time.monotonic() - t0) * 1000)
-                aio_streams, aio_in, aio_ms, aio_meta = [], 0, 0, {'tag': AIO_TAG, 'ok': False, 'err': 'timeout'}
+                aio_streams, aio_in, aio_ms_remote, aio_meta, aio_ms_local = [], 0, 0, {'tag': AIO_TAG, 'ok': False, 'err': 'timeout'}, 0
 
         _harvest_p2()
 
         if aio_streams:
-            _aio_cache_set(aio_key, aio_streams, aio_in, int(aio_ms or 0))
+            _aio_cache_set(aio_key, aio_streams, aio_in, int(aio_ms_remote or 0))
 
     merged = aio_streams + p2_streams
 
@@ -5415,7 +5426,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
         except Exception:
             pass
 
-    return merged, aio_in, prov2_in, aio_wait_ms, p2_wait_ms, False, None, {'aio': aio_meta, 'p2': p2_meta}
+    return merged, aio_in, prov2_in, aio_ms_local, p2_ms_local, False, None, {'aio': aio_meta, 'p2': p2_meta}
 
 def hash_stats(pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]]):
     total = len(pairs)
@@ -8817,7 +8828,7 @@ def stream(type_: str, id_: str):
 
     try:
         t_fetch_wall0 = time.monotonic()
-        streams, aio_in, prov2_in, ms_aio, ms_p2, prefiltered, pre_stats, fetch_meta = get_streams(
+        streams, aio_in, prov2_in, ms_aio_local, ms_p2_local, prefiltered, pre_stats, fetch_meta = get_streams(
             type_,
             id_,
             is_android=is_android,
@@ -8853,16 +8864,18 @@ def stream(type_: str, id_: str):
         # Attach fetch timings
         stats.aio_in = int(aio_in or 0)
         stats.prov2_in = int(prov2_in or 0)
-        stats.ms_fetch_aio = int(ms_aio or 0)
-        stats.ms_fetch_p2 = int(ms_p2 or 0)
+        stats.ms_fetch_aio = int(ms_aio_local or 0)
+        stats.ms_fetch_p2 = int(ms_p2_local or 0)
 
         # Patch 6: counts + fetch meta (safe; used for logs/debug)
         try:
             stats.fetch_aio = _compact_fetch_meta((fetch_meta or {}).get("aio") or {})
             stats.fetch_p2 = _compact_fetch_meta((fetch_meta or {}).get("p2") or {})
             try:
-                stats.ms_fetch_aio_remote = int((stats.fetch_aio or {}).get('ms') or 0)
-                stats.ms_fetch_p2_remote = int((stats.fetch_p2 or {}).get('ms') or 0)
+                ms_aio_remote = int((stats.fetch_aio or {}).get('ms_provider') or 0)
+                ms_p2_remote  = int((stats.fetch_p2 or {}).get('ms_provider') or 0)
+                stats.ms_fetch_aio_remote = ms_aio_remote
+                stats.ms_fetch_p2_remote  = ms_p2_remote
             except Exception:
                 stats.ms_fetch_aio_remote = 0
                 stats.ms_fetch_p2_remote = 0
@@ -8932,8 +8945,8 @@ def stream(type_: str, id_: str):
             p2_remote_ms  = int(stats.ms_fetch_p2_remote or 0)
 
             # What we "report" as timing_ms.* (used by smoke tests): remote when we have it, otherwise wait.
-            aio_ms = aio_remote_ms
-            p2_ms  = p2_remote_ms
+            aio_ms = aio_remote_ms if aio_remote_ms > 0 else aio_wait_ms
+            p2_ms  = p2_remote_ms  if p2_remote_ms  > 0 else p2_wait_ms
 
             tmdb_ms = int(stats.ms_tmdb or 0)
             tb_api_ms = int(stats.ms_tb_api or 0)
@@ -8971,9 +8984,9 @@ def stream(type_: str, id_: str):
                                     "py_wrap_emit": int(getattr(stats, "ms_py_wrap_emit", 0) or 0),
                                     "usenet_ready_match": int(getattr(stats, "ms_usenet_ready_match", 0) or 0),
                                     "usenet_probe": int(getattr(stats, "ms_usenet_probe", 0) or 0),
-                                    "usenet_probe": int(getattr(stats, "ms_fetch_wall", 0) or 0),
-                                    "usenet_probe": max(int(getattr(stats, "ms_py_ff", 0) or 0) - int(getattr(stats, "ms_py_wrap_emit", 0) or 0), 0),
-                                    "usenet_probe": int(getattr(stats, "ms_overhead", 0) or 0),
+                                    "fetch_wall": int(getattr(stats, "ms_fetch_wall", 0) or 0),
+                                    "py_pre_wrap": max(int(getattr(stats, "ms_py_ff", 0) or 0) - int(getattr(stats, "ms_py_wrap_emit", 0) or 0), 0),
+                                    "overhead": int(getattr(stats, "ms_overhead", 0) or 0),
                                 },
                                 "remote_ms": {"aio": aio_remote_ms, "p2": p2_remote_ms},
                                 "wait_ms": {"aio": aio_wait_ms, "p2": p2_wait_ms},
