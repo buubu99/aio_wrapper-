@@ -9329,7 +9329,7 @@ def stream(type_: str, id_: str):
                 "py_tb_prep_ms=%s tb_api_ms=%s py_tb_mark_ms=%s "
                 "tb_webdav_ms=%s tb_usenet_ms=%s usenet_ready_ms=%s usenet_probe_ms=%s "
                 "py_dedup_ms=%s py_wrap_emit_ms=%s py_ff_overhead_ms=%s py_pre_wrap_ms=%s overhead_ms=%s",
-                req_id,
+                _rid(),
                 int(ms_total),
                 int(getattr(stats, "ms_fetch_wall", 0) or 0),
                 int(getattr(stats, "ms_fetch_aio", 0) or 0),
