@@ -107,6 +107,14 @@ class PipeStats:
     ms_py_ff: int = 0              # total time inside filter_and_format
     ms_py_dedup: int = 0           # dedup + best-pick loop
     ms_py_wrap_emit: int = 0       # wrapping /r/<token> URLs + building final delivered list
+    ms_join_aio: int = 0           # time spent waiting on AIO future join (executor wait)
+    ms_join_p2: int = 0            # time spent waiting on P2 future join (executor wait)
+    ms_py_clean: int = 0           # main filter/classify loop (pre title/TB)
+    ms_py_sort: int = 0            # total time in sort(s)
+    ms_py_mix: int = 0             # provider mixing/diversity reordering stage(s)
+    ms_py_tb_prep: int = 0         # TorBox API hash prep (collect/prune)
+    ms_py_tb_mark_only: int = 0    # time to mark TB cached flags on candidates (no dropping)
+    ms_py_ff_overhead: int = 0     # unaccounted time inside filter_and_format (ms_py_ff - known subphases)
     ms_fetch_wall: int = 0         # wall-clock time around provider fetch phase
     ms_overhead: int = 0           # ms_total minus known phases (approx)
     ms_total: int = 0              # total request duration (monotonic)
@@ -5165,9 +5173,27 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
     """Fetch provider streams and return (streams, meta).
 
     meta keys (safe for logs/debug):
-      - tag, ok, status, bytes, count, ms, http_ms, json_ms, ms_provider, err
+      - tag, ok, status, bytes, count, ms
+      - http_ms, read_ms, json_ms, post_ms
+      - ms_provider (upstream/provider internal timing if present in JSON)
+      - wait_ms (time spent waiting on the future join; filled by caller)
+      - err
     """
-    meta: dict[str, Any] = {"tag": str(tag), "ok": False, "status": 0, "bytes": 0, "count": 0, "ms": 0, "http_ms": 0, "json_ms": 0, "ms_provider": 0, "err": ""}
+    meta: dict[str, Any] = {
+        "tag": str(tag),
+        "ok": False,
+        "status": 0,
+        "bytes": 0,
+        "count": 0,
+        "ms": 0,
+        "http_ms": 0,
+        "read_ms": 0,
+        "json_ms": 0,
+        "post_ms": 0,
+        "ms_provider": 0,
+        "wait_ms": 0,
+        "err": "",
+    }
     t0 = time.monotonic()
     if not base:
         meta["err"] = "no_base"
@@ -5176,57 +5202,77 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
     headers = _auth_headers(auth)
     try:
         sess = fast_session if no_retry else session
-        t_http0 = time.monotonic()
-        resp = sess.get(url, headers=headers, timeout=timeout)
-        meta["http_ms"] = int((time.monotonic() - t_http0) * 1000)
-        meta["status"] = int(getattr(resp, "status_code", 0) or 0)
-        meta["bytes"] = int(len(getattr(resp, "content", b"") or b""))
-        if meta["status"] != 200:
-            meta["err"] = f"http_{meta['status']}"
-            return [], meta
-        t_json0 = time.monotonic()
-        data = resp.json() if resp.content else {}
-        meta["json_ms"] = int((time.monotonic() - t_json0) * 1000)
-        provider_ms = 0
-        try:
-            if isinstance(data, dict):
-                provider_ms = int(data.get("ms") or (data.get("meta") or {}).get("ms") or 0)
-        except Exception:
-            provider_ms = 0
-        meta["ms_provider"] = provider_ms
-        streams = (data.get("streams") or [])[:INPUT_CAP]
-        # Lightweight tagging for debug (does not expose tokens)
-        for s in streams:
-            if not isinstance(s, dict):
-                continue
-            bh = s.get("behaviorHints")
-            if not isinstance(bh, dict):
-                bh = {}
-                s["behaviorHints"] = bh
-            # Always tag supplier (AIO/P2) for downstream counters/debug.
-            bh["wrap_src"] = tag
-            bh["source_tag"] = tag
-            # Parse and persist AIOStreams 2.23+ machine tags EARLY (before we rewrite description for UI).
-            # This lets later stages (sorting/counts/logs) use C:/P:/T:/UL:/VT:/NSE etc even if description gets overwritten.
-            try:
-                desc_raw = s.get("description", "") or ""
-                aio_tags = _parse_aio_223_tags(desc_raw)
-                if isinstance(aio_tags, dict) and aio_tags:
-                    bh["wrap_aio"] = aio_tags  # full tag dict (debuggable; not shown to user UI)
-                    # Step 1 truth signals: trust C:/P:/T: when present (gated by USE_AIO_READY).
-                    if USE_AIO_READY:
-                        if aio_tags.get("cached", None) is not None:
-                            bh["cached"] = bool(aio_tags.get("cached"))
-                        if aio_tags.get("proxied", None) is not None:
-                            bh["wrap_proxied"] = bool(aio_tags.get("proxied"))
-                        if aio_tags.get("type"):
-                            bh["wrap_type"] = str(aio_tags.get("type"))
-            except Exception:
-                pass
 
-        meta["count"] = int(len(streams))
-        meta["ok"] = True
-        return streams, meta
+        # HTTP timing: stream=True so we can separate response header time (http_ms)
+        # from full body read time (read_ms).
+        t_http0 = time.monotonic()
+        with sess.get(url, headers=headers, timeout=timeout, stream=True) as resp:
+            meta["http_ms"] = int((time.monotonic() - t_http0) * 1000)
+            meta["status"] = int(getattr(resp, "status_code", 0) or 0)
+
+            # Read/download timing (body)
+            t_read0 = time.monotonic()
+            raw = getattr(resp, "content", b"") or b""
+            meta["read_ms"] = int((time.monotonic() - t_read0) * 1000)
+            meta["bytes"] = int(len(raw))
+
+            if meta["status"] != 200:
+                meta["err"] = f"http_{meta['status']}"
+                return [], meta
+
+            # JSON decode timing
+            t_json0 = time.monotonic()
+            data = json.loads(raw) if raw else {}
+            meta["json_ms"] = int((time.monotonic() - t_json0) * 1000)
+
+            # Upstream/provider timing (if provided by JSON)
+            provider_ms = 0
+            try:
+                if isinstance(data, dict):
+                    provider_ms = int(data.get("ms") or (data.get("meta") or {}).get("ms") or 0)
+            except Exception:
+                provider_ms = 0
+            meta["ms_provider"] = provider_ms
+
+            streams = []
+            if isinstance(data, dict):
+                streams = (data.get("streams") or [])[:INPUT_CAP]
+
+            # Lightweight post-load tagging timing (does not expose tokens)
+            t_post0 = time.monotonic()
+            for s in streams:
+                if not isinstance(s, dict):
+                    continue
+                bh = s.get("behaviorHints")
+                if not isinstance(bh, dict):
+                    bh = {}
+                    s["behaviorHints"] = bh
+                # Always tag supplier (AIO/P2) for downstream counters/debug.
+                bh["wrap_src"] = tag
+                bh["source_tag"] = tag
+                # Parse and persist AIOStreams 2.23+ machine tags EARLY (before we rewrite description for UI).
+                # This lets later stages (sorting/counts/logs) use C:/P:/T:/UL:/VT:/NSE etc even if description gets overwritten.
+                try:
+                    desc_raw = s.get("description", "") or ""
+                    aio_tags = _parse_aio_223_tags(desc_raw)
+                    if isinstance(aio_tags, dict) and aio_tags:
+                        bh["wrap_aio"] = aio_tags  # full tag dict (debuggable; not shown to user UI)
+                        # Step 1 truth signals: trust C:/P:/T: when present (gated by USE_AIO_READY).
+                        if USE_AIO_READY:
+                            if aio_tags.get("cached", None) is not None:
+                                bh["cached"] = bool(aio_tags.get("cached"))
+                            if aio_tags.get("proxied", None) is not None:
+                                bh["wrap_proxied"] = bool(aio_tags.get("proxied"))
+                            if aio_tags.get("type"):
+                                bh["wrap_type"] = str(aio_tags.get("type"))
+                except Exception:
+                    pass
+            meta["post_ms"] = int((time.monotonic() - t_post0) * 1000)
+
+            meta["count"] = int(len(streams))
+            meta["ok"] = True
+            return streams, meta
+
     except requests.Timeout:
         meta["err"] = "timeout"
         return [], meta
@@ -5238,6 +5284,7 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
         return [], meta
     finally:
         meta["ms"] = int((time.monotonic() - t0) * 1000)
+
 
 
 def get_streams_single(base: str, auth: str, type_: str, id_: str, tag: str, timeout: float = REQUEST_TIMEOUT, no_retry: bool = False) -> tuple[list[dict[str, Any]], int, int, dict[str, Any], int]:
@@ -5315,12 +5362,18 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
         if not p2_fut:
             return
         remaining = max(0.05, deadline - time.monotonic())
+        t_wait0 = time.monotonic()
         try:
             p2_streams, prov2_in, p2_ms_remote, p2_meta, p2_ms_local = p2_fut.result(timeout=remaining)
         except FuturesTimeoutError:
             p2_streams, prov2_in, p2_ms_remote, p2_meta, p2_ms_local = [], 0, 0, {'tag': PROV2_TAG, 'ok': False, 'err': 'timeout'}, 0
         except Exception as e:
             p2_streams, prov2_in, p2_ms_remote, p2_meta, p2_ms_local = [], 0, 0, {'tag': PROV2_TAG, 'ok': False, 'err': f'error:{type(e).__name__}'}, 0
+        try:
+            if isinstance(p2_meta, dict):
+                p2_meta["wait_ms"] = int((time.monotonic() - t_wait0) * 1000)
+        except Exception:
+            pass
 
     mode = AIO_CACHE_MODE
 
@@ -5329,7 +5382,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
         aio_streams, aio_in, cached_ms = cached
         aio_ms_remote = int(cached_ms or 0)
         aio_ms_local = 0
-        aio_meta = {'tag': AIO_TAG, 'ok': True, 'err': 'cache_hit', 'count': int(aio_in or 0), 'ms': int(aio_ms_remote or 0)}
+        aio_meta = {'tag': AIO_TAG, 'ok': True, 'status': 200, 'err': 'cache_hit', 'count': int(aio_in or 0), 'ms': int(aio_ms_remote or 0), 'wait_ms': 0}
 
         if aio_fut:
             aio_fut.add_done_callback(_make_aio_cache_update_cb(aio_key))
@@ -5342,6 +5395,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
             # behave like "off"
             soft = max(0.05, deadline - time.monotonic())
 
+        t_wait0 = time.monotonic()
         try:
             aio_streams, aio_in, aio_ms_remote, aio_meta, aio_ms_local = aio_fut.result(timeout=min(soft, max(0.05, deadline - time.monotonic())))
         except FuturesTimeoutError:
@@ -5359,16 +5413,31 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
             # refresh cache when AIO finishes
             aio_fut.add_done_callback(_make_aio_cache_update_cb(aio_key))
 
+
+        try:
+            if isinstance(aio_meta, dict):
+                aio_meta["wait_ms"] = int((time.monotonic() - t_wait0) * 1000)
+        except Exception:
+            pass
+
         _harvest_p2()
 
     else:
         # mode == "off" OR no cache: wait for AIO and P2 within the deadline
         if aio_fut:
             remaining = max(0.05, deadline - time.monotonic())
+            t_wait0 = time.monotonic()
             try:
                 aio_streams, aio_in, aio_ms_remote, aio_meta, aio_ms_local = aio_fut.result(timeout=remaining)
             except FuturesTimeoutError:
                 aio_streams, aio_in, aio_ms_remote, aio_meta, aio_ms_local = [], 0, 0, {'tag': AIO_TAG, 'ok': False, 'err': 'timeout'}, 0
+
+            try:
+                if isinstance(aio_meta, dict):
+                    aio_meta["wait_ms"] = int((time.monotonic() - t_wait0) * 1000)
+            except Exception:
+                pass
+
 
         _harvest_p2()
 
@@ -5943,7 +6012,7 @@ def _compact_fetch_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(meta, dict):
         return {}
     # Only keep the safe/compact keys
-    keep = ("tag", "ok", "status", "bytes", "count", "ms", "err")
+    keep = ("tag", "ok", "status", "bytes", "count", "ms", "ms_provider", "wait_ms", "http_ms", "read_ms", "json_ms", "post_ms", "soft_timeout_ms", "err")
     return {k: meta.get(k) for k in keep if k in meta and meta.get(k) not in (None, "", {})}
 
 # Diversify top M while preserving quality: pick from a larger pool, bucketed by resolution, then mix providers/suppliers.
@@ -6708,6 +6777,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
 
     cleaned: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    t_clean0 = time.monotonic()
     for s in streams:
         if not isinstance(s, dict):
             continue
@@ -6799,6 +6869,11 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
 
         cleaned.append((s, m))
+
+    try:
+        stats.ms_py_clean = int((time.monotonic() - t_clean0) * 1000)
+    except Exception:
+        pass
 
     # Candidates before validation/scoring/dedup (dedup runs later with Point 11 tie-breaks)
     out_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = cleaned[:]
@@ -7311,8 +7386,12 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         return (instant_val, ready_val, cached_val, verify_rank, -res, sanity_val, p1_bucket, -p1_q, -size_b, -score, -seeders, prov_idx)  # Add: Swap for stronger ready (Usenet beats non-instant cached)
 
     did_verify = False
+    _t_sort0 = time.monotonic()
     out_pairs.sort(key=sort_key)
-
+    try:
+        stats.ms_py_sort += int((time.monotonic() - _t_sort0) * 1000)
+    except Exception:
+        pass
     # Direct Usenet playability probe (REAL vs STUB) - replaces NZBGeek readiness when enabled.
     # This runs AFTER global sort/dedup and marks/demotes stubs so playable links float upward.
     if (not fast_mode) and has_usenet and USENET_PROBE_ENABLE:
@@ -7334,7 +7413,12 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 stats=stats,
             )
             stats.ms_usenet_probe = int((time.monotonic() - t_up0) * 1000)
+            _t_sort0 = time.monotonic()
             out_pairs.sort(key=sort_key)
+            try:
+                stats.ms_py_sort += int((time.monotonic() - _t_sort0) * 1000)
+            except Exception:
+                pass
         except Exception as _e:
             logger.debug("USENET_PROBE_ERR rid=%s err=%s", rid, _e)
 
@@ -7344,7 +7428,12 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             top_n = ANDROID_VERIFY_TOP_N if (is_android or is_iphone) else VERIFY_DESKTOP_TOP_N
             timeout = ANDROID_VERIFY_TIMEOUT if (is_android or is_iphone) else VERIFY_STREAM_TIMEOUT
             out_pairs = _drop_bad_top_n(out_pairs, top_n=int(top_n or 0), timeout_s=float(timeout or VERIFY_STREAM_TIMEOUT), range_mode=VERIFY_RANGE, deliver_cap=deliver_cap_eff, sort_buffer=VERIFY_SORT_BUFFER)
+            _t_sort0 = time.monotonic()
             out_pairs.sort(key=sort_key)
+            try:
+                stats.ms_py_sort += int((time.monotonic() - _t_sort0) * 1000)
+            except Exception:
+                pass
             did_verify = True
         except Exception as e:
             logger.debug("VERIFY_PARALLEL_SKIPPED rid=%s err=%s", rid, e)
@@ -7581,6 +7670,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # --- Streak mix (Android/Desktop): break up long same-provider runs (esp. Usenet) without destroying quality order.
     # This prevents situations where, after an initial "mix head", a long NZB/ND block pushes high-quality RD/TB items
     # to the very end of the delivered slice.
+    t_mix0 = time.monotonic()
     if (not iphone_usenet_mode) and out_pairs and deliver_cap_eff >= 20:
         try:
             from collections import deque
@@ -7712,6 +7802,12 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         except Exception:
             # Never fail the request due to ordering tweaks.
             pass
+
+    try:
+        stats.ms_py_mix = int((time.monotonic() - t_mix0) * 1000)
+    except Exception:
+        pass
+
 
 # Candidate pool (post-sort/post-diversity). Everything below operates on `candidates`.
     # NOTE: Patch3 fix — patch2 accidentally referenced `candidates` before it was initialized.
@@ -7877,6 +7973,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     elif not candidates:
         tb_api_reason = "no_candidates"
     else:
+        t_tb_prep0 = time.monotonic()
         seen_h: set[str] = set()
         for _s, _m in candidates:
             if len(tb_hashes) >= tb_max_hashes:
@@ -7900,6 +7997,10 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             tb_api_reason = "min_hashes"
         else:
             try:
+                try:
+                    stats.ms_py_tb_prep = int((time.monotonic() - t_tb_prep0) * 1000)
+                except Exception:
+                    pass
                 t0 = time.monotonic()
                 # If both TorBox torrent and TorBox usenet checks are queued, run them concurrently.
                 if tb_usenet_should_run and tb_usenet_hashes_list:
@@ -8024,6 +8125,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         tb_mark_true = 0
         tb_mark_false = 0
         tb_flip = 0
+        t_mark0 = time.monotonic()
         for _s, _m in candidates:
             if (_m.get('provider') or '').upper() != 'TB':
                 continue
@@ -8040,6 +8142,11 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                     tb_flip += 1
                 with CACHED_HISTORY_LOCK:
                     CACHED_HISTORY[h] = bool(_m['cached'])
+        try:
+            stats.ms_py_tb_mark_only = int((time.monotonic() - t_mark0) * 1000)
+        except Exception:
+            pass
+
         if tb_total:
             try:
                 logger.info("TB_FLIPS rid=%s flipped=%s/%s tb_api_hashes=%s", _rid(), tb_flip, tb_total, int(stats.tb_api_hashes or 0))
@@ -8640,6 +8747,28 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         pass
 
     stats.ms_py_ff = int((time.monotonic() - t_ff0) * 1000)
+    # Unaccounted time inside filter_and_format (helps explain “where did the seconds go?”).
+    # NOTE: These are *our-side* timers only; upstream (AIOStreams) wall times must be compared via logs externally.
+    try:
+        _known = 0
+        _known += int(stats.ms_tmdb or 0)
+        _known += int(stats.ms_py_clean or 0)
+        _known += int(stats.ms_title_mismatch or 0)
+        _known += int(stats.ms_py_sort or 0)
+        _known += int(stats.ms_py_mix or 0)
+        _known += int(stats.ms_py_dedup or 0)
+        _known += int(stats.ms_tb_webdav or 0)
+        _known += int(stats.ms_py_tb_prep or 0)
+        _known += int(stats.ms_tb_api or 0)
+        _known += int(stats.ms_py_tb_mark_only or 0)
+        _known += int(stats.ms_tb_usenet or 0)
+        _known += int(stats.ms_usenet_ready_match or 0)
+        _known += int(stats.ms_usenet_probe or 0)
+        _known += int(stats.ms_py_wrap_emit or 0)
+        stats.ms_py_ff_overhead = max(0, int(stats.ms_py_ff or 0) - _known)
+    except Exception:
+        pass
+
     # Clear TLS stats pointer to avoid leaking across requests
     try:
         if hasattr(_TLS, "stats"):
@@ -8872,6 +9001,11 @@ def stream(type_: str, id_: str):
             stats.fetch_aio = _compact_fetch_meta((fetch_meta or {}).get("aio") or {})
             stats.fetch_p2 = _compact_fetch_meta((fetch_meta or {}).get("p2") or {})
             try:
+                stats.ms_join_aio = int(((fetch_meta or {}).get("aio") or {}).get("wait_ms") or 0)
+                stats.ms_join_p2  = int(((fetch_meta or {}).get("p2") or {}).get("wait_ms") or 0)
+            except Exception:
+                pass
+            try:
                 ms_aio_remote = int((stats.fetch_aio or {}).get('ms_provider') or 0)
                 ms_p2_remote  = int((stats.fetch_p2 or {}).get('ms_provider') or 0)
                 stats.ms_fetch_aio_remote = ms_aio_remote
@@ -8939,14 +9073,24 @@ def stream(type_: str, id_: str):
 
         if want_dbg:
             # Prefer remote timings, but fall back to wait timings when remote is unavailable.
-            aio_wait_ms = int(stats.ms_fetch_aio or 0)
-            p2_wait_ms  = int(stats.ms_fetch_p2 or 0)
-            aio_remote_ms = int(stats.ms_fetch_aio_remote or 0)
-            p2_remote_ms  = int(stats.ms_fetch_p2_remote or 0)
+            aio_local_ms = int(stats.ms_fetch_aio or 0)
+            p2_local_ms  = int(stats.ms_fetch_p2 or 0)
+            aio_join_ms  = int(stats.ms_join_aio or 0)
+            p2_join_ms   = int(stats.ms_join_p2 or 0)
+            aio_provider_ms = int(stats.ms_fetch_aio_remote or 0)
+            p2_provider_ms  = int(stats.ms_fetch_p2_remote or 0)
+            aio_http_ms = int((stats.fetch_aio or {}).get("http_ms") or 0)
+            aio_read_ms = int((stats.fetch_aio or {}).get("read_ms") or 0)
+            aio_json_ms = int((stats.fetch_aio or {}).get("json_ms") or 0)
+            aio_post_ms = int((stats.fetch_aio or {}).get("post_ms") or 0)
+            p2_http_ms  = int((stats.fetch_p2 or {}).get("http_ms") or 0)
+            p2_read_ms  = int((stats.fetch_p2 or {}).get("read_ms") or 0)
+            p2_json_ms  = int((stats.fetch_p2 or {}).get("json_ms") or 0)
+            p2_post_ms  = int((stats.fetch_p2 or {}).get("post_ms") or 0)
 
-            # What we "report" as timing_ms.* (used by smoke tests): remote when we have it, otherwise wait.
-            aio_ms = aio_remote_ms if aio_remote_ms > 0 else aio_wait_ms
-            p2_ms  = p2_remote_ms  if p2_remote_ms  > 0 else p2_wait_ms
+            # What we "report" as timing_ms.* (used by smoke tests): provider internal when we have it, otherwise our local fetch time.
+            aio_ms = aio_provider_ms if aio_provider_ms > 0 else aio_local_ms
+            p2_ms  = p2_provider_ms  if p2_provider_ms  > 0 else p2_local_ms
 
             tmdb_ms = int(stats.ms_tmdb or 0)
             tb_api_ms = int(stats.ms_tb_api or 0)
@@ -8971,10 +9115,24 @@ def stream(type_: str, id_: str):
                                     "p2": p2_ms,
                                     "tb_api": tb_api_ms,
                                     "tmdb": tmdb_ms,
-                                    "aio_remote": aio_remote_ms,
-                                    "p2_remote": p2_remote_ms,
-                                    "aio_wait": aio_wait_ms,
-                                    "p2_wait": p2_wait_ms,
+                                    "aio_remote": aio_provider_ms,
+                                    "p2_remote": p2_provider_ms,
+                                    "aio_wait": aio_join_ms,
+                                    "p2_wait": p2_join_ms,
+                                    "aio_local": aio_local_ms,
+                                    "p2_local": p2_local_ms,
+                                    "aio_provider": aio_provider_ms,
+                                    "p2_provider": p2_provider_ms,
+                                    "aio_join": aio_join_ms,
+                                    "p2_join": p2_join_ms,
+                                    "aio_http": aio_http_ms,
+                                    "aio_read": aio_read_ms,
+                                    "aio_json": aio_json_ms,
+                                    "aio_post": aio_post_ms,
+                                    "p2_http": p2_http_ms,
+                                    "p2_read": p2_read_ms,
+                                    "p2_json": p2_json_ms,
+                                    "p2_post": p2_post_ms,
                                     "tb_wd": tb_wd_ms,
                                     "tb_usenet": tb_usenet_ms,
                                     "title_mismatch": title_mismatch_ms,
@@ -8982,14 +9140,25 @@ def stream(type_: str, id_: str):
                                     "py_ff": int(getattr(stats, "ms_py_ff", 0) or 0),
                                     "py_dedup": int(getattr(stats, "ms_py_dedup", 0) or 0),
                                     "py_wrap_emit": int(getattr(stats, "ms_py_wrap_emit", 0) or 0),
+                                    "py_clean": int(getattr(stats, "ms_py_clean", 0) or 0),
+                                    "py_sort": int(getattr(stats, "ms_py_sort", 0) or 0),
+                                    "py_mix": int(getattr(stats, "ms_py_mix", 0) or 0),
+                                    "py_tb_prep": int(getattr(stats, "ms_py_tb_prep", 0) or 0),
+                                    "py_tb_mark_only": int(getattr(stats, "ms_py_tb_mark_only", 0) or 0),
+                                    "py_ff_overhead": int(getattr(stats, "ms_py_ff_overhead", 0) or 0),
                                     "usenet_ready_match": int(getattr(stats, "ms_usenet_ready_match", 0) or 0),
                                     "usenet_probe": int(getattr(stats, "ms_usenet_probe", 0) or 0),
                                     "fetch_wall": int(getattr(stats, "ms_fetch_wall", 0) or 0),
                                     "py_pre_wrap": max(int(getattr(stats, "ms_py_ff", 0) or 0) - int(getattr(stats, "ms_py_wrap_emit", 0) or 0), 0),
                                     "overhead": int(getattr(stats, "ms_overhead", 0) or 0),
                                 },
-                                "remote_ms": {"aio": aio_remote_ms, "p2": p2_remote_ms},
-                                "wait_ms": {"aio": aio_wait_ms, "p2": p2_wait_ms},
+                                "remote_ms": {"aio": aio_provider_ms, "p2": p2_provider_ms},
+                                "wait_ms": {"aio": aio_join_ms, "p2": p2_join_ms},
+                                "local_ms": {"aio": aio_local_ms, "p2": p2_local_ms},
+                                "fetch_breakdown_ms": {
+                                    "aio": {"http": aio_http_ms, "read": aio_read_ms, "json": aio_json_ms, "post": aio_post_ms},
+                                    "p2":  {"http": p2_http_ms,  "read": p2_read_ms,  "json": p2_json_ms,  "post": p2_post_ms},
+                                },
                                 "delivered": int(stats.delivered or 0),
                 "drops": {
                     "error": int(stats.dropped_error or 0),
@@ -9127,16 +9296,7 @@ def stream(type_: str, id_: str):
             _sum = 0
             _sum += int(getattr(stats, "ms_fetch_wall", 0) or 0)
             _sum += int(getattr(stats, "ms_py_ff", 0) or 0)
-            _sum += int(getattr(stats, "ms_py_dedup", 0) or 0)
-            _sum += int(getattr(stats, "ms_py_wrap_emit", 0) or 0)
-            _sum += int(getattr(stats, "ms_tmdb", 0) or 0)
-            _sum += int(getattr(stats, "ms_tb_api", 0) or 0)
-            _sum += int(getattr(stats, "ms_tb_webdav", 0) or 0)
-            _sum += int(getattr(stats, "ms_tb_usenet", 0) or 0)
-            _sum += int(getattr(stats, "ms_title_mismatch", 0) or 0)
-            _sum += int(getattr(stats, "ms_uncached_check", 0) or 0)
-            _sum += int(getattr(stats, "ms_usenet_ready_match", 0) or 0)
-            _sum += int(getattr(stats, "ms_usenet_probe", 0) or 0)
+            # ms_overhead is “everything we didn't explicitly time”, outside fetch_wall + filter_and_format.
             stats.ms_overhead = max(0, int(ms_total) - int(_sum))
         except Exception:
             pass
@@ -9161,29 +9321,51 @@ def stream(type_: str, id_: str):
             pass
 
         logger.info(
-            "WRAP_TIMING rid=%s mark=%s build=%s git=%s path=%s client_platform=%s platform=%s ua_tok=%s ua_family=%s type=%s id=%s cache=%s aio_wait_ms=%s p2_wait_ms=%s aio_fetch_ms=%s p2_fetch_ms=%s tmdb_ms=%s tb_api_ms=%s tb_webdav_ms=%s tb_usenet_ms=%s title_mismatch_ms=%s uncached_ms=%s tb_api_hashes=%s tb_webdav_hashes=%s tb_usenet_hashes=%s mem_kb=%s ms_py_ff=%s ms_py_dedup=%s ms_py_wrap_emit=%s ms_usenet_ready_match=%s ms_usenet_probe=%s fetch_wall_ms=%s py_pre_wrap_ms=%s overhead_ms=%s",
-            _rid(), _mark(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
-            platform,
-            getattr(g, "_cached_ua_tok", ""),
-            getattr(g, "_cached_ua_family", ""),
-            type_, id_,
-            int(1 if served_from_cache else 0),
-            int(stats.ms_fetch_aio or 0), int(stats.ms_fetch_p2 or 0),
-            int(getattr(stats, 'ms_fetch_aio_remote', 0) or 0), int(getattr(stats, 'ms_fetch_p2_remote', 0) or 0),
-            int(stats.ms_tmdb or 0),
-            int(stats.ms_tb_api or 0), int(stats.ms_tb_webdav or 0), int(stats.ms_tb_usenet or 0),
-            int(stats.ms_title_mismatch or 0), int(stats.ms_uncached_check or 0),
-            int(stats.tb_api_hashes or 0), int(stats.tb_webdav_hashes or 0), int(stats.tb_usenet_hashes or 0),
-            int(stats.memory_peak_kb or 0),
-            int(getattr(stats, 'ms_py_ff', 0) or 0),
-            int(getattr(stats, 'ms_py_dedup', 0) or 0),
-            int(getattr(stats, 'ms_py_wrap_emit', 0) or 0),
-            int(getattr(stats, 'ms_usenet_ready_match', 0) or 0),
-            int(getattr(stats, 'ms_usenet_probe', 0) or 0),
-            int(getattr(stats, "ms_fetch_wall", 0) or 0),
-            max(int(getattr(stats, "ms_py_ff", 0) or 0) - int(getattr(stats, "ms_py_wrap_emit", 0) or 0), 0),
-            int(getattr(stats, "ms_overhead", 0) or 0),
-        )
+                "WRAP_TIMING rid=%s total_ms=%s fetch_wall_ms=%s "
+                "aio_local_ms=%s aio_join_ms=%s aio_http_ms=%s aio_read_ms=%s aio_json_ms=%s aio_post_ms=%s aio_prov_ms=%s "
+                "p2_local_ms=%s p2_join_ms=%s p2_http_ms=%s p2_read_ms=%s p2_json_ms=%s p2_post_ms=%s p2_prov_ms=%s "
+                "parallel_slack_ms=%s "
+                "tmdb_ms=%s py_ff_ms=%s py_clean_ms=%s title_ms=%s py_sort_ms=%s py_mix_ms=%s "
+                "py_tb_prep_ms=%s tb_api_ms=%s py_tb_mark_ms=%s "
+                "tb_webdav_ms=%s tb_usenet_ms=%s usenet_ready_ms=%s usenet_probe_ms=%s "
+                "py_dedup_ms=%s py_wrap_emit_ms=%s py_ff_overhead_ms=%s py_pre_wrap_ms=%s overhead_ms=%s",
+                req_id,
+                int(ms_total),
+                int(getattr(stats, "ms_fetch_wall", 0) or 0),
+                int(getattr(stats, "ms_fetch_aio", 0) or 0),
+                int(getattr(stats, "ms_join_aio", 0) or 0),
+                int(((getattr(stats, "fetch_aio", {}) or {}).get("http_ms")) or 0),
+                int(((getattr(stats, "fetch_aio", {}) or {}).get("read_ms")) or 0),
+                int(((getattr(stats, "fetch_aio", {}) or {}).get("json_ms")) or 0),
+                int(((getattr(stats, "fetch_aio", {}) or {}).get("post_ms")) or 0),
+                int(getattr(stats, "ms_fetch_aio_remote", 0) or 0),
+                int(getattr(stats, "ms_fetch_p2", 0) or 0),
+                int(getattr(stats, "ms_join_p2", 0) or 0),
+                int(((getattr(stats, "fetch_p2", {}) or {}).get("http_ms")) or 0),
+                int(((getattr(stats, "fetch_p2", {}) or {}).get("read_ms")) or 0),
+                int(((getattr(stats, "fetch_p2", {}) or {}).get("json_ms")) or 0),
+                int(((getattr(stats, "fetch_p2", {}) or {}).get("post_ms")) or 0),
+                int(getattr(stats, "ms_fetch_p2_remote", 0) or 0),
+                max(0, int(getattr(stats, "ms_fetch_wall", 0) or 0) - max(int(getattr(stats, "ms_fetch_aio", 0) or 0), int(getattr(stats, "ms_fetch_p2", 0) or 0))),
+                int(getattr(stats, "ms_tmdb", 0) or 0),
+                int(getattr(stats, "ms_py_ff", 0) or 0),
+                int(getattr(stats, "ms_py_clean", 0) or 0),
+                int(getattr(stats, "ms_title_mismatch", 0) or 0),
+                int(getattr(stats, "ms_py_sort", 0) or 0),
+                int(getattr(stats, "ms_py_mix", 0) or 0),
+                int(getattr(stats, "ms_py_tb_prep", 0) or 0),
+                int(getattr(stats, "ms_tb_api", 0) or 0),
+                int(getattr(stats, "ms_py_tb_mark_only", 0) or 0),
+                int(getattr(stats, "ms_tb_webdav", 0) or 0),
+                int(getattr(stats, "ms_tb_usenet", 0) or 0),
+                int(getattr(stats, "ms_usenet_ready_match", 0) or 0),
+                int(getattr(stats, "ms_usenet_probe", 0) or 0),
+                int(getattr(stats, "ms_py_dedup", 0) or 0),
+                int(getattr(stats, "ms_py_wrap_emit", 0) or 0),
+                int(getattr(stats, "ms_py_ff_overhead", 0) or 0),
+                int(py_pre_wrap_ms),
+                int(getattr(stats, "ms_overhead", 0) or 0),
+                )
         # New: Approximate output size (bytes) for debugging response bloat
         total_streams = 0
         out_size = 0
