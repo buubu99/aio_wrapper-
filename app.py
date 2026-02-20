@@ -599,10 +599,53 @@ def _get_fetch_executor() -> ThreadPoolExecutor:
             try:
                 warm_n = max(0, min(int(WRAP_FETCH_WORKERS or 0), 4))
                 for _ in range(warm_n):
-                    __get_fetch_executor().submit(lambda: None)
+                    _FETCH_EXECUTOR.submit(lambda: None)
             except Exception:
                 pass
         return _FETCH_EXECUTOR
+
+
+# ---- micro warm (per-worker, fork-safe) ----
+# Runs once per worker PID to avoid first-request setup latency.
+_WARMED_PIDS = set()
+_WARMED_LOCK = threading.Lock()
+
+def _micro_warm_worker(reason: str = "") -> bool:
+    """Initialize per-worker internals (executor, sessions) without external calls.
+    Returns True only the first time it runs per PID.
+    """
+    pid = os.getpid()
+    try:
+        with _WARMED_LOCK:
+            if pid in _WARMED_PIDS:
+                return False
+            _WARMED_PIDS.add(pid)
+    except Exception:
+        # If locking fails, still attempt warm but don't spam logs.
+        pass
+
+    # Ensure fetch executor exists (threads created in this worker).
+    try:
+        _get_fetch_executor()
+    except Exception:
+        pass
+
+    # Touch HTTP session objects (no network) to ensure adapters exist.
+    try:
+        _ = session.adapters  # type: ignore[name-defined]
+        _ = fast_session.adapters  # type: ignore[name-defined]
+    except Exception:
+        pass
+
+    # Log once per worker for visibility.
+    try:
+        logger.info("MICRO_WARM rid=%s pid=%s reason=%s", _rid(), pid, reason)
+    except Exception:
+        try:
+            logger.info("MICRO_WARM pid=%s reason=%s", pid, reason)
+        except Exception:
+            pass
+    return True
 
 AIO_CACHE_TTL_S = int(os.getenv("AIO_CACHE_TTL_S", "600") or 600)   # 0 disables cache
 AIO_CACHE_MAX = int(os.getenv("AIO_CACHE_MAX", "200") or 200)
@@ -6610,6 +6653,11 @@ def check_nzbgeek_readiness_title(title_query: str) -> List[str]:
 def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_in: int = 0, prov2_in: int = 0, is_android: bool = False, is_iphone: bool = False, fast_mode: bool = False, deliver_cap: Optional[int] = None) -> Tuple[List[Dict[str, Any]], PipeStats]:
     stats = PipeStats()
     rid = _rid()
+
+    # Batch drop logging (avoid per-item DROP_* spam). Does not change drop logic or counters.
+    drop_reasons = defaultdict(int)
+    drop_examples = {}  # reason -> one short example (optional)
+
     t_ff0 = time.monotonic()
     # Expose per-request stats to heuristic helpers (thread-local)
     try:
@@ -6950,15 +6998,18 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             continue
         if not sanitize_stream_inplace(s):
             stats.dropped_missing_url += 1
-            continue
+        drop_reasons['missing_url'] += 1
+        continue
         if (s.get("streamData") or {}).get("type") == "error":
             stats.dropped_error += 1
-            continue
+        drop_reasons['error'] += 1
+        continue
 
         try:
             m = classify_cached(s)
         except Exception as e:
             stats.dropped_error += 1
+            drop_reasons['classify_exc'] += 1
             if len(stats.error_reasons) < 8:
                 stats.error_reasons.append(f"classify:{type(e).__name__}")
             logger.warning(
@@ -6970,33 +7021,40 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         # Optional hard drops first
         if DROP_RD and m.get("provider") == "RD":
             stats.dropped_rd += 1
+            drop_reasons['rd'] += 1
             continue
         if DROP_AD and m.get("provider") == "AD":
             stats.dropped_ad += 1
+            drop_reasons['ad'] += 1
             continue
 
         if not VALIDATE_OFF:
             # Seeders
             if m.get('seeders', 0) < MIN_SEEDERS:
                 stats.dropped_low_seeders += 1
+                drop_reasons['low_seeders'] += 1
                 continue
             # Language
             if PREFERRED_LANG and m.get('language') != PREFERRED_LANG:
                 stats.dropped_lang += 1
+                drop_reasons['lang'] += 1
                 continue
             # Pollution
             if DROP_POLLUTED and is_polluted(s, type_, season, episode):
                 stats.dropped_pollution += 1
+                drop_reasons['pollution'] += 1
                 continue
             # Premium plan (best-effort)
             if VERIFY_PREMIUM and m.get("premium_level", 0) == 0:
                 stats.dropped_low_premium += 1
+                drop_reasons['low_premium'] += 1
                 continue
 
             # Resolution
             if MIN_RES > 0:
                 if _res_to_int(m.get('res', '')) < MIN_RES:
                     stats.dropped_low_res += 1
+                    drop_reasons['low_res'] += 1
                     continue
 
             # Age heuristic
@@ -7004,6 +7062,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 age = _extract_age_days((s.get('description') or '') + ' ' + (s.get('name') or ''))
                 if age is not None and age > MAX_AGE_DAYS:
                     stats.dropped_old_age += 1
+                    drop_reasons['old_age'] += 1
                     continue
 
             # Blacklists
@@ -7011,6 +7070,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 text = f"{s.get('name','')} {s.get('description','')} {m.get('group','')}"
                 if _is_blacklisted(text):
                     stats.dropped_blacklist += 1
+                    drop_reasons['blacklist'] += 1
                     continue
 
             # Fakes DB (infohash)
@@ -7018,6 +7078,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 h = (m.get('infohash') or '').lower()
                 if h and h in bad_hashes:
                     stats.dropped_fakes_db += 1
+                    drop_reasons['fakes_db'] += 1
                     continue
             # Optional URL verification moved to batched/parallel top-N pass (see below)
 
@@ -7030,7 +7091,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             if min_size and size_b < min_size:
                 # Dedicated counter for accuracy + per-drop log (mobile debugging)
                 stats.dropped_low_size_iphone += 1
-                logger.info("DROP_IPHONE_SIZE rid=%s dropped_low_size_iphone=%s", rid, stats.dropped_low_size_iphone)
+                drop_reasons['iphone_size'] += 1
+                drop_examples.setdefault('iphone_size', f"size_b={size_b} name={(s.get('name') or '')[:60]}")
                 continue
 
 
@@ -7114,19 +7176,15 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                         pass
                     if best < thr:
                         stats.dropped_title_mismatch += 1
-                        logger.info(
-                            'DROP_TITLE_MISMATCH rid=%s platform=%s type=%s id=%s cand=%r expected_title=%r expected_ep=%r ratio=%.3f thr=%.2f #%d',
-                            rid, platform, type_, id_, cand_title, expected_title, expected_ep_title, best, thr, stats.dropped_title_mismatch
-                        )
+                        drop_reasons['title_mismatch'] += 1
+                        drop_examples.setdefault('title_mismatch', f"cand={cand_title[:60]} exp={(expected_title or expected_ep_title)[:60]} ratio={best:.3f} thr={thr:.2f}")
                         continue
             if TRAKT_STRICT_YEAR and expected_year:
                 stream_year = _extract_year(s.get('name') or '') or _extract_year(s.get('description') or '')
                 if stream_year and abs(int(stream_year) - int(expected_year)) > 1:
                     stats.dropped_title_mismatch += 1
-                    try:
-                        logger.info("DROP_TITLE_MISMATCH rid=%s name=%s expected_title=%s dropped_title_mismatch=%s", rid, s.get("name"), expected_title, stats.dropped_title_mismatch)
-                    except Exception:
-                        pass
+                    drop_reasons['year_mismatch'] += 1
+                    drop_examples.setdefault('year_mismatch', f"name={(s.get('name') or '')[:60]} exp_year={expected_year} got_year={stream_year}")
                     continue
 
             filtered_pairs.append((s, m))
@@ -7137,6 +7195,28 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             stats.ms_title_mismatch += int((time.monotonic() - t_title0) * 1000)
         except Exception:
             pass
+
+
+    # Batch drop logging summary (single log per drop reason; avoids per-item DROP_* spam).
+    try:
+        for _reason, _count in sorted((drop_reasons or {}).items()):
+            try:
+                c = int(_count or 0)
+            except Exception:
+                c = 0
+            if c <= 0:
+                continue
+            ex = ""
+            try:
+                ex = str((drop_examples or {}).get(_reason, "") or "")
+            except Exception:
+                ex = ""
+            if ex:
+                logger.info("BATCH_DROP rid=%s reason=%s count=%d ex=%s", rid, str(_reason).upper(), c, ex)
+            else:
+                logger.info("BATCH_DROP rid=%s reason=%s count=%d", rid, str(_reason).upper(), c)
+    except Exception:
+        pass
 
 
     # Global hash visibility (per request)
@@ -8950,7 +9030,13 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 # ---------------------------
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "build": BUILD_ID, "ts": int(time.time())}), 200
+    # Warm per-worker internals on cheap endpoint (cron ping). No external calls.
+    warmed = False
+    try:
+        warmed = bool(_micro_warm_worker("health"))
+    except Exception:
+        warmed = False
+    return jsonify({"ok": True, "build": BUILD_ID, "ts": int(time.time()), "warmed": warmed}), 200
 
 
 # ---------------------------
@@ -9099,6 +9185,13 @@ def manifest():
 def stream(type_: str, id_: str):
     if not _is_valid_stream_id(type_, id_):
         return jsonify({"streams": []}), 400
+
+    # Per-request micro-warm: ensures this worker is ready even if traffic lands on a cold PID.
+    # No external calls; runs once per PID.
+    try:
+        _micro_warm_worker("stream")
+    except Exception:
+        pass
 
     mem_start = 0
     try:
