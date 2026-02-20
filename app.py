@@ -49,6 +49,50 @@ from email.utils import parsedate_to_datetime
 from xml.etree import ElementTree as ET  # NZBGeek (Newznab) readiness checks
 import threading
 import resource  # For memory tracking (ru_maxrss)
+
+# ---------------------------
+# urllib3 connect/TLS phase timing (no extra requests; near-zero overhead)
+# Measures only when a NEW connection is created; warm reuse will report 0ms.
+# ---------------------------
+_NETPH = threading.local()
+NETPHASE_OK = False
+try:
+    import urllib3.util.connection as _uconn
+    import urllib3.connection as _ucon
+
+    _ORIG_CREATE_CONN = _uconn.create_connection
+    _ORIG_HTTPS_CONNECT = _ucon.HTTPSConnection.connect
+
+    def _timed_create_connection(*args, **kwargs):
+        # DNS + TCP connect happen here (best-effort).
+        if getattr(_NETPH, "armed", False):
+            t0 = time.monotonic()
+            sock = _ORIG_CREATE_CONN(*args, **kwargs)
+            _NETPH.conn_ms = int((time.monotonic() - t0) * 1000)
+            return sock
+        return _ORIG_CREATE_CONN(*args, **kwargs)
+
+    def _timed_https_connect(self):
+        # HTTPSConnection.connect covers connection setup including TLS handshake.
+        # We approximate TLS as: total_connect_ms - conn_ms (DNS+TCP).
+        if getattr(_NETPH, "armed", False):
+            # reset per-request
+            _NETPH.conn_ms = 0
+            _NETPH.tls_ms = 0
+            t0 = time.monotonic()
+            _ORIG_HTTPS_CONNECT(self)
+            total_ms = int((time.monotonic() - t0) * 1000)
+            conn_ms = int(getattr(_NETPH, "conn_ms", 0) or 0)
+            _NETPH.tls_ms = max(0, total_ms - conn_ms)
+            return
+        return _ORIG_HTTPS_CONNECT(self)
+
+    _uconn.create_connection = _timed_create_connection
+    _ucon.HTTPSConnection.connect = _timed_https_connect
+    NETPHASE_OK = True
+except Exception:
+    NETPHASE_OK = False
+  # For memory tracking (ru_maxrss)
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
@@ -5192,6 +5236,11 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
         "post_ms": 0,
         "ms_provider": 0,
         "wait_ms": 0,
+        "req_epoch_ms": 0,
+        "conn_ms": 0,
+        "tls_ms": 0,
+        "pre_net_ms": 0,
+        "svrwait_ms": 0,
         "err": "",
     }
     t0 = time.monotonic()
@@ -5205,11 +5254,15 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
 
         # HTTP timing: stream=True so we can separate response header time (http_ms)
         # from full body read time (read_ms).
+        meta["req_epoch_ms"] = int(time.time_ns() // 1_000_000)
+        if NETPHASE_OK:
+            _NETPH.armed = True
+            _NETPH.conn_ms = 0
+            _NETPH.tls_ms = 0
         t_http0 = time.monotonic()
         with sess.get(url, headers=headers, timeout=timeout, stream=True) as resp:
             meta["http_ms"] = int((time.monotonic() - t_http0) * 1000)
             meta["status"] = int(getattr(resp, "status_code", 0) or 0)
-
             # Read/download timing (body)
             t_read0 = time.monotonic()
             raw = getattr(resp, "content", b"") or b""
@@ -5283,6 +5336,26 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
         meta["err"] = type(e).__name__
         return [], meta
     finally:
+        if NETPHASE_OK and getattr(_NETPH, "armed", False):
+            try:
+                meta["conn_ms"] = int(getattr(_NETPH, "conn_ms", 0) or 0)
+                meta["tls_ms"] = int(getattr(_NETPH, "tls_ms", 0) or 0)
+            except Exception:
+                meta["conn_ms"] = int(meta.get("conn_ms", 0) or 0)
+                meta["tls_ms"] = int(meta.get("tls_ms", 0) or 0)
+            try:
+                _NETPH.armed = False
+            except Exception:
+                pass
+
+        # Derived breakdown helpers (best-effort; 0 on warm reuse)
+        try:
+            meta["pre_net_ms"] = int(meta.get("conn_ms", 0) or 0) + int(meta.get("tls_ms", 0) or 0)
+            meta["svrwait_ms"] = max(0, int(meta.get("http_ms", 0) or 0) - int(meta.get("pre_net_ms", 0) or 0))
+        except Exception:
+            meta["pre_net_ms"] = int(meta.get("pre_net_ms", 0) or 0)
+            meta["svrwait_ms"] = int(meta.get("svrwait_ms", 0) or 0)
+
         meta["ms"] = int((time.monotonic() - t0) * 1000)
 
 
@@ -6012,7 +6085,7 @@ def _compact_fetch_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(meta, dict):
         return {}
     # Only keep the safe/compact keys
-    keep = ("tag", "ok", "status", "bytes", "count", "ms", "ms_provider", "wait_ms", "http_ms", "read_ms", "json_ms", "post_ms", "soft_timeout_ms", "err")
+    keep = ("tag", "ok", "status", "bytes", "count", "ms", "ms_provider", "wait_ms", "http_ms", "read_ms", "json_ms", "post_ms", "req_epoch_ms", "conn_ms", "tls_ms", "pre_net_ms", "svrwait_ms", "soft_timeout_ms", "err")
     return {k: meta.get(k) for k in keep if k in meta and meta.get(k) not in (None, "", {})}
 
 # Diversify top M while preserving quality: pick from a larger pool, bucketed by resolution, then mix providers/suppliers.
@@ -9330,8 +9403,8 @@ def stream(type_: str, id_: str):
 
         logger.info(
                 "WRAP_TIMING rid=%s total_ms=%s fetch_wall_ms=%s "
-                "aio_local_ms=%s aio_join_ms=%s aio_http_ms=%s aio_read_ms=%s aio_json_ms=%s aio_post_ms=%s aio_prov_ms=%s "
-                "p2_local_ms=%s p2_join_ms=%s p2_http_ms=%s p2_read_ms=%s p2_json_ms=%s p2_post_ms=%s p2_prov_ms=%s "
+                "aio_local_ms=%s aio_join_ms=%s aio_req_epoch_ms=%s aio_conn_ms=%s aio_tls_ms=%s aio_pre_net_ms=%s aio_svrwait_ms=%s aio_http_ms=%s aio_read_ms=%s aio_json_ms=%s aio_post_ms=%s aio_prov_ms=%s "
+                "p2_local_ms=%s p2_join_ms=%s p2_req_epoch_ms=%s p2_conn_ms=%s p2_tls_ms=%s p2_pre_net_ms=%s p2_svrwait_ms=%s p2_http_ms=%s p2_read_ms=%s p2_json_ms=%s p2_post_ms=%s p2_prov_ms=%s "
                 "parallel_slack_ms=%s "
                 "tmdb_ms=%s py_ff_ms=%s py_clean_ms=%s title_ms=%s py_sort_ms=%s py_mix_ms=%s "
                 "py_tb_prep_ms=%s tb_api_ms=%s py_tb_mark_ms=%s "
@@ -9342,6 +9415,11 @@ def stream(type_: str, id_: str):
                 int(getattr(stats, "ms_fetch_wall", 0) or 0),
                 int(getattr(stats, "ms_fetch_aio", 0) or 0),
                 int(getattr(stats, "ms_join_aio", 0) or 0),
+                int(((getattr(stats, "fetch_aio", {}) or {}).get("req_epoch_ms")) or 0),
+                int(((getattr(stats, "fetch_aio", {}) or {}).get("conn_ms")) or 0),
+                int(((getattr(stats, "fetch_aio", {}) or {}).get("tls_ms")) or 0),
+                int(((getattr(stats, "fetch_aio", {}) or {}).get("pre_net_ms")) or 0),
+                int(((getattr(stats, "fetch_aio", {}) or {}).get("svrwait_ms")) or 0),
                 int(((getattr(stats, "fetch_aio", {}) or {}).get("http_ms")) or 0),
                 int(((getattr(stats, "fetch_aio", {}) or {}).get("read_ms")) or 0),
                 int(((getattr(stats, "fetch_aio", {}) or {}).get("json_ms")) or 0),
@@ -9349,6 +9427,11 @@ def stream(type_: str, id_: str):
                 int(getattr(stats, "ms_fetch_aio_remote", 0) or 0),
                 int(getattr(stats, "ms_fetch_p2", 0) or 0),
                 int(getattr(stats, "ms_join_p2", 0) or 0),
+                int(((getattr(stats, "fetch_p2", {}) or {}).get("req_epoch_ms")) or 0),
+                int(((getattr(stats, "fetch_p2", {}) or {}).get("conn_ms")) or 0),
+                int(((getattr(stats, "fetch_p2", {}) or {}).get("tls_ms")) or 0),
+                int(((getattr(stats, "fetch_p2", {}) or {}).get("pre_net_ms")) or 0),
+                int(((getattr(stats, "fetch_p2", {}) or {}).get("svrwait_ms")) or 0),
                 int(((getattr(stats, "fetch_p2", {}) or {}).get("http_ms")) or 0),
                 int(((getattr(stats, "fetch_p2", {}) or {}).get("read_ms")) or 0),
                 int(((getattr(stats, "fetch_p2", {}) or {}).get("json_ms")) or 0),
