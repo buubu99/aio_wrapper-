@@ -6998,12 +6998,12 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             continue
         if not sanitize_stream_inplace(s):
             stats.dropped_missing_url += 1
-        drop_reasons['missing_url'] += 1
-        continue
+            drop_reasons['missing_url'] += 1
+            continue
         if (s.get("streamData") or {}).get("type") == "error":
             stats.dropped_error += 1
-        drop_reasons['error'] += 1
-        continue
+            drop_reasons['error'] += 1
+            continue
 
         try:
             m = classify_cached(s)
