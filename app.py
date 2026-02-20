@@ -13,6 +13,9 @@ import difflib
 import random
 import subprocess
 
+# Early logger (used by env validation before full logging setup)
+logger = logging.getLogger("aio-wrapper")
+
 # ---------------------------
 # Build / version metadata (logging)
 # ---------------------------
@@ -562,6 +565,23 @@ if VERIFY_DROP_STUBS and not VERIFY_STUB_MAX_BYTES_RAW:
 # ---------- FETCH EXECUTOR + AIO CACHE ----------
 WRAP_FETCH_WORKERS = int(os.getenv("WRAP_FETCH_WORKERS") or os.getenv("FETCH_WORKERS") or "8")
 FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=WRAP_FETCH_WORKERS)
+
+# Warm the fetch thread pool on startup to avoid first-request latency spikes.
+def _warm_fetch_executor() -> None:
+    try:
+        n = max(0, min(int(WRAP_FETCH_WORKERS or 0), 8))
+    except Exception:
+        n = 0
+    if n <= 0:
+        return
+    try:
+        for _ in range(n):
+            FETCH_EXECUTOR.submit(lambda: None)
+    except Exception:
+        pass
+
+_warm_fetch_executor()
+
 
 AIO_CACHE_TTL_S = int(os.getenv("AIO_CACHE_TTL_S", "600") or 600)   # 0 disables cache
 AIO_CACHE_MAX = int(os.getenv("AIO_CACHE_MAX", "200") or 200)
@@ -4322,6 +4342,14 @@ def _p1_ac_features(aio: Any, text_upper: str) -> Tuple[int, str, float]:
 
 def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     bh = s.get("behaviorHints", {}) or {}
+    # Fast-path: if we've already classified this stream in this request, reuse cached meta.
+    try:
+        if isinstance(bh, dict):
+            _cm = bh.get("wrap_m")
+            if isinstance(_cm, dict) and _cm.get("provider") and _cm.get("res") is not None:
+                return _cm
+    except Exception:
+        pass
     name = s.get("name", "").lower()
     desc_raw = s.get("description", "") or ""
     desc = str(desc_raw).lower()
@@ -4538,7 +4566,7 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
-    return {
+    meta = {
         "provider": provider,
         "cached": cached,
         "aio": aio,
@@ -4560,6 +4588,12 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
         "premium_level": premium_level,
         "container": container,
     }
+    try:
+        if isinstance(bh, dict):
+            bh["wrap_m"] = meta
+    except Exception:
+        pass
+    return meta
 
 
 # ---------------------------
@@ -6080,7 +6114,9 @@ def _summarize_streams_for_counts(streams: List[Dict[str, Any]]) -> Dict[str, An
         supplier = str(supplier).upper()
 
         try:
-            m = classify(s)
+            m = (bh.get("wrap_m") if isinstance(bh, dict) else None)
+            if not isinstance(m, dict):
+                m = classify(s)
         except Exception:
             m = {}
         prov = str(m.get("provider") or "UNK").upper()
@@ -8886,6 +8922,20 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     except Exception:
         pass
 
+
+    # Cheap counts summaries (for logs/?debug=1).
+    # By this point, classify() has already run for candidate streams, so wrap_m caching makes this O(n) without regex rework.
+    try:
+        if not getattr(stats, 'counts_in', None):
+            stats.counts_in = _summarize_streams_for_counts(streams)
+    except Exception:
+        pass
+    try:
+        if not getattr(stats, 'counts_out', None):
+            stats.counts_out = _summarize_streams_for_counts(delivered)
+    except Exception:
+        pass
+
     return delivered, stats
 
 # ---------------------------
@@ -9155,9 +9205,16 @@ def stream(type_: str, id_: str):
                 pass
         except Exception:
             stats.fetch_aio, stats.fetch_p2 = {}, {}
+        # Counts summaries (by provider/res/size/etc).
+        # NOTE: These are only needed for debug/ops logs; skip entirely for normal fast path.
         try:
-            stats.counts_in = _summarize_streams_for_counts(streams)
-            stats.counts_out = _summarize_streams_for_counts(out)
+            if want_dbg or WRAP_LOG_COUNTS:
+                if not getattr(stats, "counts_in", None):
+                    stats.counts_in = _summarize_streams_for_counts(streams)
+                if not getattr(stats, "counts_out", None):
+                    stats.counts_out = _summarize_streams_for_counts(out)
+            else:
+                stats.counts_in, stats.counts_out = {}, {}
         except Exception:
             stats.counts_in, stats.counts_out = {}, {}
 
