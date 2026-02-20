@@ -13,6 +13,9 @@ import difflib
 import random
 import subprocess
 
+# Base logger must exist early because some env validation happens before later logging setup.
+logger = logging.getLogger("aio-wrapper")
+
 # ---------------------------
 # Build / version metadata (logging)
 # ---------------------------
@@ -561,7 +564,45 @@ if VERIFY_DROP_STUBS and not VERIFY_STUB_MAX_BYTES_RAW:
 
 # ---------- FETCH EXECUTOR + AIO CACHE ----------
 WRAP_FETCH_WORKERS = int(os.getenv("WRAP_FETCH_WORKERS") or os.getenv("FETCH_WORKERS") or "8")
-FETCH_EXECUTOR = ThreadPoolExecutor(max_workers=WRAP_FETCH_WORKERS)
+
+# Fork-safe per-worker fetch executor (Gunicorn may preload/fork).
+_FETCH_EXECUTOR = None
+_FETCH_EXECUTOR_PID = None
+_FETCH_EXECUTOR_LOCK = threading.Lock()
+
+def _get_fetch_executor() -> ThreadPoolExecutor:
+    global _FETCH_EXECUTOR, _FETCH_EXECUTOR_PID
+    pid = os.getpid()
+    with _FETCH_EXECUTOR_LOCK:
+        if _FETCH_EXECUTOR is None or _FETCH_EXECUTOR_PID != pid:
+            # If we inherited an executor from a different PID (preload/fork), discard it.
+            try:
+                if _FETCH_EXECUTOR is not None:
+                    _FETCH_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                # cancel_futures not supported on very old Pythons
+                try:
+                    if _FETCH_EXECUTOR is not None:
+                        _FETCH_EXECUTOR.shutdown(wait=False)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            _FETCH_EXECUTOR = ThreadPoolExecutor(
+                max_workers=WRAP_FETCH_WORKERS,
+                thread_name_prefix="wrapfetch",
+            )
+            _FETCH_EXECUTOR_PID = pid
+
+            # Warm a few threads inside the current worker to reduce first-request overhead.
+            try:
+                warm_n = max(0, min(int(WRAP_FETCH_WORKERS or 0), 4))
+                for _ in range(warm_n):
+                    __get_fetch_executor().submit(lambda: None)
+            except Exception:
+                pass
+        return _FETCH_EXECUTOR
 
 AIO_CACHE_TTL_S = int(os.getenv("AIO_CACHE_TTL_S", "600") or 600)   # 0 disables cache
 AIO_CACHE_MAX = int(os.getenv("AIO_CACHE_MAX", "200") or 200)
@@ -1132,7 +1173,7 @@ def _verify_stream_url(
             return True
         return False
 
-    def _sig_classify(buf: bytes) -> str:
+    def _sig_classify_cached(buf: bytes) -> str:
         """Return best-effort signature label for first bytes."""
         if not buf:
             return ""
@@ -1256,7 +1297,7 @@ def _verify_stream_url(
         return (False, 0, "FINAL_NOT_PLAYABLE")
 
     # Quick reject: obvious upstream error text types or signatures.
-    sig0 = _sig_classify(got0)
+    sig0 = _sig_classify_cached(got0)
     if _looks_texty(ct) or sig0 in {"HTML", "JSON"}:
         if h0:
             _verify_host_cache_set(h0, "unsafe", "UPSTREAM_ERROR_TEXT")
@@ -1312,7 +1353,7 @@ def _verify_stream_url(
                     return (False, 0, "PROBE_UNSAFE_CL_MISMATCH")
 
             # Re-check text signatures using richer bytes.
-            sig = _sig_classify(got)
+            sig = _sig_classify_cached(got)
             if _looks_texty(ct) or sig in {"HTML", "JSON"}:
                 if h0:
                     _verify_host_cache_set(h0, "unsafe", "UPSTREAM_ERROR_TEXT")
@@ -1323,7 +1364,7 @@ def _verify_stream_url(
 
     # Determine kind from headers/signatures
     ct_low = (ct or "").split(";", 1)[0].strip().lower()
-    sig = _sig_classify(got)
+    sig = _sig_classify_cached(got)
     kind = ""
     if "video/mp4" in ct_low:
         kind = "MP4"
@@ -3106,7 +3147,6 @@ handler.setFormatter(SafeFormatter("%(asctime)s | %(levelname)s | %(rid)s | %(me
 logging.getLogger().addHandler(handler)
 logging.getLogger().setLevel(LOG_LEVEL)
 logging.getLogger().addFilter(RequestIdFilter())
-logger = logging.getLogger("aio-wrapper")
 logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N}")
 
 
@@ -4562,6 +4602,23 @@ def classify(s: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+
+
+# Cache classify() output per stream dict to avoid repeated heavy parsing during counts/logging.
+def classify_cached(s: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        m = s.get("_wrap_m", None)
+        if isinstance(m, dict):
+            return m
+    except Exception:
+        pass
+    m = classify(s)
+    try:
+        s["_wrap_m"] = m
+    except Exception:
+        pass
+    return m
+
 # ---------------------------
 # Expected metadata (real TMDB fetch)
 # ---------------------------
@@ -5422,14 +5479,14 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
     p2_fut = None
 
     if AIO_BASE and not iphone_usenet_mode:
-        aio_fut = FETCH_EXECUTOR.submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, upstream_id, AIO_TAG, (ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT))
+        aio_fut = _get_fetch_executor().submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, upstream_id, AIO_TAG, (ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT))
     elif iphone_usenet_mode:
         logger.info("AIO skipped rid=%s reason=iphone_usenet_only", _rid())
     else:
         aio_meta = {'tag': AIO_TAG, 'ok': False, 'err': 'no_base'}
         logger.warning("AIO disabled rid=%s reason=no_base", _rid())
     if PROV2_BASE:
-        p2_fut = FETCH_EXECUTOR.submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, upstream_id, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT))
+        p2_fut = _get_fetch_executor().submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, upstream_id, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT))
     def _harvest_p2():
         nonlocal p2_streams, prov2_in, p2_meta, p2_ms_remote, p2_ms_local
         if not p2_fut:
@@ -5569,7 +5626,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                 if not isinstance(st, dict):
                     continue
                 try:
-                    mt = classify(st)
+                    mt = classify_cached(st)
                 except Exception:
                     mt = {}
                 scored.append((i, st, mt))
@@ -6080,7 +6137,7 @@ def _summarize_streams_for_counts(streams: List[Dict[str, Any]]) -> Dict[str, An
         supplier = str(supplier).upper()
 
         try:
-            m = classify(s)
+            m = classify_cached(s)
         except Exception:
             m = {}
         prov = str(m.get("provider") or "UNK").upper()
@@ -6899,7 +6956,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             continue
 
         try:
-            m = classify(s)
+            m = classify_cached(s)
         except Exception as e:
             stats.dropped_error += 1
             if len(stats.error_reasons) < 8:
@@ -6989,7 +7046,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     out_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = cleaned[:]
 
     # Optional: title/year validation gate (local similarity; useful to drop obvious mismatches)
-    # Uses parsed title from classify() when available (streams often have empty s['title']).
+    # Uses parsed title from classify_cached() when available (streams often have empty s['title']).
     if (not fast_mode) and (not VALIDATE_OFF) and (TRAKT_VALIDATE_TITLES or TRAKT_STRICT_YEAR):
         t_title0 = time.monotonic()
         expected_title = (expected.get('title') or '').lower().strip()
@@ -9195,6 +9252,19 @@ def stream(type_: str, id_: str):
         else:
             out_for_client = out
 
+        # Strip internal per-stream cache keys from client output (keep internal 'out' intact for logs/stats).
+        try:
+            cleaned = []
+            for _s in (out_for_client or []):
+                if isinstance(_s, dict) and "_wrap_m" in _s:
+                    _c = dict(_s)
+                    _c.pop("_wrap_m", None)
+                    cleaned.append(_c)
+                else:
+                    cleaned.append(_s)
+            out_for_client = cleaned
+        except Exception:
+            pass
         payload: Dict[str, Any] = {"streams": out_for_client, "cacheMaxAge": int(CACHE_TTL)}
 
         if want_dbg:
