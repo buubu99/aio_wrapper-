@@ -5503,7 +5503,40 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
             try:
                 aio_streams, aio_in, aio_ms_remote, aio_meta, aio_ms_local = aio_fut.result(timeout=remaining)
             except FuturesTimeoutError:
+                # AIO did not finish within the request deadline. Two important fixes:
+                #  (1) Optional small grace window to catch near-miss completions (doesn't block beyond AIO_JOIN_GRACE_S).
+                #  (2) Always let the in-flight fetch warm the SWR cache via done_callback, so the next request can use it.
                 aio_streams, aio_in, aio_ms_remote, aio_meta, aio_ms_local = [], 0, 0, {'tag': AIO_TAG, 'ok': False, 'err': 'timeout'}, 0
+
+                grace_s = 0.0
+                try:
+                    grace_s = float(os.environ.get("AIO_JOIN_GRACE_S", "0") or 0)
+                except Exception:
+                    grace_s = 0.0
+
+                if grace_s > 0:
+                    try:
+                        # Allow up to grace_s extra beyond the original deadline (bounded).
+                        t_gr0 = time.monotonic()
+                        aio_streams, aio_in, aio_ms_remote, aio_meta, aio_ms_local = aio_fut.result(
+                            timeout=min(grace_s, max(0.05, (deadline + grace_s) - time.monotonic()))
+                        )
+                        try:
+                            if isinstance(aio_meta, dict):
+                                aio_meta["late_grace_ms"] = int((time.monotonic() - t_gr0) * 1000)
+                        except Exception:
+                            pass
+                    except FuturesTimeoutError:
+                        # still not ready; keep timeout meta
+                        aio_streams, aio_in, aio_ms_remote, aio_meta, aio_ms_local = [], 0, 0, {'tag': AIO_TAG, 'ok': False, 'err': 'timeout'}, 0
+                    except Exception as e:
+                        aio_streams, aio_in, aio_ms_remote, aio_meta, aio_ms_local = [], 0, 0, {'tag': AIO_TAG, 'ok': False, 'err': f'error:{type(e).__name__}'}, 0
+
+                # Warm cache when AIO eventually finishes (even if we timed out here)
+                try:
+                    aio_fut.add_done_callback(_make_aio_cache_update_cb(aio_key))
+                except Exception:
+                    pass
 
             try:
                 if isinstance(aio_meta, dict):
@@ -9063,16 +9096,24 @@ def stream(type_: str, id_: str):
         except Exception:
             stats.memory_peak_kb = 0
 
-        # Attach fetch timings
+        # Attach fetch counts + fetch meta (safe; used for logs/debug)
         stats.aio_in = int(aio_in or 0)
         stats.prov2_in = int(prov2_in or 0)
-        stats.ms_fetch_aio = int(ms_aio_local or 0)
-        stats.ms_fetch_p2 = int(ms_p2_local or 0)
+        _raw_aio_local_ms = int(ms_aio_local or 0)
+        _raw_p2_local_ms  = int(ms_p2_local or 0)
 
         # Patch 6: counts + fetch meta (safe; used for logs/debug)
         try:
             stats.fetch_aio = _compact_fetch_meta((fetch_meta or {}).get("aio") or {})
             stats.fetch_p2 = _compact_fetch_meta((fetch_meta or {}).get("p2") or {})
+            # ms_fetch_*: prefer per-provider meta['ms'] (always set by _fetch_* finally).
+            # This avoids misleading 0ms in cache-hit / timeout scenarios where we didn't get a local_ms.
+            try:
+                stats.ms_fetch_aio = int((stats.fetch_aio or {}).get("ms") or _raw_aio_local_ms or 0)
+                stats.ms_fetch_p2  = int((stats.fetch_p2  or {}).get("ms") or _raw_p2_local_ms  or 0)
+            except Exception:
+                stats.ms_fetch_aio = int(_raw_aio_local_ms or 0)
+                stats.ms_fetch_p2  = int(_raw_p2_local_ms  or 0)
             try:
                 stats.ms_join_aio = int(((fetch_meta or {}).get("aio") or {}).get("wait_ms") or 0)
                 stats.ms_join_p2  = int(((fetch_meta or {}).get("p2") or {}).get("wait_ms") or 0)
