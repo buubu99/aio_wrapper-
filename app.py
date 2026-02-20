@@ -5455,7 +5455,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
         aio_streams, aio_in, cached_ms = cached
         aio_ms_remote = int(cached_ms or 0)
         aio_ms_local = 0
-        aio_meta = {'tag': AIO_TAG, 'ok': True, 'status': 200, 'err': 'cache_hit', 'count': int(aio_in or 0), 'ms': int(aio_ms_remote or 0), 'wait_ms': 0}
+        aio_meta = {'tag': AIO_TAG, 'src': 'cache_hit', 'ok': True, 'status': 200, 'err': 'cache_hit', 'count': int(aio_in or 0), 'ms': 0, 'last_fetch_ms': int(aio_ms_remote or 0), 'wait_ms': 0}
 
         if aio_fut:
             aio_fut.add_done_callback(_make_aio_cache_update_cb(aio_key))
@@ -5476,7 +5476,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                 aio_streams, aio_in, cached_ms = cached
                 aio_ms_remote = int(cached_ms or 0)
                 aio_ms_local = 0
-                aio_meta = {'tag': AIO_TAG, 'ok': True, 'err': 'soft_timeout_cache' if float(soft or 0) > 0 else 'cache_hit', 'count': int(aio_in or 0), 'ms': int(aio_ms_remote or 0), 'soft_timeout_ms': int(float(soft or 0) * 1000)}
+                aio_meta = {'tag': AIO_TAG, 'src': 'cache_fallback', 'ok': True, 'status': 200, 'err': 'soft_timeout_cache' if float(soft or 0) > 0 else 'cache_hit', 'count': int(aio_in or 0), 'ms': 0, 'last_fetch_ms': int(aio_ms_remote or 0), 'soft_timeout_ms': int(float(soft or 0) * 1000)}
             else:
                 aio_streams, aio_in = [], 0
                 aio_ms_remote = 0
@@ -6118,7 +6118,7 @@ def _compact_fetch_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(meta, dict):
         return {}
     # Only keep the safe/compact keys
-    keep = ("tag", "ok", "status", "bytes", "count", "ms", "ms_provider", "wait_ms", "http_ms", "read_ms", "json_ms", "post_ms", "req_epoch_ms", "conn_ms", "tls_ms", "pre_net_ms", "svrwait_ms", "soft_timeout_ms", "err")
+    keep = ("tag", "src", "ok", "status", "bytes", "count", "ms", "last_fetch_ms", "ms_provider", "wait_ms", "late_grace_ms", "http_ms", "read_ms", "json_ms", "post_ms", "req_epoch_ms", "conn_ms", "tls_ms", "pre_net_ms", "svrwait_ms", "soft_timeout_ms", "err")
     return {k: meta.get(k) for k in keep if k in meta and meta.get(k) not in (None, "", {})}
 
 # Diversify top M while preserving quality: pick from a larger pool, bucketed by resolution, then mix providers/suppliers.
@@ -9109,7 +9109,15 @@ def stream(type_: str, id_: str):
             # ms_fetch_*: prefer per-provider meta['ms'] (always set by _fetch_* finally).
             # This avoids misleading 0ms in cache-hit / timeout scenarios where we didn't get a local_ms.
             try:
-                stats.ms_fetch_aio = int((stats.fetch_aio or {}).get("ms") or _raw_aio_local_ms or 0)
+                _aio_err = str((stats.fetch_aio or {}).get("err") or "").lower().strip()
+                _aio_src = str((stats.fetch_aio or {}).get("src") or "").lower().strip()
+                _aio_is_cache = (_aio_src.startswith("cache") or _aio_err == "cache_hit" or _aio_err.endswith("cache") or ("cache" in _aio_err))
+                # IMPORTANT: on cache-hit/fallback, meta['ms'] reflects the *last live fetch* (history),
+                # not time spent in this request. Keep request timing truthful: provider local_ms=0 when cached.
+                if _aio_is_cache:
+                    stats.ms_fetch_aio = 0
+                else:
+                    stats.ms_fetch_aio = int((stats.fetch_aio or {}).get("ms") or _raw_aio_local_ms or 0)
                 stats.ms_fetch_p2  = int((stats.fetch_p2  or {}).get("ms") or _raw_p2_local_ms  or 0)
             except Exception:
                 stats.ms_fetch_aio = int(_raw_aio_local_ms or 0)
@@ -9234,6 +9242,7 @@ def stream(type_: str, id_: str):
                                     "aio_wait": aio_join_ms,
                                     "p2_wait": p2_join_ms,
                                     "aio_local": aio_local_ms,
+                                    "aio_last_fetch": int((stats.fetch_aio or {}).get("last_fetch_ms") or 0),
                                     "p2_local": p2_local_ms,
                                     "aio_provider": aio_provider_ms,
                                     "p2_provider": p2_provider_ms,
@@ -9442,10 +9451,32 @@ def stream(type_: str, id_: str):
         except Exception:
             py_pre_wrap_ms = 0
 
+        # Source semantics for per-provider timing:
+        #  - live: this request performed a network fetch (meta contains NETPHASE breakdown)
+        #  - cache_hit/cache_fallback: this request used cached AIO; meta['last_fetch_ms'] is historical and must not
+        #    be treated as current request time.
+        aio_src = ""
+        p2_src = ""
+        aio_last_fetch_ms = 0
+        try:
+            _fa = getattr(stats, "fetch_aio", {}) or {}
+            _ea = str(_fa.get("err") or "").strip()
+            aio_src = str(_fa.get("src") or "").strip() or (_ea if _ea else ("live" if bool(_fa.get("ok")) else "unknown"))
+            aio_last_fetch_ms = int(_fa.get("last_fetch_ms") or 0)
+        except Exception:
+            aio_src = ""
+            aio_last_fetch_ms = 0
+        try:
+            _fp = getattr(stats, "fetch_p2", {}) or {}
+            _ep = str(_fp.get("err") or "").strip()
+            p2_src = (_ep if _ep else ("live" if bool(_fp.get("ok")) else "unknown"))
+        except Exception:
+            p2_src = ""
+
         logger.info(
                 "WRAP_TIMING rid=%s total_ms=%s fetch_wall_ms=%s "
-                "aio_local_ms=%s aio_join_ms=%s aio_req_epoch_ms=%s aio_conn_ms=%s aio_tls_ms=%s aio_pre_net_ms=%s aio_svrwait_ms=%s aio_http_ms=%s aio_read_ms=%s aio_json_ms=%s aio_post_ms=%s aio_prov_ms=%s "
-                "p2_local_ms=%s p2_join_ms=%s p2_req_epoch_ms=%s p2_conn_ms=%s p2_tls_ms=%s p2_pre_net_ms=%s p2_svrwait_ms=%s p2_http_ms=%s p2_read_ms=%s p2_json_ms=%s p2_post_ms=%s p2_prov_ms=%s "
+                "aio_local_ms=%s aio_join_ms=%s aio_src=%s aio_last_fetch_ms=%s aio_req_epoch_ms=%s aio_conn_ms=%s aio_tls_ms=%s aio_pre_net_ms=%s aio_svrwait_ms=%s aio_http_ms=%s aio_read_ms=%s aio_json_ms=%s aio_post_ms=%s aio_prov_ms=%s "
+                "p2_local_ms=%s p2_join_ms=%s p2_src=%s p2_req_epoch_ms=%s p2_conn_ms=%s p2_tls_ms=%s p2_pre_net_ms=%s p2_svrwait_ms=%s p2_http_ms=%s p2_read_ms=%s p2_json_ms=%s p2_post_ms=%s p2_prov_ms=%s "
                 "parallel_slack_ms=%s "
                 "tmdb_ms=%s py_ff_ms=%s py_clean_ms=%s title_ms=%s py_sort_ms=%s py_mix_ms=%s "
                 "py_tb_prep_ms=%s tb_api_ms=%s py_tb_mark_ms=%s "
@@ -9456,6 +9487,8 @@ def stream(type_: str, id_: str):
                 int(getattr(stats, "ms_fetch_wall", 0) or 0),
                 int(getattr(stats, "ms_fetch_aio", 0) or 0),
                 int(getattr(stats, "ms_join_aio", 0) or 0),
+                aio_src,
+                int(aio_last_fetch_ms or 0),
                 int(((getattr(stats, "fetch_aio", {}) or {}).get("req_epoch_ms")) or 0),
                 int(((getattr(stats, "fetch_aio", {}) or {}).get("conn_ms")) or 0),
                 int(((getattr(stats, "fetch_aio", {}) or {}).get("tls_ms")) or 0),
@@ -9468,6 +9501,7 @@ def stream(type_: str, id_: str):
                 int(getattr(stats, "ms_fetch_aio_remote", 0) or 0),
                 int(getattr(stats, "ms_fetch_p2", 0) or 0),
                 int(getattr(stats, "ms_join_p2", 0) or 0),
+                p2_src,
                 int(((getattr(stats, "fetch_p2", {}) or {}).get("req_epoch_ms")) or 0),
                 int(((getattr(stats, "fetch_p2", {}) or {}).get("conn_ms")) or 0),
                 int(((getattr(stats, "fetch_p2", {}) or {}).get("tls_ms")) or 0),
