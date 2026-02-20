@@ -5510,7 +5510,9 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
 
                 grace_s = 0.0
                 try:
-                    grace_s = float(os.environ.get("AIO_JOIN_GRACE_S", "0") or 0)
+                    # Back-compat: older env used AIO_JOIN_GRACE (seconds). Newer uses AIO_JOIN_GRACE_S.
+                    _gr = os.environ.get("AIO_JOIN_GRACE_S") or os.environ.get("AIO_JOIN_GRACE") or "0"
+                    grace_s = float((_gr or "0").strip() or 0)
                 except Exception:
                     grace_s = 0.0
 
@@ -5524,6 +5526,8 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                         try:
                             if isinstance(aio_meta, dict):
                                 aio_meta["late_grace_ms"] = int((time.monotonic() - t_gr0) * 1000)
+                                # Mark that this request harvested AIO during the grace window (still a live fetch).
+                                aio_meta.setdefault("src", "live_grace")
                         except Exception:
                             pass
                     except FuturesTimeoutError:
