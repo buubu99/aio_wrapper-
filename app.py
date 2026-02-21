@@ -12,6 +12,9 @@ import uuid
 import difflib
 import random
 import subprocess
+import asyncio
+import aiohttp  # required
+
 
 # Base logger must exist early because some env validation happens before later logging setup.
 logger = logging.getLogger("aio-wrapper")
@@ -1565,20 +1568,38 @@ def sniff_magic(data: bytes) -> str:
     except Exception:
         return "unknown"
 
-def _usenet_range_probe_is_real(url: str, *, timeout_s: float, range_end: int, stub_len: int, retries: int, deadline_ts: Optional[float] = None) -> Tuple[bool, str, int]:
-    """Return (is_real, reason, bytes_read).
 
-    Heuristic: request Range bytes=0-range_end and read up to (range_end+1) bytes.
-    If we read exactly `stub_len` bytes, treat as STUB. If we read exactly (range_end+1), treat as REAL.
-    Anything else is treated as not-real (short read, range ignored, auth, etc.).
+async def _usenet_range_probe_is_real_async(
+    session: "aiohttp.ClientSession",
+    url: str,
+    *,
+    timeout_s: float,
+    range_end: int,
+    stub_len: int,
+    retries: int,
+    deadline_ts: Optional[float] = None,
+) -> Tuple[bool, str, int]:
+    """Async: Return (is_real, reason, bytes_read) using a tiny Range GET.
+
+    Keeps the same semantics as the sync version:
+      - Request Range bytes=0-range_end and read up to (range_end+1) bytes.
+      - Treat <= stub_len as STUB.
+      - Treat == expected (range_end+1) as REAL *iff* it doesn't look like HTML/JSON and entropy is reasonable.
     """
     u = url or ""
     try:
         # If caller passed a short /r/<token> URL, unwrap to upstream.
-        if "/r/" in u:
+        if "/r/" in u or (WRAP_URL_SHORT and len(u) < 100):
             long_u = _unwrap_short_url(u)
             if long_u:
                 u = long_u
+    except Exception:
+        pass
+
+    # Skip known multi-hop proxies that tend to be slow/flaky in probes.
+    try:
+        if "replay" in (u or "").lower():
+            return (False, "SKIP_REPLAY", 0)
     except Exception:
         pass
 
@@ -1587,91 +1608,77 @@ def _usenet_range_probe_is_real(url: str, *, timeout_s: float, range_end: int, s
     base_headers = {"User-Agent": ua, "Range": f"bytes=0-{int(range_end)}", "Accept": "*/*"}
     auth_h = _probe_auth_headers_for_url(u)
     if auth_h:
-        base_headers.update(auth_h)
+        try:
+            base_headers.update(auth_h)
+        except Exception:
+            pass
 
-    last_err = ""
-    last_bytes = 0
-
-    # No retry loop for fast (retries=0 via env)
-    # Enforce an overall deadline so the probe can't blow past the /stream latency budget.
+    # Budget-aware per-request timeout
     if deadline_ts is not None:
         rem = float(deadline_ts) - float(time.monotonic())
         if rem <= 0.15:
-            return (False, "BUDGET", int(last_bytes or 0))
-        # Cap per-request timeout by remaining time (and keep a small minimum so connect doesn't instantly fail).
+            return (False, "BUDGET", 0)
         timeout_eff = max(0.35, min(float(timeout_s), rem))
     else:
         timeout_eff = float(timeout_s)
 
-    try:
-        sess = _tls_requests_session()
-        r = sess.get(u, headers=base_headers, timeout=float(timeout_eff), allow_redirects=True, stream=True)
+    last_err = ""
+    last_bytes = 0
+
+    for attempt in range(1, max(1, int(retries or 1)) + 1):
         try:
-            st = int(getattr(r, "status_code", 0) or 0)
-        except Exception:
-            st = 0
-        if st in (401, 403):
-            try:
-                r.close()
-            except Exception:
-                pass
-            return (False, "AUTH", 0)
-        if st < 200 or st >= 400:
-            last_err = f"HTTP_{st}"
-            try:
-                r.close()
-            except Exception:
-                pass
-            return (False, last_err, 0)
+            async with session.get(
+                u,
+                headers=base_headers,
+                timeout=aiohttp.ClientTimeout(total=float(timeout_eff)),
+                allow_redirects=True,
+            ) as r:
+                st = int(getattr(r, "status", 0) or 0)
+                if st in (401, 403):
+                    return (False, "AUTH", 0)
+                if st < 200 or st >= 400:
+                    last_err = f"HTTP_{st}"
+                    if attempt < retries:
+                        await asyncio.sleep(0.5)
+                        continue
+                    return (False, last_err, 0)
 
-        ct = (r.headers.get("Content-Type") or "").lower()
-        if ct.startswith("text/") or ("json" in ct) or ("xml" in ct) or ("html" in ct):
-            try:
-                r.close()
-            except Exception:
-                pass
-            return (False, "CT_TEXT", 0)
+                ct = (r.headers.get("Content-Type") or "").lower()
+                if ct.startswith("text/") or ("json" in ct) or ("xml" in ct) or ("html" in ct):
+                    return (False, "CT_TEXT", 0)
 
-        # Read up to expected bytes (and stop). Guard against servers ignoring Range.
-        total = 0
-        max_allow = expected + 2  # tiny slack
-        body = b""
-        for chunk in r.iter_content(chunk_size=4096):
-            if not chunk:
+                # Read up to expected bytes (+ tiny slack) and stop.
+                max_allow = expected + 2
+                body = await r.content.read(max_allow)
+                total = len(body)
+                last_bytes = int(total)
+
+                magic = sniff_magic(body)
+                ent = shannon_entropy(body)
+
+                if total <= int(stub_len):
+                    return (False, "STUB_LEN", int(total))
+                if magic in ("html", "json", "xml/htmlish"):
+                    return (False, f"BAD_MAGIC_{magic}", int(total))
+                if ent < 3.0:
+                    return (False, f"LOW_ENT_{ent:.2f}", int(total))
+
+                if total == expected and (magic != "unknown" or ent >= 4.5):
+                    return (True, "REAL", int(total))
+                if total > expected:
+                    return (False, "RANGE_IGNORED", int(total))
+                return (False, f"SHORT_{int(total)}", int(total))
+
+        except asyncio.TimeoutError:
+            last_err = "TIMEOUT"
+            if attempt < retries:
+                await asyncio.sleep(0.5)
                 continue
-            body += chunk
-            total += len(chunk)
-            if total >= expected:
-                break
-            if total > max_allow:
-                break
-
-        try:
-            r.close()
-        except Exception:
-            pass
-
-        last_bytes = int(total)
-
-        # Fast probe checks (entropy/magic for stubs)
-        magic = sniff_magic(body)
-        ent = shannon_entropy(body)
-        if total <= stub_len:  # Tiny/stub size
-            return (False, "STUB_LEN", int(total))
-        if magic in ("html", "json", "xml/htmlish"):  # Bad content
-            return (False, f"BAD_MAGIC_{magic}", int(total))
-        if ent < 3.0:  # Low entropy stub
-            return (False, f"LOW_ENT_{ent:.2f}", int(total))
-        if total == expected and (magic != "unknown" or ent >= 4.5):
-            return (True, "REAL", int(total))
-        if total > expected:
-            return (False, "RANGE_IGNORED", int(total))
-        return (False, f"SHORT_{int(total)}", int(total))
-
-    except requests.Timeout:
-        last_err = "TIMEOUT"
-    except Exception as e:
-        last_err = f"ERR:{type(e).__name__}"
+        except Exception as e:
+            last_err = f"ERR:{type(e).__name__}"
+            if attempt < retries:
+                await asyncio.sleep(0.5)
+                continue
 
     return (False, last_err or "ERR", int(last_bytes or 0))
 
@@ -1693,16 +1700,7 @@ def _apply_usenet_playability_probe(
 ) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
     """Probe top-N usenet candidates and mark/drop unplayable proxy links.
 
-    Goals:
-      - Keep /stream latency bounded via an overall budget (default ~8.5s).
-      - Identify REAL links (read exactly range_end+1 bytes).
-      - Mark REAL with meta["usenet_probe"]="REAL" and (optionally) meta["ready"]=True.
-      - Mark non-REAL with meta["usenet_probe"]="STUB"/"ERR" (unless we ran out of budget).
-      - Drop probed STUBs (and optionally drop probed ERR) from output so they don't occupy top spots.
-      - Stop early once `target_real` REAL links are found *or* we hit the budget.
-
-    IMPORTANT: Anything we *didn't* get to probe within the budget is treated as "not probed"
-    and stays in the normal sorting pack with debrid.
+    Async aiohttp probe (lower overhead + true concurrency). Requires aiohttp (no fallback).
     """
     if not pairs:
         return pairs
@@ -1711,7 +1709,7 @@ def _apply_usenet_playability_probe(
     if tn <= 0:
         return pairs
 
-    # Fast-path: honor any pre-existing probe markers (e.g., early P2 probe) without re-probing URLs.
+    # Fast-path: honor any pre-existing probe markers without re-probing.
     try:
         if drop_stubs or drop_fails:
             _drop_idx = set()
@@ -1727,7 +1725,7 @@ def _apply_usenet_playability_probe(
                 pairs = [p for _k, p in enumerate(pairs) if _k not in _drop_idx]
     except Exception:
         pass
-    # Identify usenet-like providers
+
     usenet_provs = {str(p).upper() for p in (USENET_PROVIDERS or USENET_PRIORITY or [])}
     usenet_provs.add("ND")
 
@@ -1744,13 +1742,9 @@ def _apply_usenet_playability_probe(
             pass
         return False
 
-    # Candidate indices: first N usenet items by current order (not first N overall).
-    # We scan the full list until we collect tn unique usenet URLs. This ensures usenet
-    # candidates that would otherwise sit below debrid in the global sort still get probed.
     cand: List[int] = []
     seen_url: set[str] = set()
     for i, (s, m) in enumerate(pairs):
-        # Skip URLs already probed earlier (keeps probe budget for untested items).
         try:
             _up0 = str((m or {}).get("usenet_probe") or "").upper().strip()
             if _up0 in ("REAL", "STUB", "ERR"):
@@ -1759,6 +1753,12 @@ def _apply_usenet_playability_probe(
             pass
         if not _is_usenet_pair((s, m)):
             continue
+        try:
+            bh = (s.get("behaviorHints") or {}) if isinstance(s, dict) else {}
+            if isinstance(bh, dict) and bh.get("proxyHeaders"):
+                continue
+        except Exception:
+            pass
         u = ""
         try:
             u = (s.get("url") or "") if isinstance(s, dict) else ""
@@ -1773,24 +1773,17 @@ def _apply_usenet_playability_probe(
         if len(cand) >= tn:
             break
 
-
-
-    # Mark candidate metas so callers can log accurate scanned counts (cand size) even if we later drop STUB/ERR.
     try:
         for _ci in cand:
-            try:
-                _mci = pairs[_ci][1]
-                if isinstance(_mci, dict):
-                    _mci["_usenet_probe_cand"] = True
-            except Exception:
-                pass
+            _mci = pairs[_ci][1]
+            if isinstance(_mci, dict):
+                _mci["_usenet_probe_cand"] = True
     except Exception:
         pass
 
     if not cand:
         return pairs
 
-    max_workers = max(1, min(int(concurrency or 1), len(cand), int(VERIFY_MAX_WORKERS or 1)))
     target = max(0, int(target_real or 0))
     budget = max(0.5, float(budget_s or 0.0))
     deadline = float(time.monotonic()) + float(budget)
@@ -1801,162 +1794,133 @@ def _apply_usenet_playability_probe(
     err_idx: List[int] = []
     budget_idx: List[int] = []
 
-    # Use a single executor; avoid batch-level waits that can exceed the budget.
-    from collections import deque
-    q = deque(cand)
+    probe_results: List[Tuple[int, bool, str, int]] = []
 
-    ex = ThreadPoolExecutor(max_workers=max_workers)
-    in_flight: Dict[Any, int] = {}
-    try:
+    if True:
+        conc = max(1, min(int(concurrency or 1), len(cand)))
 
-        def _submit(i: int) -> None:
-            s, _m = pairs[i]
-            try:
-                u = s.get("url") if isinstance(s, dict) else ""
-            except Exception:
-                u = ""
-            # Pass the overall deadline down so the probe can't outlive the budget.
-            fut = ex.submit(
-                _usenet_range_probe_is_real,
-                u,
-                timeout_s=float(timeout_s),
-                range_end=int(range_end),
-                stub_len=int(stub_len),
-                retries=int(retries),
-                deadline_ts=float(deadline),
-            )
-            in_flight[fut] = i
+        async def _main() -> List[Tuple[int, bool, str, int]]:
+            sem = asyncio.Semaphore(conc)
 
-        # Prime the pool
-        while q and len(in_flight) < max_workers and time.monotonic() < deadline:
-            _submit(q.popleft())
-
-        def _handle_done(fut) -> None:
-            i = in_flight.pop(fut, None)
-            if i is None:
-                return
-            try:
-                ok, reason, nbytes = fut.result(timeout=0)
-            except Exception:
-                ok, reason, nbytes = (False, "ERR", 0)
-
-            s, m = pairs[i]
-            if not isinstance(m, dict):
-                return
-
-            # Budget sentinel: treat as "not probed" (do not drop).
-            if str(reason) == "BUDGET":
-                budget_idx.append(i)
-                return
-
-            if ok:
-                real_idx.append(i)
-                m["usenet_probe"] = "REAL"
-                m["usenet_probe_bytes"] = int(nbytes or 0)
-                if mark_ready:
-                    m["ready"] = True
-            else:
-                if reason == "STUB_LEN" or str(reason).startswith("SHORT_"):
-                    stub_idx.append(i)
-                    m["usenet_probe"] = "STUB"
-                else:
-                    err_idx.append(i)
-                    m["usenet_probe"] = "ERR"
-                m["usenet_probe_reason"] = str(reason)
-                # Track why probes failed (counts by reason) for debugging/metrics.
-                if stats is not None:
+            async def _probe_one(idx: int, session: "aiohttp.ClientSession") -> Tuple[int, bool, str, int]:
+                async with sem:
+                    s, _m = pairs[idx]
+                    u = ""
                     try:
-                        _d = getattr(stats, "ms_usenet_probe_fail_reasons", None)
-                        if isinstance(_d, dict):
-                            _r = str(reason)
-                            _d[_r] = int(_d.get(_r, 0)) + 1
+                        u = s.get("url") if isinstance(s, dict) else ""
                     except Exception:
-                        pass
-                m["usenet_probe_bytes"] = int(nbytes or 0)
-                # Demote hard so these don't occupy top spots.
+                        u = ""
+                    ok, reason, nbytes = await _usenet_range_probe_is_real_async(
+                        session,
+                        u or "",
+                        timeout_s=float(timeout_s),
+                        range_end=int(range_end),
+                        stub_len=int(stub_len),
+                        retries=int(retries or 1),
+                        deadline_ts=float(deadline),
+                    )
+                    return (idx, bool(ok), str(reason), int(nbytes or 0))
+
+            # Use one session for all probes
+            async with aiohttp.ClientSession() as session:
+                tasks = [asyncio.create_task(_probe_one(idx, session)) for idx in cand]
+                results: List[Tuple[int, bool, str, int]] = []
+                real_count = 0
+                timeout_total = max(0.1, float(deadline) - float(time.monotonic()))
                 try:
-                    m["verify_rank"] = max(int(m.get("verify_rank") or 0), 9999)
-                except Exception:
-                    m["verify_rank"] = 9999
+                    for fut in asyncio.as_completed(tasks, timeout=timeout_total):
+                        try:
+                            idx, ok, reason, nbytes = await fut
+                        except asyncio.TimeoutError:
+                            break
+                        results.append((idx, ok, reason, nbytes))
+                        if ok:
+                            real_count += 1
+                            if target and real_count >= target:
+                                break
+                        if float(time.monotonic()) >= float(deadline):
+                            break
+                finally:
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                return results
 
-        # Main completion loop
-        from concurrent.futures import FIRST_COMPLETED
-        while in_flight and time.monotonic() < deadline and (target == 0 or len(real_idx) < target):
-            rem = max(0.01, float(deadline) - float(time.monotonic()))
-            done, _not_done = wait(list(in_flight.keys()), timeout=rem, return_when=FIRST_COMPLETED)
-            if not done:
-                break
-            for fut in list(done):
-                _handle_done(fut)
-                if time.monotonic() >= deadline:
-                    break
-                if target and len(real_idx) >= target:
-                    break
-                if q and len(in_flight) < max_workers and time.monotonic() < deadline:
-                    _submit(q.popleft())
-
-        # Small grace drain (do not extend budget): collect any completions already done right now.
         try:
-            done, _ = wait(list(in_flight.keys()), timeout=0.01, return_when=FIRST_COMPLETED)
-            for fut in list(done):
-                _handle_done(fut)
-        except Exception:
-            pass
+            probe_results = asyncio.run(_main())
+        except Exception as e:
+            logger.warning("USENET_PROBE aiohttp_failed=%s (no fallback)", type(e).__name__)
+            probe_results = []
 
-        # Cancel anything still running; do not wait for full shutdown (avoid blowing /stream latency).
-        try:
-            for fut in list(in_flight.keys()):
+    idx_to_res = {i: (ok, reason, nbytes) for (i, ok, reason, nbytes) in probe_results}
+
+    for i in cand:
+        if i not in idx_to_res:
+            budget_idx.append(i)
+            continue
+        ok, reason, nbytes = idx_to_res[i]
+        s, m = pairs[i]
+        if not isinstance(m, dict):
+            continue
+        if str(reason) == "BUDGET":
+            budget_idx.append(i)
+            continue
+        if ok:
+            real_idx.append(i)
+            m["usenet_probe"] = "REAL"
+            m["usenet_probe_bytes"] = int(nbytes or 0)
+            if mark_ready:
+                m["ready"] = True
                 try:
-                    fut.cancel()
+                    if isinstance(s, dict):
+                        bh = s.get("behaviorHints") or {}
+                        if not isinstance(bh, dict):
+                            bh = {}
+                        bh["isPlayable"] = True
+                        s["behaviorHints"] = bh
                 except Exception:
                     pass
-            ex.shutdown(wait=False, cancel_futures=True)
-        except Exception:
+        else:
+            if reason == "STUB_LEN" or str(reason).startswith("SHORT_"):
+                stub_idx.append(i)
+                m["usenet_probe"] = "STUB"
+            else:
+                err_idx.append(i)
+                m["usenet_probe"] = "ERR"
+            m["usenet_probe_reason"] = str(reason)
+            m["usenet_probe_bytes"] = int(nbytes or 0)
+
+    drop_idx = set()
+    if drop_stubs:
+        drop_idx.update(stub_idx)
+    if drop_fails:
+        drop_idx.update(err_idx)
+
+    if drop_idx:
+        pairs = [(s, m) for j, (s, m) in enumerate(pairs) if j not in drop_idx]
+
+    try:
+        ms = int((time.monotonic() - t0) * 1000)
+        logger.info(
+            "USENET_PROBE rid=%s scanned=%s real=%s stub=%s err=%s budget=%s ms=%s",
+            _rid(), int(len(cand)), int(len(real_idx)), int(len(stub_idx)), int(len(err_idx)), int(len(budget_idx)), int(ms),
+        )
+        if stats is not None:
             try:
-                ex.shutdown(wait=False)
+                stats.counters.setdefault("fetch_p2", {})
+                stats.counters["fetch_p2"]["probe_scanned"] = int(len(cand))
+                stats.counters["fetch_p2"]["probe_real"] = int(len(real_idx))
+                stats.counters["fetch_p2"]["probe_stub"] = int(len(stub_idx))
+                stats.counters["fetch_p2"]["probe_err"] = int(len(err_idx))
+                stats.counters["fetch_p2"]["probe_budget"] = int(len(budget_idx))
+                stats.counters["fetch_p2"]["probe_ms"] = int(ms)
             except Exception:
                 pass
+    except Exception:
+        pass
 
-        # Drop probed STUBs (and optionally ERR) from output entirely (keeps list reliable).
-        drop_idx: set[int] = set()
-        if drop_stubs and stub_idx:
-            drop_idx.update(stub_idx)
-        if drop_fails and err_idx:
-            drop_idx.update(err_idx)
-        if drop_idx:
-            pairs = [p for j, p in enumerate(pairs) if j not in drop_idx]
-
-        # Lightweight summary log (no URLs).
-        try:
-            ms = int((time.monotonic() - t0) * 1000)
-            logger.info(
-                "USENET_PROBE rid=%s scanned=%s real=%s stub=%s err=%s budget=%s ms=%s",
-                _rid(), int(len(cand)), int(len(real_idx)), int(len(stub_idx)), int(len(err_idx)), int(len(budget_idx)), int(ms),
-            )
-            if stats is not None:
-                try:
-                    stats.counts_out = stats.counts_out or {}
-                    stats.counts_out["usenet_probe_real"] = int(len(real_idx))
-                    stats.counts_out["usenet_probe_stub"] = int(len(stub_idx))
-                    stats.counts_out["usenet_probe_err"] = int(len(err_idx))
-                    stats.counts_out["usenet_probe_budget"] = int(len(budget_idx))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        return pairs
-    finally:
-        try:
-            ex.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            # Python < 3.9: cancel_futures not supported
-            ex.shutdown(wait=False)
-        except Exception:
-            pass
-
-
-
+    return pairs
 def _apply_usenet_real_priority_mix(
     pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
     *,
