@@ -1658,27 +1658,42 @@ async def _probe_single(
     max_bytes: int,
     guard: bool,
 ) -> Tuple[str, bool, int, str]:
-    async with sem:
-        for attempt in range(1, retries + 1):
-            try:
-                headers = {'Range': f'bytes=0-{range_end}'}
-
-                async with session.get(url, headers=headers, allow_redirects=True, timeout=timeout_s) as resp:
-                    body = await resp.read()
+    # IMPORTANT: acquire the semaphore per-attempt (not across the whole retry loop),
+    # so a slow attempt doesn't "hog" a slot during backoff.
+    for attempt in range(1, retries + 1):
+        try:
+            headers = {"Range": f"bytes=0-{range_end}"}
+            async with sem:
+                async with session.get(
+                    url,
+                    headers=headers,
+                    allow_redirects=True,
+                    timeout=aiohttp.ClientTimeout(total=timeout_s),
+                ) as resp:
+                    # Read only what we need (protects budget if a server ignores Range).
+                    # We never need more than (stub_len+1) to decide REAL vs STUB.
+                    # Still respect max_bytes as a hard guard rail.
+                    want = int(min(max_bytes, stub_len + 1))
+                    body = await resp.content.read(want + 1)  # +1 to detect oversize/ignored-range
                     size = len(body)
+
                     if guard and size > max_bytes:
                         return (url, False, size, "OVERSIZE")
+
+                    # Manual-probe compatible: REAL is strictly > stub_len.
                     if size > stub_len:
                         return (url, True, size, "REAL")
-                    elif size == stub_len:
+                    if size == stub_len:
                         return (url, False, size, "STUB")
-                    else:
-                        return (url, False, size, "SHORT")
-            except Exception as e:
-                if attempt == retries:
-                    return (url, False, 0, f"FAIL_{type(e).__name__}")
-                await asyncio.sleep(0.3)  # Backoff
+
+                    # Anything shorter than stub_len is effectively a stub/invalid proxy.
+                    return (url, False, size, "SHORT")
+        except Exception as e:
+            if attempt == retries:
+                return (url, False, 0, f"FAIL_{type(e).__name__}")
+            await asyncio.sleep(0.3)  # Backoff
     return (url, False, 0, "MAX_RETRIES")
+
 
 
 def _apply_usenet_playability_probe(
@@ -1819,6 +1834,28 @@ def _apply_usenet_playability_probe(
                 urls.sort(key=len)
             except Exception:
                 pass
+            # Debug visibility: show what we're actually probing (obfuscated).
+            try:
+                from urllib.parse import urlparse
+                _hosts = {}
+                for _u in urls:
+                    try:
+                        _h = urlparse(_u).netloc or "?"
+                    except Exception:
+                        _h = "?"
+                    _hosts[_h] = _hosts.get(_h, 0) + 1
+                _host_top = sorted(_hosts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                _sample = []
+                for _u in urls[:8]:
+                    try:
+                        _p = urlparse(_u)
+                        _sample.append(f"{_p.scheme}://{_p.netloc}{(_p.path[:40] + ('…' if len(_p.path) > 40 else ''))} (len={len(_u)})")
+                    except Exception:
+                        _sample.append(f"(bad_url len={len(str(_u))})")
+                logger.info("USENET_PROBE_URLS rid=%s hosts=%s sample=%s", rid, _host_top, _sample)
+            except Exception:
+                pass
+
             async def _main() -> List[Tuple[str, bool, int, str]]:
                 return await _usenet_range_probe_is_real_async(
                     urls,
@@ -1834,6 +1871,18 @@ def _apply_usenet_playability_probe(
 
             batch_res = asyncio.run(_main()) if urls else []
             url_to_res = {u: (bool(ok), int(size or 0), str(reason)) for (u, ok, size, reason) in (batch_res or [])}
+            # Reason histogram so we can immediately see if we're failing with TIMEOUT/DNS/SSL/etc.
+            try:
+                from collections import Counter
+                _rc = Counter([str(r[3]) for r in (batch_res or [])])
+                # Add pending-as-budget too (we log counts, not URLs)
+                _budget_missing = max(0, len(urls) - len(batch_res or []))
+                if _budget_missing:
+                    _rc["(missing)"] += _budget_missing
+                logger.info("USENET_PROBE_REASONS rid=%s reasons=%s", rid, dict(_rc.most_common(8)))
+            except Exception:
+                pass
+
             for u, idx in url_to_idx.items():
                 r = url_to_res.get(u)
                 if r is None:
