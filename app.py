@@ -1579,108 +1579,69 @@ async def _usenet_range_probe_is_real_async(
     retries: int,
     deadline_ts: Optional[float] = None,
 ) -> Tuple[bool, str, int]:
-    """Async: Return (is_real, reason, bytes_read) using a tiny Range GET.
-
-    Keeps the same semantics as the sync version:
-      - Request Range bytes=0-range_end and read up to (range_end+1) bytes.
-      - Treat <= stub_len as STUB.
-      - Treat == expected (range_end+1) as REAL *iff* it doesn't look like HTML/JSON and entropy is reasonable.
-    """
+    # Simpler probe: tiny Range GET and classify STUB vs REAL by exact byte count.
+    # NOTE: HTTP Range end is inclusive. We request (stub_len) bytes by using end=(stub_len-1).
     u = url or ""
     try:
-        # If caller passed a short /r/<token> URL, unwrap to upstream.
         if "/r/" in u or (WRAP_URL_SHORT and len(u) < 100):
             long_u = _unwrap_short_url(u)
             if long_u:
                 u = long_u
     except Exception:
-        pass
+        return (False, "UNWRAP_ERR", 0)
 
-    # Skip known multi-hop proxies that tend to be slow/flaky in probes.
-    try:
-        if "replay" in (u or "").lower():
-            return (False, "SKIP_REPLAY", 0)
-    except Exception:
-        pass
-
-    expected = int(range_end) + 1
-    ua = globals().get("VERIFY_UA", "Mozilla/5.0")
-    base_headers = {"User-Agent": ua, "Range": f"bytes=0-{int(range_end)}", "Accept": "*/*"}
-    auth_h = _probe_auth_headers_for_url(u)
-    if auth_h:
-        try:
-            base_headers.update(auth_h)
-        except Exception:
-            pass
-
-    # Budget-aware per-request timeout
-    if deadline_ts is not None:
-        rem = float(deadline_ts) - float(time.monotonic())
-        if rem <= 0.15:
-            return (False, "BUDGET", 0)
-        timeout_eff = max(0.35, min(float(timeout_s), rem))
-    else:
-        timeout_eff = float(timeout_s)
+    if "replay" in (u or "").lower():
+        return (False, "SKIP_REPLAY", 0)
 
     last_err = ""
     last_bytes = 0
 
-    for attempt in range(1, max(1, int(retries or 1)) + 1):
+    stub_end = max(0, int(stub_len) - 1)
+    base_headers = {"Range": f"bytes=0-{stub_end}"}
+
+    base_timeout = max(1.0, float(timeout_s or 0))
+
+    for attempt in range(1, int(retries) + 1):
         try:
+            timeout_eff = base_timeout
+            if deadline_ts is not None:
+                remaining = float(deadline_ts) - time.time()
+                if remaining <= 0.15:
+                    return (False, "BUDGET", last_bytes)
+                timeout_eff = max(0.5, min(timeout_eff, remaining))
+
             async with session.get(
                 u,
                 headers=base_headers,
-                timeout=aiohttp.ClientTimeout(total=float(timeout_eff)),
+                timeout=aiohttp.ClientTimeout(total=timeout_eff),
                 allow_redirects=True,
             ) as r:
-                st = int(getattr(r, "status", 0) or 0)
-                if st in (401, 403):
-                    return (False, "AUTH", 0)
-                if st < 200 or st >= 400:
-                    last_err = f"HTTP_{st}"
+                if r.status not in (200, 206):
+                    last_err = f"HTTP{r.status}"
                     if attempt < retries:
                         await asyncio.sleep(0.5)
                         continue
                     return (False, last_err, 0)
 
-                ct = (r.headers.get("Content-Type") or "").lower()
-                if ct.startswith("text/") or ("json" in ct) or ("xml" in ct) or ("html" in ct):
-                    return (False, "CT_TEXT", 0)
+                body = await r.read()
+                last_bytes = len(body)
 
-                # Read up to expected bytes (+ tiny slack) and stop.
-                max_allow = expected + 2
-                body = await r.content.read(max_allow)
-                total = len(body)
-                last_bytes = int(total)
-
-                magic = sniff_magic(body)
-                ent = shannon_entropy(body)
-
-                if total <= int(stub_len):
-                    return (False, "STUB_LEN", int(total))
-                if magic in ("html", "json", "xml/htmlish"):
-                    return (False, f"BAD_MAGIC_{magic}", int(total))
-                if ent < 3.0:
-                    return (False, f"LOW_ENT_{ent:.2f}", int(total))
-
-                if total == expected and (magic != "unknown" or ent >= 4.5):
-                    return (True, "REAL", int(total))
-                if total > expected:
-                    return (False, "RANGE_IGNORED", int(total))
-                return (False, f"SHORT_{int(total)}", int(total))
+                # EXACT SAME CHECK AS YOUR STANDALONE PROBE:
+                # If we only get the stub bytes back, treat as STUB.
+                if last_bytes == int(stub_len):
+                    return (False, "STUB_LEN", last_bytes)
+                return (True, "REAL", last_bytes)
 
         except asyncio.TimeoutError:
             last_err = "TIMEOUT"
-            if attempt < retries:
-                await asyncio.sleep(0.5)
-                continue
         except Exception as e:
             last_err = f"ERR:{type(e).__name__}"
-            if attempt < retries:
-                await asyncio.sleep(0.5)
-                continue
 
-    return (False, last_err or "ERR", int(last_bytes or 0))
+        if attempt < retries:
+            await asyncio.sleep(0.5)
+
+    return (False, last_err or "ERR", last_bytes)
+
 
 def _apply_usenet_playability_probe(
     pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
