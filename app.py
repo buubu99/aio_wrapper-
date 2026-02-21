@@ -1804,15 +1804,31 @@ def _apply_usenet_playability_probe(
                         _sample.append(f"{_p.scheme}://{_p.netloc}{(_p.path[:40] + ('…' if len(_p.path) > 40 else ''))} (len={len(_u)})")
                     except Exception:
                         _sample.append(f"(bad_url len={len(str(_u))})")
-                logger.info("USENET_PROBE_URLS rid=%s hosts=%s sample=%s", rid, _host_top, _sample)
+                logger.info("USENET_PROBE_URLS rid=%s hosts=%s sample=%s", _rid(), _host_top, _sample)
+            except Exception:
+                pass
+
+            # Auto-tune under a hard global budget: avoid spending the whole budget on retrying timeouts.
+            eff_conc = int(conc)
+            eff_retries = int(retries or 1)
+            _why = []
+            try:
+                if float(budget) <= float(timeout_s) * 2.1 and int(len(urls)) > 10 and eff_retries > 1:
+                    eff_retries = 1
+                    _why.append('clamp_retries_for_budget')
+                if int(len(urls)) >= 20 and eff_conc > 10:
+                    eff_conc = 10
+                    _why.append('clamp_conc_for_stability')
+                if _why:
+                    logger.info('USENET_PROBE_TUNE rid=%s conc=%s->%s retries=%s->%s why=%s', _rid(), int(conc), int(eff_conc), int(retries or 1), int(eff_retries), _why)
             except Exception:
                 pass
 
             async def _main() -> List[Tuple[str, bool, int, str]]:
                 return await _usenet_range_probe_is_real_async(
                     urls,
-                    concurrency=int(conc),
-                    retries=int(retries or 1),
+                    concurrency=int(eff_conc),
+                    retries=int(eff_retries),
                     timeout_s=float(timeout_s),
                     stub_len=int(stub_len),
                     range_end=int(range_end) if range_end is not None else None,
@@ -1823,6 +1839,19 @@ def _apply_usenet_playability_probe(
 
             batch_res = asyncio.run(_main()) if urls else []
             url_to_res = {u: (bool(ok), int(size or 0), str(reason)) for (u, ok, size, reason) in (batch_res or [])}
+            # Small sample of outcomes (first 5) for debugging host/status issues
+            try:
+                _samp=[]
+                for (_u,_ok,_sz,_rs) in (batch_res or [])[:5]:
+                    try:
+                        _p=urlparse(_u)
+                        _samp.append(f"{_p.netloc} {_rs} {_sz}")
+                    except Exception:
+                        _samp.append(f"(bad_url) {_rs} {_sz}")
+                if _samp:
+                    logger.info("USENET_PROBE_SAMPLE rid=%s sample=%s", _rid(), _samp)
+            except Exception:
+                pass
             # Reason histogram so we can immediately see if we're failing with TIMEOUT/DNS/SSL/etc.
             try:
                 from collections import Counter
@@ -1831,7 +1860,7 @@ def _apply_usenet_playability_probe(
                 _budget_missing = max(0, len(urls) - len(batch_res or []))
                 if _budget_missing:
                     _rc["(missing)"] += _budget_missing
-                logger.info("USENET_PROBE_REASONS rid=%s reasons=%s", rid, dict(_rc.most_common(8)))
+                logger.info("USENET_PROBE_REASONS rid=%s reasons=%s", _rid(), dict(_rc.most_common(8)))
             except Exception:
                 pass
 
