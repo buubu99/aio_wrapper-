@@ -1582,133 +1582,69 @@ async def _usenet_range_probe_is_real_async(
 ) -> List[Tuple[str, bool, int, str]]:
     """
     Asynchronously probe a list of URLs to determine if they are real or stubs.
-
-    Returns: list of (url, is_real, nbytes, reason)
-
-    Budget behavior:
-      - We keep at most `concurrency` in-flight probes at once (prevents host overload).
-      - We stop at the wall-clock `budget_s` deadline.
-      - Any URL not completed by the deadline is returned as ("BUDGET").
+    Returns a list of (url, is_real, size, reason) for each URL.
+    Enforces budget_s as a hard timeout, returning partial results if exceeded.
     """
-    urls = [u for u in (urls or []) if u]
-    if not urls:
-        return []
-
-    results: List[Tuple[str, bool, int, str]] = []
-    seen: set = set()
-
-    # Concurrency guard
-    try:
-        conc = max(1, int(concurrency or 1))
-    except Exception:
-        conc = 1
-    sem = asyncio.Semaphore(conc)
-
-    # Session-level BasicAuth (matches the user's manual probe). Preserves auth across redirects.
+    results = []
+    sem = asyncio.Semaphore(concurrency)
+    # Use session-level BasicAuth (matches the user's manual probe). This preserves auth across redirects.
     _auth = None
     try:
-        _auth_str = os.environ.get('AIO_AUTH') or os.environ.get('PROV2_AUTH')
-        if _auth_str and ':' in _auth_str:
-            _u, _p = _auth_str.split(':', 1)
+        # Prefer explicit PROV2_AUTH; otherwise fall back to the wrapper's main AIO auth.
+        _auth_str = (PROV2_AUTH or "") or (AIO_AUTH or "") or os.environ.get("PROV2_AUTH", "") or os.environ.get("AIOSTREAMS_AUTH", "") or os.environ.get("AIO_AUTH", "")
+        if _auth_str and ":" in _auth_str:
+            _u, _p = _auth_str.split(":", 1)
             _auth = aiohttp.BasicAuth(_u, _p)
     except Exception:
         _auth = None
-
-    # Hard deadline
-    t0 = time.monotonic()
-    deadline = t0 + float(budget_s or 0.0)
-
-    # Use a bounded connector: prevents aiohttp from opening too many per-host connections at once.
-    connector = None
-    try:
-        connector = aiohttp.TCPConnector(limit=conc, limit_per_host=conc, ttl_dns_cache=300)
-    except Exception:
-        connector = None
-
-    async with aiohttp.ClientSession(auth=_auth, connector=connector) as session:
-        pending: set = set()
+    async with aiohttp.ClientSession(auth=_auth) as session:
+        tasks: List[asyncio.Task] = []
         task_url: Dict[asyncio.Task, str] = {}
 
-        # Helper: start one probe task
-        def _start(u: str) -> None:
-            try:
-                t = asyncio.create_task(
-                    _probe_single(session, u, sem, retries, timeout_s, stub_len, range_end or stub_len, max_bytes, guard)
-                )
-                pending.add(t)
-                task_url[t] = u
-            except Exception:
-                # If task creation fails, mark as failure immediately
-                results.append((u, False, 0, "FAIL_CREATE"))
-                seen.add(u)
+        for url in urls:
+            t = asyncio.create_task(
+                _probe_single(session, url, sem, retries, timeout_s, stub_len, range_end or stub_len, max_bytes, guard)
+            )
+            tasks.append(t)
+            task_url[t] = url
 
-        # Prime up to concurrency
-        i = 0
-        while i < len(urls) and len(pending) < conc:
-            _start(urls[i])
-            i += 1
+        # Wait for all with overall budget timeout (partial results if exceeded)
+        done, pending = await asyncio.wait(tasks, timeout=budget_s)
 
-        # Drain loop until budget or all tasks completed; top-up as tasks finish
-        while pending:
-            rem = float(deadline - time.monotonic())
-            if rem <= 0:
-                break
+        if pending:
+            logger.info(
+                "PROBE_PARTIAL: %d/%d completed in %.2f s",
+                int(len(done)),
+                int(len(tasks)),
+                float(budget_s),
+            )
 
-            done, pending = await asyncio.wait(pending, timeout=rem, return_when=asyncio.FIRST_COMPLETED)
-
-            # If nothing finished within remaining time, hit budget wall
-            if not done:
-                break
-
-            for t in done:
-                u = task_url.pop(t, "")
-                if not u:
-                    continue
-                try:
-                    res = t.result()
-                    if res:
-                        results.append(res)
-                    else:
-                        results.append((u, False, 0, "FAIL_EMPTY"))
-                except Exception as e:
-                    results.append((u, False, 0, f"FAIL_{type(e).__name__}"))
-                seen.add(u)
-
-            # Top up pending with more URLs while we still have budget
-            while i < len(urls) and len(pending) < conc and (deadline - time.monotonic()) > 0:
-                _start(urls[i])
-                i += 1
-
-        # Anything left pending at the wall becomes BUDGET
-        if pending or i < len(urls):
-            try:
-                done_count = len(seen)
-                total = len(urls)
-                logger.info("PROBE_PARTIAL: %d/%d completed in %.2f s", int(done_count), int(total), float(budget_s))
-            except Exception:
-                pass
-
-        # Cancel pending tasks and mark them as BUDGET
-        for t in list(pending):
+        for t in done:
             u = task_url.get(t, "")
             try:
-                t.cancel()
-            except Exception:
-                pass
-            if u and u not in seen:
-                results.append((u, False, 0, "BUDGET"))
-                seen.add(u)
+                res = t.result()
+                if res:
+                    results.append(res)
+            except Exception as e:
+                logger.warning("PROBE_EXC url=%s err=%s", u, type(e).__name__)
+                if u:
+                    results.append((u, False, 0, f"FAIL_{type(e).__name__}"))
 
+        # Cancel pending to enforce budget; caller will treat missing URLs as BUDGET
+        for t in pending:
+            t.cancel()
         if pending:
             _ = await asyncio.gather(*pending, return_exceptions=True)
 
-        # Any URLs we never even started within the budget are also BUDGET
-        while i < len(urls):
-            u = urls[i]
-            if u and u not in seen:
-                results.append((u, False, 0, "BUDGET"))
-                seen.add(u)
-            i += 1
+        # Ensure we always return a result for every URL.
+        # Any URL still pending at the budget wall is reported as BUDGET.
+        try:
+            for t in pending:
+                u = task_url.get(t, "")
+                if u:
+                    results.append((u, False, 0, "BUDGET"))
+        except Exception:
+            pass
 
     return results
 
@@ -1738,14 +1674,27 @@ async def _probe_single(
                     # Read only what we need (protects budget if a server ignores Range).
                     # We never need more than (stub_len+1) to decide REAL vs STUB.
                     # Still respect max_bytes as a hard guard rail.
-                    want = int(min(max_bytes, stub_len + 1))
-                    if guard and want < (stub_len + 1):
-                        return (url, False, want, "MISCONFIG_MAX_BYTES")
+                    want_need = int(stub_len + 1)
+                    if guard and int(max_bytes) < want_need:
+                        # Can't ever distinguish REAL vs STUB if we refuse to read at least stub_len+1 bytes
+                        return (url, False, int(max_bytes), "MISCONFIG_MAX_BYTES")
 
-                    body = await resp.content.read(want + 1)  # +1 to detect oversize/ignored-range
-                    size = len(body)
+                    # IMPORTANT: aiohttp's .read(n) may return fewer than n bytes even when more are available.
+                    # So we accumulate until we have enough to decide (stub_len+1) or we hit EOF / max_bytes.
+                    cap = int(max_bytes) + 1  # +1 lets us detect oversize/ignored-range safely
+                    buf = bytearray()
+                    async for chunk in resp.content.iter_chunked(4096):
+                        if not chunk:
+                            break
+                        remaining = cap - len(buf)
+                        if remaining <= 0:
+                            break
+                        buf.extend(chunk[:remaining])
+                        if len(buf) >= want_need:
+                            break
+                    size = len(buf)
 
-                    if guard and size > max_bytes:
+                    if guard and size > int(max_bytes):
                         return (url, False, size, "OVERSIZE")
 
                     # Manual-probe compatible: REAL is strictly > stub_len.
@@ -1920,7 +1869,7 @@ def _apply_usenet_playability_probe(
                         _sample.append(f"{_p.scheme}://{_p.netloc}{(_p.path[:40] + ('…' if len(_p.path) > 40 else ''))} (len={len(_u)})")
                     except Exception:
                         _sample.append(f"(bad_url len={len(str(_u))})")
-                logger.info("USENET_PROBE_URLS rid=%s hosts=%s sample=%s", _rid(), _host_top, _sample)
+                logger.info("USENET_PROBE_URLS rid=%s hosts=%s sample=%s", rid, _host_top, _sample)
             except Exception:
                 pass
 
@@ -1947,7 +1896,7 @@ def _apply_usenet_playability_probe(
                 _budget_missing = max(0, len(urls) - len(batch_res or []))
                 if _budget_missing:
                     _rc["(missing)"] += _budget_missing
-                logger.info("USENET_PROBE_REASONS rid=%s reasons=%s", _rid(), dict(_rc.most_common(8)))
+                logger.info("USENET_PROBE_REASONS rid=%s reasons=%s", rid, dict(_rc.most_common(8)))
             except Exception:
                 pass
 
