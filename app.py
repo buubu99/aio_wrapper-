@@ -1532,7 +1532,8 @@ async def _usenet_range_probe_is_real_async(
             _auth = aiohttp.BasicAuth(_u, _p)
     except Exception:
         _auth = None
-    async with aiohttp.ClientSession(auth=_auth) as session:
+    connector = aiohttp.TCPConnector(limit=int(concurrency), limit_per_host=min(4, int(concurrency)), ttl_dns_cache=300)
+    async with aiohttp.ClientSession(auth=_auth, connector=connector) as session:
         tasks: List[asyncio.Task] = []
         task_url: Dict[asyncio.Task, str] = {}
 
@@ -1604,7 +1605,7 @@ async def _probe_single(
                     url,
                     headers=headers,
                     allow_redirects=True,
-                    timeout=aiohttp.ClientTimeout(total=timeout_s),
+                    timeout=aiohttp.ClientTimeout(total=timeout_s, sock_connect=min(2.0, timeout_s), sock_read=timeout_s),
                 ) as resp:
                     # Read only what we need (protects budget if a server ignores Range).
                     # We never need more than (stub_len+1) to decide REAL vs STUB.
@@ -1618,7 +1619,7 @@ async def _probe_single(
                     # So we accumulate until we have enough to decide (stub_len+1) or we hit EOF / max_bytes.
                     cap = int(max_bytes) + 1  # +1 lets us detect oversize/ignored-range safely
                     buf = bytearray()
-                    async for chunk in resp.content.iter_chunked(4096):
+                    async for chunk in resp.content.iter_chunked(8192):
                         if not chunk:
                             break
                         remaining = cap - len(buf)
@@ -1816,9 +1817,10 @@ def _apply_usenet_playability_probe(
                 if float(budget) <= float(timeout_s) * 2.1 and int(len(urls)) > 10 and eff_retries > 1:
                     eff_retries = 1
                     _why.append('clamp_retries_for_budget')
-                if int(len(urls)) >= 20 and eff_conc > 10:
-                    eff_conc = 10
-                    _why.append('clamp_conc_for_stability')
+                # Keep user-configured concurrency; only clamp extreme values that can destabilize remote hosts.
+                if int(len(urls)) >= 80 and eff_conc > 25:
+                    eff_conc = 25
+                    _why.append('clamp_conc_extreme')
                 if _why:
                     logger.info('USENET_PROBE_TUNE rid=%s conc=%s->%s retries=%s->%s why=%s', _rid(), int(conc), int(eff_conc), int(retries or 1), int(eff_retries), _why)
             except Exception:
@@ -1860,7 +1862,7 @@ def _apply_usenet_playability_probe(
                 _budget_missing = max(0, len(urls) - len(batch_res or []))
                 if _budget_missing:
                     _rc["(missing)"] += _budget_missing
-                logger.info("USENET_PROBE_REASONS rid=%s reasons=%s", _rid(), dict(_rc.most_common(8)))
+                logger.info("USENET_PROBE_REASONS rid=%s ver=v16 reasons=%s", _rid(), dict(_rc.most_common(8)))
             except Exception:
                 pass
 
@@ -1879,12 +1881,11 @@ def _apply_usenet_playability_probe(
     idx_to_res = {i: (ok, reason, nbytes) for (i, ok, reason, nbytes) in probe_results}
     for i in cand:
         if i not in idx_to_res:
-            # No result came back for this candidate (budget wall or probe error).
+            # No result came back for this candidate before the budget wall.
             budget_idx.append(i)
             s, m = pairs[i]
             if isinstance(m, dict):
-                err_idx.append(i)
-                m['usenet_probe'] = 'ERR'
+                m['usenet_probe'] = 'BUDGET'
                 m['usenet_probe_reason'] = 'BUDGET'
                 m['usenet_probe_bytes'] = 0
             continue
@@ -1894,8 +1895,7 @@ def _apply_usenet_playability_probe(
             continue
         if str(reason) == 'BUDGET':
             budget_idx.append(i)
-            err_idx.append(i)
-            m['usenet_probe'] = 'ERR'
+            m['usenet_probe'] = 'BUDGET'
             m['usenet_probe_reason'] = 'BUDGET'
             m['usenet_probe_bytes'] = int(nbytes or 0)
             continue
