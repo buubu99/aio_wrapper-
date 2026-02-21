@@ -601,14 +601,7 @@ def _get_fetch_executor() -> ThreadPoolExecutor:
                 thread_name_prefix="wrapfetch",
             )
             _FETCH_EXECUTOR_PID = pid
-
-            # Warm a few threads inside the current worker to reduce first-request overhead.
-            try:
-                warm_n = max(0, min(int(WRAP_FETCH_WORKERS or 0), 4))
-                for _ in range(warm_n):
-                    _FETCH_EXECUTOR.submit(lambda: None)
-            except Exception:
-                pass
+            # Prewarm disabled (thread warmup removed for testing).
         return _FETCH_EXECUTOR
 
 
@@ -618,75 +611,8 @@ _WARMED_PIDS = set()
 _WARMED_LOCK = threading.Lock()
 
 def _micro_warm_worker(reason: str = "") -> bool:
-    """Initialize per-worker internals (executor, sessions) without external calls.
-    Returns True only the first time it runs per PID.
-    """
-    pid = os.getpid()
-    try:
-        with _WARMED_LOCK:
-            if pid in _WARMED_PIDS:
-                return False
-            _WARMED_PIDS.add(pid)
-    except Exception:
-        # If locking fails, still attempt warm but don't spam logs.
-        pass
-
-    # Ensure fetch executor exists and pre-start its threads in this worker (no external calls).
-    try:
-        ex = _get_fetch_executor()
-        # Force thread creation here so the first real /stream request doesn't pay the spawn cost.
-        try:
-            warm_n = max(1, min(int(WRAP_FETCH_WORKERS or 0), 4))
-        except Exception:
-            warm_n = 2
-        def _noop():
-            return None
-        futs = []
-        try:
-            for _ in range(warm_n):
-                futs.append(ex.submit(_noop))
-            # Wait briefly for the no-op tasks to complete (threads created + running).
-            done, not_done = wait(futs, timeout=1.0)
-            for f in done:
-                try:
-                    f.result(timeout=0)
-                except Exception:
-                    pass
-            for f in not_done:
-                try:
-                    f.cancel()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-    # Touch HTTP session objects (no network) to ensure adapters exist.
-    try:
-        _ = session.adapters  # type: ignore[name-defined]
-        _ = fast_session.adapters  # type: ignore[name-defined]
-    except Exception:
-        pass
-
-    # Log once per worker for visibility.
-    try:
-        logger.info("MICRO_WARM rid=%s pid=%s reason=%s", _rid(), pid, reason)
-    except Exception:
-        try:
-            logger.info("MICRO_WARM pid=%s reason=%s", pid, reason)
-        except Exception:
-            pass
-    return True
-
-AIO_CACHE_TTL_S = int(os.getenv("AIO_CACHE_TTL_S", "600") or 600)   # 0 disables cache
-AIO_CACHE_MAX = int(os.getenv("AIO_CACHE_MAX", "200") or 200)
-AIO_CACHE_MODE = (os.getenv("AIO_CACHE_MODE", "off") or "off").lower()  # off|swr|soft
-AIO_SOFT_TIMEOUT_S = float(os.getenv("AIO_SOFT_TIMEOUT_S", "0") or 0)   # only used in 'soft' mode
-
-
-_AIO_CACHE = {}  # key -> (ts_monotonic, streams, count, ms)
-_AIO_CACHE_LOCK = threading.Lock()
+    """DISABLED for testing: micro prewarm is turned off."""
+    return False
 
 def _aio_cache_get(key: str):
     if AIO_CACHE_TTL_S <= 0:
@@ -9670,7 +9596,7 @@ def health():
     # Warm per-worker internals on cheap endpoint (cron ping). No external calls.
     warmed = False
     try:
-        warmed = bool(_micro_warm_worker("health"))
+        warmed = False  # micro warm disabled
     except Exception:
         warmed = False
     return jsonify({"ok": True, "build": BUILD_ID, "ts": int(time.time()), "warmed": warmed}), 200
@@ -9826,7 +9752,7 @@ def stream(type_: str, id_: str):
     # Per-request micro-warm: ensures this worker is ready even if traffic lands on a cold PID.
     # No external calls; runs once per PID.
     try:
-        _micro_warm_worker("stream")
+        pass  # micro warm disabled
     except Exception:
         pass
 
