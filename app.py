@@ -1774,6 +1774,19 @@ def _apply_usenet_playability_probe(
             break
 
 
+
+    # Mark candidate metas so callers can log accurate scanned counts (cand size) even if we later drop STUB/ERR.
+    try:
+        for _ci in cand:
+            try:
+                _mci = pairs[_ci][1]
+                if isinstance(_mci, dict):
+                    _mci["_usenet_probe_cand"] = True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     if not cand:
         return pairs
 
@@ -2093,18 +2106,26 @@ def _apply_usenet_real_priority_mix(
         # Stats/log helper (no URLs)
         in_top10 = 0
         in_top20 = 0
+        pos_top10 = []
+        pos_top20 = []
         for i, (_s0, _m0) in enumerate(out[:max(top20_n_eff, top10_n)], start=1):
             if not isinstance(_m0, dict):
                 continue
             if str(_m0.get("usenet_probe") or "") == "REAL":
                 if i <= top10_n:
                     in_top10 += 1
+                    pos_top10.append(i)
                 if i <= top20_n_eff:
                     in_top20 += 1
+                    pos_top20.append(i)
         logger.info(
             "USENET_REAL_MIX rid=%s real_total=%s real_top10=%s real_top20=%s cap10=%s top20=%s",
             _rid(), int(len(real_usenet)), int(in_top10), int(in_top20), int(cap10), int(top20_n_eff),
         )
+        try:
+            logger.info("USENET_REAL_POS rid=%s pos_top10=%s pos_top20=%s", _rid(), pos_top10, pos_top20)
+        except Exception:
+            pass
         if stats is not None:
             try:
                 stats.counts_out = stats.counts_out or {}
@@ -5989,17 +6010,20 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                 stub_len=int(USENET_PROBE_STUB_LEN or 0),
                 retries=int(USENET_PROBE_RETRIES or 0),
                 concurrency=int(USENET_PROBE_CONCURRENCY or 1),
-                drop_stubs=bool(USENET_PROBE_DROP_STUBS),
-                drop_fails=bool(USENET_PROBE_DROP_FAILS),
+                drop_stubs=False,
+                drop_fails=False,
                 mark_ready=bool(USENET_PROBE_MARK_READY),
                 stats=None,
             )
 
             real = stub = err = 0
-            out: List[Dict[str, Any]] = []
+            scanned = 0
+            out_all: List[Dict[str, Any]] = []
             for _s, _m in _pairs2:
                 if not isinstance(_s, dict):
                     continue
+                if isinstance(_m, dict) and _m.get("_usenet_probe_cand"):
+                    scanned += 1
                 try:
                     up = str((_m or {}).get("usenet_probe") or "").upper().strip()
                 except Exception:
@@ -6024,10 +6048,28 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                         stub += 1
                     elif up == "ERR":
                         err += 1
-                out.append(_s)
+                out_all.append(_s)
+
+            # Apply drop policy here (only drop streams that were actually probed as STUB/ERR).
+            drop_stubs = bool(USENET_PROBE_DROP_STUBS)
+            drop_fails = bool(USENET_PROBE_DROP_FAILS)
+            if drop_stubs or drop_fails:
+                out: List[Dict[str, Any]] = []
+                for _s in out_all:
+                    try:
+                        up2 = str(_s.get("_wrap_usenet_probe") or "").upper().strip()
+                    except Exception:
+                        up2 = ""
+                    if up2 == "STUB" and drop_stubs:
+                        continue
+                    if up2 == "ERR" and drop_fails:
+                        continue
+                    out.append(_s)
+            else:
+                out = out_all
 
             ms = int((time.monotonic() - t0p) * 1000)
-            return out, {"probe_early": True, "probe_ms": ms, "probe_scanned": int(len(_pairs)), "probe_real": int(real), "probe_stub": int(stub), "probe_err": int(err)}
+            return out, {"probe_early": True, "probe_ms": ms, "probe_scanned": int(scanned), "probe_real": int(real), "probe_stub": int(stub), "probe_err": int(err)}
         except Exception as _e:
             return _streams, {"probe_early": True, "probe_early_err": f"error:{type(_e).__name__}"}
         finally:
