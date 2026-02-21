@@ -1587,7 +1587,16 @@ async def _usenet_range_probe_is_real_async(
     """
     results = []
     sem = asyncio.Semaphore(concurrency)
-    async with aiohttp.ClientSession() as session:
+    # Use session-level BasicAuth (matches the user's manual probe). This preserves auth across redirects.
+    _auth = None
+    try:
+        _auth_str = os.environ.get('AIO_AUTH') or os.environ.get('PROV2_AUTH')
+        if _auth_str and ':' in _auth_str:
+            _u, _p = _auth_str.split(':', 1)
+            _auth = aiohttp.BasicAuth(_u, _p)
+    except Exception:
+        _auth = None
+    async with aiohttp.ClientSession(auth=_auth) as session:
         tasks: List[asyncio.Task] = []
         task_url: Dict[asyncio.Task, str] = {}
 
@@ -1653,17 +1662,8 @@ async def _probe_single(
         for attempt in range(1, retries + 1):
             try:
                 headers = {'Range': f'bytes=0-{range_end}'}
-                # Add authentication headers
-                auth_str = os.environ.get('AIO_AUTH') or os.environ.get('PROV2_AUTH')
-                if auth_str:
-                    user, pw = auth_str.split(':', 1)
-                    auth = aiohttp.BasicAuth(user, pw)
-                else:
-                    auth = None
 
-                async with session.get(url, headers=headers, allow_redirects=True, timeout=timeout_s, auth=auth) as resp:
-                    if resp.status != 206 and resp.status != 200:
-                        raise ValueError(f"Bad status: {resp.status}")
+                async with session.get(url, headers=headers, allow_redirects=True, timeout=timeout_s) as resp:
                     body = await resp.read()
                     size = len(body)
                     if guard and size > max_bytes:
