@@ -601,7 +601,7 @@ def _get_fetch_executor() -> ThreadPoolExecutor:
                 thread_name_prefix="wrapfetch",
             )
             _FETCH_EXECUTOR_PID = pid
-            # Prewarm disabled (thread warmup removed for testing).
+            # (prewarm disabled)
         return _FETCH_EXECUTOR
 
 
@@ -611,8 +611,17 @@ _WARMED_PIDS = set()
 _WARMED_LOCK = threading.Lock()
 
 def _micro_warm_worker(reason: str = "") -> bool:
-    """DISABLED for testing: micro prewarm is turned off."""
+    # prewarm disabled (A/B test)
     return False
+
+AIO_CACHE_TTL_S = int(os.getenv("AIO_CACHE_TTL_S", "600") or 600)   # 0 disables cache
+AIO_CACHE_MAX = int(os.getenv("AIO_CACHE_MAX", "200") or 200)
+AIO_CACHE_MODE = (os.getenv("AIO_CACHE_MODE", "off") or "off").lower()  # off|swr|soft
+AIO_SOFT_TIMEOUT_S = float(os.getenv("AIO_SOFT_TIMEOUT_S", "0") or 0)   # only used in 'soft' mode
+
+
+_AIO_CACHE = {}  # key -> (ts_monotonic, streams, count, ms)
+_AIO_CACHE_LOCK = threading.Lock()
 
 def _aio_cache_get(key: str):
     if AIO_CACHE_TTL_S <= 0:
@@ -9596,7 +9605,7 @@ def health():
     # Warm per-worker internals on cheap endpoint (cron ping). No external calls.
     warmed = False
     try:
-        warmed = False  # micro warm disabled
+        warmed = False  # prewarm disabled
     except Exception:
         warmed = False
     return jsonify({"ok": True, "build": BUILD_ID, "ts": int(time.time()), "warmed": warmed}), 200
@@ -9748,13 +9757,7 @@ def manifest():
 def stream(type_: str, id_: str):
     if not _is_valid_stream_id(type_, id_):
         return jsonify({"streams": []}), 400
-
-    # Per-request micro-warm: ensures this worker is ready even if traffic lands on a cold PID.
-    # No external calls; runs once per PID.
-    try:
-        pass  # micro warm disabled
-    except Exception:
-        pass
+    # (prewarm disabled)
 
     mem_start = 0
     try:
