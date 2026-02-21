@@ -1605,7 +1605,7 @@ async def _usenet_range_probe_is_real_async(
         try:
             timeout_eff = base_timeout
             if deadline_ts is not None:
-                remaining = float(deadline_ts) - time.time()
+                remaining = float(deadline_ts) - time.monotonic()
                 if remaining <= 0.15:
                     return (False, "BUDGET", last_bytes)
                 timeout_eff = max(0.5, min(timeout_eff, remaining))
