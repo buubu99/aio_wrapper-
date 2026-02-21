@@ -624,9 +624,34 @@ def _micro_warm_worker(reason: str = "") -> bool:
         # If locking fails, still attempt warm but don't spam logs.
         pass
 
-    # Ensure fetch executor exists (threads created in this worker).
+    # Ensure fetch executor exists and pre-start its threads in this worker (no external calls).
     try:
-        _get_fetch_executor()
+        ex = _get_fetch_executor()
+        # Force thread creation here so the first real /stream request doesn't pay the spawn cost.
+        try:
+            warm_n = max(1, min(int(WRAP_FETCH_WORKERS or 0), 4))
+        except Exception:
+            warm_n = 2
+        def _noop():
+            return None
+        futs = []
+        try:
+            for _ in range(warm_n):
+                futs.append(ex.submit(_noop))
+            # Wait briefly for the no-op tasks to complete (threads created + running).
+            done, not_done = wait(futs, timeout=1.0)
+            for f in done:
+                try:
+                    f.result(timeout=0)
+                except Exception:
+                    pass
+            for f in not_done:
+                try:
+                    f.cancel()
+                except Exception:
+                    pass
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -4665,8 +4690,7 @@ def classify_cached(s: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------
 # Expected metadata (real TMDB fetch)
 # ---------------------------
-@lru_cache(maxsize=2000)
-def get_expected_metadata(type_: str, id_: str) -> dict:
+def _get_expected_metadata_impl(type_: str, id_: str) -> dict:
     """Fetch expected metadata for title/year validation and nicer series labels.
 
     Supports Stremio ids like:
@@ -4864,6 +4888,38 @@ def get_expected_metadata(type_: str, id_: str) -> dict:
             "source": "tmdb",
             "imdb_id": imdb_id or "",
         }
+
+# ---- Expected metadata cache wrapper (safe, returns fresh dict per call) ----
+# We intentionally cache an immutable tuple so callers never share a mutable dict.
+# This prevents subtle bugs if any downstream code mutates the returned mapping.
+@lru_cache(maxsize=500)
+def _get_expected_metadata_cached(type_: str, id_: str) -> tuple:
+    d = _get_expected_metadata_impl(type_, id_) or {}
+    return (
+        str(d.get("title") or "").strip(),
+        d.get("year"),
+        d.get("tmdb_id"),
+        str(d.get("episode_title") or "").strip(),
+        d.get("season"),
+        d.get("episode"),
+        str(d.get("source") or ""),
+        str(d.get("imdb_id") or ""),
+    )
+
+
+def get_expected_metadata(type_: str, id_: str) -> dict:
+    title, year, tmdb_id, episode_title, season, episode, source, imdb_id = _get_expected_metadata_cached(type_, id_)
+    return {
+        "title": title,
+        "year": year,
+        "tmdb_id": tmdb_id,
+        "episode_title": episode_title,
+        "season": season,
+        "episode": episode,
+        "source": source,
+        "imdb_id": imdb_id,
+    }
+
 
 def format_stream_inplace(
     s: Dict[str, Any],
