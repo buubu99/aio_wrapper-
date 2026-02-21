@@ -508,6 +508,10 @@ VERIFY_TB_CACHE_OFF = _parse_bool(os.environ.get("VERIFY_TB_CACHE_OFF", "false")
 # Fixes Android/Google TV URL-length limits and keeps playback URLs private.
 WRAP_URL_SHORT = _parse_bool(os.environ.get("WRAP_URL_SHORT", "true"), True)
 WRAP_URL_TTL = _safe_int(os.environ.get('WRAP_URL_TTL', '3600'), 3600)  # seconds
+WRAP_URL_BACKEND = (os.environ.get('WRAP_URL_BACKEND', 'auto') or 'auto').strip().lower()
+WRAP_URL_SQLITE_PATH = (os.environ.get('WRAP_URL_SQLITE_PATH', '/tmp/aio_wrap_tokens.sqlite3') or '/tmp/aio_wrap_tokens.sqlite3').strip()
+# Best-effort: infer intended worker count from env (used only to pick safe /r token backend)
+WEB_CONCURRENCY_ENV = _safe_int(os.environ.get('WEB_CONCURRENCY', os.environ.get('RENDER_WEB_CONCURRENCY', '1')), 1)
 WRAP_HEAD_MODE = (os.environ.get("WRAP_HEAD_MODE", "200_noloc") or "200_noloc").strip().lower()
 RANGE_PROBE_GUARD = _parse_bool(os.environ.get("RANGE_PROBE_GUARD", "true"), True)
 RANGE_PROBE_MAX_BYTES = _safe_int(os.environ.get("RANGE_PROBE_MAX_BYTES", "1024"), 1024)
@@ -1707,6 +1711,22 @@ def _apply_usenet_playability_probe(
     if tn <= 0:
         return pairs
 
+    # Fast-path: honor any pre-existing probe markers (e.g., early P2 probe) without re-probing URLs.
+    try:
+        if drop_stubs or drop_fails:
+            _drop_idx = set()
+            for _j, (_s0, _m0) in enumerate(pairs):
+                if not isinstance(_m0, dict):
+                    continue
+                _up0 = str(_m0.get("usenet_probe") or "").upper().strip()
+                if _up0 == "STUB" and drop_stubs:
+                    _drop_idx.add(_j)
+                elif _up0 == "ERR" and drop_fails:
+                    _drop_idx.add(_j)
+            if _drop_idx:
+                pairs = [p for _k, p in enumerate(pairs) if _k not in _drop_idx]
+    except Exception:
+        pass
     # Identify usenet-like providers
     usenet_provs = {str(p).upper() for p in (USENET_PROVIDERS or USENET_PRIORITY or [])}
     usenet_provs.add("ND")
@@ -1730,6 +1750,13 @@ def _apply_usenet_playability_probe(
     cand: List[int] = []
     seen_url: set[str] = set()
     for i, (s, m) in enumerate(pairs):
+        # Skip URLs already probed earlier (keeps probe budget for untested items).
+        try:
+            _up0 = str((m or {}).get("usenet_probe") or "").upper().strip()
+            if _up0 in ("REAL", "STUB", "ERR"):
+                continue
+        except Exception:
+            pass
         if not _is_usenet_pair((s, m)):
             continue
         u = ""
@@ -2502,11 +2529,297 @@ def _zurl_decode(token: str) -> str:
     raw = zlib.decompress(comp)
     return raw.decode("utf-8")
 
-# In-memory short URL map for /r/<token> -> upstream URL
-# Note: With WEB_CONCURRENCY>1, each worker has its own map; keep concurrency=1 for reliability.
-_WRAP_URL_MAP = {}  # token -> (url, expires_epoch)
-_WRAP_URL_HASH_TO_TOKEN = {}  # sha256(url) -> token (best-effort dedup)
+# Short-token storage backend for /r/<token> -> upstream URL
+#
+# - memory: fastest, but only safe with a single worker (each process has its own map)
+# - sqlite: safe across multiple Gunicorn workers on the SAME Render instance (shared filesystem)
+# - redis:  safe across workers AND multiple instances (requires Render Key Value / Redis + 'redis' package)
+#
+# Choose backend:
+#   WRAP_URL_BACKEND=auto|memory|sqlite|redis
+#   - auto defaults to: redis (if REDIS_URL + redis package), else sqlite (if WEB_CONCURRENCY_ENV>1), else memory
+_WRAP_URL_BACKEND_REQ = (WRAP_URL_BACKEND or "auto").strip().lower()
+_REDIS_URL = (os.environ.get("REDIS_URL", "") or "").strip()
+
+try:
+    import redis as _redis  # type: ignore
+    _REDIS_AVAILABLE = True
+except Exception:
+    _redis = None
+    _REDIS_AVAILABLE = False
+
+if _WRAP_URL_BACKEND_REQ in ("memory", "sqlite", "redis"):
+    _WRAP_URL_BACKEND = _WRAP_URL_BACKEND_REQ
+else:
+    if _REDIS_URL and _REDIS_AVAILABLE:
+        _WRAP_URL_BACKEND = "redis"
+    elif int(WEB_CONCURRENCY_ENV or 1) > 1:
+        _WRAP_URL_BACKEND = "sqlite"
+    else:
+        _WRAP_URL_BACKEND = "memory"
+
+# If someone turns on multiple workers but keeps memory short tokens, /r lookups will randomly fail.
+# Protect playback by disabling WRAP_URL_SHORT unless explicitly forced.
+if WRAP_URL_SHORT and _WRAP_URL_BACKEND == "memory" and int(WEB_CONCURRENCY_ENV or 1) > 1:
+    if not _parse_bool(os.environ.get("WRAP_URL_SHORT_ALLOW_BROKEN", "false"), False):
+        logger.warning(
+            "WRAP_URL_SHORT disabled: WEB_CONCURRENCY=%s with backend=memory would break /r tokens across workers. "
+            "Set WRAP_URL_BACKEND=sqlite (same instance) or configure REDIS_URL (redis backend) to keep short tokens. "
+            "Falling back to restart-safe tokens for reliability.",
+            WEB_CONCURRENCY_ENV,
+        )
+        WRAP_URL_SHORT = False
+        # Ensure restart-safe encoding when we fall back to long tokens
+        os.environ.setdefault("WRAP_URL_RESTART_SAFE", "true")
+    else:
+        logger.warning(
+            "WRAP_URL_SHORT is enabled with backend=memory and WEB_CONCURRENCY=%s; /r tokens may fail across workers.",
+            WEB_CONCURRENCY_ENV,
+        )
+
+# --- memory backend maps (single-worker safe) ---
+_WRAP_URL_MAP: Dict[str, Tuple[str, float]] = {}  # token -> (url, expires_epoch)
+_WRAP_URL_META: Dict[str, Tuple[Dict[str, Any], float]] = {}  # token -> (meta_dict, expires_epoch)
+_WRAP_URL_HASH_TO_TOKEN: Dict[str, str] = {}  # sha256(url) -> token (best-effort dedup)
 _WRAP_URL_LOCK = threading.Lock()
+
+# --- sqlite backend (multi-worker on same instance) ---
+_WRAP_SQLITE_CONN = None
+_WRAP_SQLITE_LOCK = threading.Lock()
+
+def _wrap_sqlite_conn():
+    global _WRAP_SQLITE_CONN
+    if _WRAP_SQLITE_CONN is not None:
+        return _WRAP_SQLITE_CONN
+    import sqlite3
+    path = WRAP_URL_SQLITE_PATH or "/tmp/aio_wrap_tokens.sqlite3"
+    conn = sqlite3.connect(path, timeout=2.0, isolation_level=None, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS wrap_tokens (token TEXT PRIMARY KEY, url TEXT NOT NULL, exp REAL NOT NULL, meta TEXT)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_wrap_tokens_exp ON wrap_tokens(exp)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS wrap_hash (h TEXT PRIMARY KEY, token TEXT NOT NULL, exp REAL NOT NULL)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_wrap_hash_exp ON wrap_hash(exp)")
+    _WRAP_SQLITE_CONN = conn
+    return conn
+
+def _wrap_sqlite_gc(conn, now_ts: float) -> None:
+    try:
+        conn.execute("DELETE FROM wrap_tokens WHERE exp <= ?", (now_ts,))
+        conn.execute("DELETE FROM wrap_hash WHERE exp <= ?", (now_ts,))
+    except Exception:
+        pass
+
+def _wrap_sqlite_store(url: str, meta: Optional[Dict[str, Any]] = None) -> str:
+    import time, hashlib, uuid, json as _json
+    now = time.time()
+    ttl = max(60, int(WRAP_URL_TTL or 3600))
+    exp = now + ttl
+    h = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    conn = _wrap_sqlite_conn()
+
+    with _WRAP_SQLITE_LOCK:
+        # occasional GC (cheap)
+        try:
+            if random.random() < 0.01:
+                _wrap_sqlite_gc(conn, now)
+        except Exception:
+            pass
+
+        if WRAPPER_DEDUP:
+            try:
+                row = conn.execute("SELECT token, exp FROM wrap_hash WHERE h = ?", (h,)).fetchone()
+                if row:
+                    tok, hexp = row[0], float(row[1] or 0)
+                    if hexp > now:
+                        row2 = conn.execute("SELECT url, exp FROM wrap_tokens WHERE token = ?", (tok,)).fetchone()
+                        if row2:
+                            old_url, old_exp = row2[0], float(row2[1] or 0)
+                            if old_url == url and old_exp > now:
+                                # refresh TTL + meta
+                                mjson = _json.dumps(meta) if isinstance(meta, dict) else None
+                                conn.execute("UPDATE wrap_tokens SET exp=?, meta=COALESCE(?, meta) WHERE token=?", (exp, mjson, tok))
+                                conn.execute("UPDATE wrap_hash SET exp=? WHERE h=?", (exp, h))
+                                return tok
+                    # stale hash mapping
+                    conn.execute("DELETE FROM wrap_hash WHERE h=?", (h,))
+            except Exception:
+                pass
+
+        # insert new token (handle rare collision)
+        mjson = _json.dumps(meta) if isinstance(meta, dict) else None
+        for _ in range(5):
+            tok = uuid.uuid4().hex[:16]
+            try:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO wrap_tokens(token, url, exp, meta) VALUES(?,?,?,?)",
+                    (tok, url, exp, mjson),
+                )
+                if cur.rowcount == 1:
+                    if WRAPPER_DEDUP:
+                        try:
+                            conn.execute(
+                                "INSERT OR REPLACE INTO wrap_hash(h, token, exp) VALUES(?,?,?)",
+                                (h, tok, exp),
+                            )
+                        except Exception:
+                            pass
+                    return tok
+            except Exception:
+                continue
+
+    # fallback: shouldn't happen
+    return uuid.uuid4().hex[:16]
+
+def _wrap_sqlite_load(token: str) -> Optional[str]:
+    import time
+    now = time.time()
+    conn = _wrap_sqlite_conn()
+    with _WRAP_SQLITE_LOCK:
+        row = conn.execute("SELECT url, exp FROM wrap_tokens WHERE token = ?", (token,)).fetchone()
+        if not row:
+            return None
+        url, exp = row[0], float(row[1] or 0)
+        if exp and now > exp:
+            try:
+                conn.execute("DELETE FROM wrap_tokens WHERE token=?", (token,))
+                conn.execute("DELETE FROM wrap_hash WHERE token=?", (token,))
+            except Exception:
+                pass
+            return None
+        return url
+
+def _wrap_sqlite_meta_load(token: str) -> Optional[Dict[str, Any]]:
+    import time, json as _json
+    now = time.time()
+    conn = _wrap_sqlite_conn()
+    with _WRAP_SQLITE_LOCK:
+        row = conn.execute("SELECT meta, exp FROM wrap_tokens WHERE token = ?", (token,)).fetchone()
+        if not row:
+            return None
+        m, exp = row[0], float(row[1] or 0)
+        if exp and now > exp:
+            try:
+                conn.execute("DELETE FROM wrap_tokens WHERE token=?", (token,))
+                conn.execute("DELETE FROM wrap_hash WHERE token=?", (token,))
+            except Exception:
+                pass
+            return None
+        if not m:
+            return None
+        try:
+            obj = _json.loads(m)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+
+def _wrap_sqlite_meta_update(token: str, meta: Dict[str, Any]) -> None:
+    if not (token and isinstance(meta, dict)):
+        return
+    import time, json as _json
+    now = time.time()
+    conn = _wrap_sqlite_conn()
+    with _WRAP_SQLITE_LOCK:
+        row = conn.execute("SELECT exp FROM wrap_tokens WHERE token = ?", (token,)).fetchone()
+        if not row:
+            return
+        exp = float(row[0] or 0)
+        if exp and now > exp:
+            return
+        try:
+            conn.execute("UPDATE wrap_tokens SET meta=? WHERE token=?", (_json.dumps(meta), token))
+        except Exception:
+            return
+
+# --- redis backend (optional; requires 'redis' package) ---
+_WRAP_REDIS = None
+def _wrap_redis():
+    global _WRAP_REDIS
+    if _WRAP_REDIS is not None:
+        return _WRAP_REDIS
+    if not (_REDIS_AVAILABLE and _REDIS_URL):
+        return None
+    try:
+        _WRAP_REDIS = _redis.from_url(_REDIS_URL, decode_responses=True)
+        return _WRAP_REDIS
+    except Exception:
+        return None
+
+def _wrap_redis_store(url: str, meta: Optional[Dict[str, Any]] = None) -> str:
+    import hashlib, uuid, json as _json
+    r = _wrap_redis()
+    if r is None:
+        # fallback to sqlite if available
+        return _wrap_sqlite_store(url, meta)
+    ttl = max(60, int(WRAP_URL_TTL or 3600))
+    h = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    # dedup
+    if WRAPPER_DEDUP:
+        try:
+            tok = r.get(f"rh:{h}")
+            if tok and r.get(f"r:{tok}") == url:
+                r.expire(f"r:{tok}", ttl)
+                if isinstance(meta, dict):
+                    r.setex(f"rm:{tok}", ttl, _json.dumps(meta))
+                r.setex(f"rh:{h}", ttl, tok)
+                return tok
+        except Exception:
+            pass
+    # new token
+    for _ in range(5):
+        tok = uuid.uuid4().hex[:16]
+        try:
+            if r.set(f"r:{tok}", url, ex=ttl, nx=True):
+                if isinstance(meta, dict):
+                    r.setex(f"rm:{tok}", ttl, _json.dumps(meta))
+                if WRAPPER_DEDUP:
+                    r.setex(f"rh:{h}", ttl, tok)
+                return tok
+        except Exception:
+            continue
+    return uuid.uuid4().hex[:16]
+
+def _wrap_redis_load(token: str) -> Optional[str]:
+    r = _wrap_redis()
+    if r is None:
+        return _wrap_sqlite_load(token)
+    try:
+        return r.get(f"r:{token}")
+    except Exception:
+        return None
+
+def _wrap_redis_meta_load(token: str) -> Optional[Dict[str, Any]]:
+    import json as _json
+    r = _wrap_redis()
+    if r is None:
+        return _wrap_sqlite_meta_load(token)
+    try:
+        m = r.get(f"rm:{token}")
+        if not m:
+            return None
+        obj = _json.loads(m)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+def _wrap_redis_meta_update(token: str, meta: Dict[str, Any]) -> None:
+    import json as _json
+    r = _wrap_redis()
+    if r is None:
+        return _wrap_sqlite_meta_update(token, meta)
+    try:
+        ttl = max(60, int(WRAP_URL_TTL or 3600))
+        r.setex(f"rm:{token}", ttl, _json.dumps(meta))
+    except Exception:
+        return
+
 
 # --- Verify host cache (short-lived) ---
 # Used to avoid repeatedly probing hosts that have already proven unsafe/risky.
@@ -2554,6 +2867,12 @@ def _wrap_url_store(url: str, meta: Optional[Dict[str, Any]] = None) -> str:
 
     This is an in-memory map per-process. If you rely on these tokens, keep GUNICORN_CONCURRENCY=1.
     """
+    # Multi-worker-safe backends for WRAP_URL_SHORT tokens
+    if _WRAP_URL_BACKEND == "sqlite":
+        return _wrap_sqlite_store(url, meta)
+    if _WRAP_URL_BACKEND == "redis":
+        return _wrap_redis_store(url, meta)
+
     import time, base64, hashlib, uuid
 
     exp = time.time() + max(60, int(WRAP_URL_TTL or 3600))
@@ -2600,6 +2919,12 @@ def _wrap_url_store(url: str, meta: Optional[Dict[str, Any]] = None) -> str:
 
 
 def _wrap_url_load(token: str) -> Optional[str]:
+    # Multi-worker-safe backends for WRAP_URL_SHORT tokens
+    if _WRAP_URL_BACKEND == "sqlite":
+        return _wrap_sqlite_load(token)
+    if _WRAP_URL_BACKEND == "redis":
+        return _wrap_redis_load(token)
+
     import hashlib
     now = time.time()
     with _WRAP_URL_LOCK:
@@ -2672,6 +2997,12 @@ def _unwrap_short_url(u: str) -> Optional[str]:
 
 def _wrap_url_meta_load(token: str) -> Optional[Dict[str, Any]]:
     """Load stored metadata for a short token (best-effort)."""
+    # Multi-worker-safe backends for WRAP_URL_SHORT token metadata
+    if _WRAP_URL_BACKEND == "sqlite":
+        return _wrap_sqlite_meta_load(token)
+    if _WRAP_URL_BACKEND == "redis":
+        return _wrap_redis_meta_load(token)
+
     try:
         now = time.time()
         with _WRAP_URL_LOCK:
@@ -2689,6 +3020,12 @@ def _wrap_url_meta_load(token: str) -> Optional[Dict[str, Any]]:
 
 def _wrap_url_meta_update(token: str, meta: Dict[str, Any]) -> None:
     """Update metadata for an existing short token (best-effort)."""
+    # Multi-worker-safe backends for WRAP_URL_SHORT token metadata
+    if _WRAP_URL_BACKEND == "sqlite":
+        return _wrap_sqlite_meta_update(token, patch)
+    if _WRAP_URL_BACKEND == "redis":
+        return _wrap_redis_meta_update(token, patch)
+
     if not (token and isinstance(meta, dict)):
         return
     try:
@@ -3215,7 +3552,7 @@ handler.setFormatter(SafeFormatter("%(asctime)s | %(levelname)s | %(rid)s | %(me
 logging.getLogger().addHandler(handler)
 logging.getLogger().setLevel(LOG_LEVEL)
 logging.getLogger().addFilter(RequestIdFilter())
-logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N}")
+logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N} wrap_url_backend={_WRAP_URL_BACKEND} web_concurrency_env={WEB_CONCURRENCY_ENV}")
 
 
 def _debug_log_full_streams(type_: str, id_: str, platform: str, out_for_client: Optional[List[Dict[str, Any]]]) -> None:
@@ -5564,6 +5901,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
 
     aio_meta: dict[str, Any] = {}
     p2_meta: dict[str, Any] = {}
+    p2_harvested = False
 
     aio_key = _aio_cache_key(type_, id_, extras)
     cached = _aio_cache_get(aio_key)
@@ -5576,6 +5914,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
 
     aio_fut = None
     p2_fut = None
+    p2_probe_fut = None  # async early usenet probe pipeline
 
     if AIO_BASE and not iphone_usenet_mode:
         aio_fut = _get_fetch_executor().submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, upstream_id, AIO_TAG, (ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT))
@@ -5587,7 +5926,9 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
     if PROV2_BASE:
         p2_fut = _get_fetch_executor().submit(get_streams_single, PROV2_BASE, PROV2_AUTH, type_, upstream_id, PROV2_TAG, (ANDROID_P2_TIMEOUT if is_android else DESKTOP_P2_TIMEOUT))
     def _harvest_p2():
-        nonlocal p2_streams, prov2_in, p2_meta, p2_ms_remote, p2_ms_local
+        nonlocal p2_streams, prov2_in, p2_meta, p2_ms_remote, p2_ms_local, p2_harvested
+        if p2_harvested:
+            return
         if not p2_fut:
             return
         remaining = max(0.05, deadline - time.monotonic())
@@ -5603,6 +5944,88 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                 p2_meta["wait_ms"] = int((time.monotonic() - t_wait0) * 1000)
         except Exception:
             pass
+        p2_harvested = True
+
+
+    def _probe_p2_streams_impl(_streams: List[Dict[str, Any]]):
+        """Run usenet playability probe on prov2 streams only, and attach markers onto stream dicts.
+        This is safe to run in a background thread while AIO is still fetching."""
+        t0p = time.monotonic()
+        try:
+            # Build lightweight (stream, meta) pairs for the probe. Provider ND is treated as usenet.
+            _pairs = []
+            for _s in (_streams or []):
+                if isinstance(_s, dict):
+                    _pairs.append((_s, {"provider": "ND"}))
+            if not _pairs:
+                return _streams, {"probe_early": True, "probe_ms": 0, "probe_scanned": 0}
+
+            _pairs2 = _apply_usenet_playability_probe(
+                _pairs,
+                top_n=int(USENET_PROBE_TOP_N or 0),
+                target_real=int(USENET_PROBE_TARGET_REAL or 0),
+                timeout_s=float(USENET_PROBE_TIMEOUT_S or 0.0),
+                budget_s=float(USENET_PROBE_BUDGET_S or 0.0),
+                range_end=int(USENET_PROBE_RANGE_END or 0),
+                stub_len=int(USENET_PROBE_STUB_LEN or 0),
+                retries=int(USENET_PROBE_RETRIES or 0),
+                concurrency=int(USENET_PROBE_CONCURRENCY or 1),
+                drop_stubs=bool(USENET_PROBE_DROP_STUBS),
+                drop_fails=bool(USENET_PROBE_DROP_FAILS),
+                mark_ready=bool(USENET_PROBE_MARK_READY),
+                stats=None,
+            )
+
+            real = stub = err = 0
+            out: List[Dict[str, Any]] = []
+            for _s, _m in _pairs2:
+                if not isinstance(_s, dict):
+                    continue
+                try:
+                    up = str((_m or {}).get("usenet_probe") or "").upper().strip()
+                except Exception:
+                    up = ""
+                if up in ("REAL", "STUB", "ERR"):
+                    _s["_wrap_usenet_probe"] = up
+                    try:
+                        if up == "REAL" and bool((_m or {}).get("ready")):
+                            _s["_wrap_usenet_ready"] = True
+                    except Exception:
+                        pass
+                    try:
+                        if (_m or {}).get("usenet_probe_reason"):
+                            _s["_wrap_usenet_probe_reason"] = str((_m or {}).get("usenet_probe_reason"))
+                        if (_m or {}).get("usenet_probe_bytes"):
+                            _s["_wrap_usenet_probe_bytes"] = int((_m or {}).get("usenet_probe_bytes") or 0)
+                    except Exception:
+                        pass
+                    if up == "REAL":
+                        real += 1
+                    elif up == "STUB":
+                        stub += 1
+                    elif up == "ERR":
+                        err += 1
+                out.append(_s)
+
+            ms = int((time.monotonic() - t0p) * 1000)
+            return out, {"probe_early": True, "probe_ms": ms, "probe_scanned": int(len(_pairs)), "probe_real": int(real), "probe_stub": int(stub), "probe_err": int(err)}
+        except Exception as _e:
+            try:
+                return _streams, {"probe_early": True, "probe_early_err": f"error:{type(_e).__name__}"}
+            except Exception:
+                return _streams, {"probe_early": True, "probe_early_err": "error"}
+
+    def _start_p2_probe_early():
+        nonlocal p2_probe_fut
+        if p2_probe_fut is not None:
+            return
+        if not (USENET_PROBE_ENABLE and p2_streams):
+            return
+        # Start probe in the background so it overlaps with AIO join time.
+        try:
+            p2_probe_fut = _get_fetch_executor().submit(_probe_p2_streams_impl, list(p2_streams))
+        except Exception:
+            p2_probe_fut = None
 
     mode = AIO_CACHE_MODE
 
@@ -5617,6 +6040,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
             aio_fut.add_done_callback(_make_aio_cache_update_cb(aio_key))
 
         _harvest_p2()
+        _start_p2_probe_early()
 
     elif mode == "soft" and aio_fut is not None:
         soft = float(AIO_SOFT_TIMEOUT_S or 0)
@@ -5624,9 +6048,22 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
             # behave like "off"
             soft = max(0.05, deadline - time.monotonic())
 
+        soft_deadline = time.monotonic() + float(soft)
+        # Pipeline overlap: if P2 finishes before AIO, harvest+probe while AIO keeps fetching.
+        try:
+            if p2_fut and (not p2_harvested):
+                from concurrent.futures import wait as _wait, FIRST_COMPLETED as _FIRST_COMPLETED
+                rem_first = min(max(0.05, float(soft_deadline - time.monotonic())), max(0.05, deadline - time.monotonic()))
+                done0, _ = _wait([aio_fut, p2_fut], timeout=rem_first, return_when=_FIRST_COMPLETED)
+                if p2_fut in done0:
+                    _harvest_p2()
+                    _start_p2_probe_early()
+        except Exception:
+            pass
+
         t_wait0 = time.monotonic()
         try:
-            aio_streams, aio_in, aio_ms_remote, aio_meta, aio_ms_local = aio_fut.result(timeout=min(soft, max(0.05, deadline - time.monotonic())))
+            aio_streams, aio_in, aio_ms_remote, aio_meta, aio_ms_local = aio_fut.result(timeout=min(max(0.05, soft_deadline - time.monotonic()), max(0.05, deadline - time.monotonic())))
         except FuturesTimeoutError:
             if cached is not None:
                 aio_streams, aio_in, cached_ms = cached
@@ -5650,9 +6087,22 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
             pass
 
         _harvest_p2()
+        _start_p2_probe_early()
 
     else:
         # mode == "off" OR no cache: wait for AIO and P2 within the deadline
+        # Pipeline overlap: if P2 finishes before AIO, harvest+probe while AIO keeps fetching.
+        try:
+            if aio_fut and p2_fut and (not p2_harvested):
+                from concurrent.futures import wait as _wait, FIRST_COMPLETED as _FIRST_COMPLETED
+                rem_first = max(0.05, deadline - time.monotonic())
+                done0, _ = _wait([aio_fut, p2_fut], timeout=rem_first, return_when=_FIRST_COMPLETED)
+                if p2_fut in done0:
+                    _harvest_p2()
+                    _start_p2_probe_early()
+        except Exception:
+            pass
+
         if aio_fut:
             remaining = max(0.05, deadline - time.monotonic())
             t_wait0 = time.monotonic()
@@ -5706,9 +6156,42 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
 
 
         _harvest_p2()
+        _start_p2_probe_early()
 
         if aio_streams:
             _aio_cache_set(aio_key, aio_streams, aio_in, int(aio_ms_remote or 0))
+
+
+    # Join early P2 probe (if started) before merging streams, bounded by request deadline.
+    if p2_probe_fut is not None:
+        try:
+            remp = max(0.05, deadline - time.monotonic())
+            _tjp = time.monotonic()
+            p2_streams2, probe_meta2 = p2_probe_fut.result(timeout=remp)
+            if isinstance(p2_streams2, list):
+                p2_streams = p2_streams2
+            try:
+                if isinstance(p2_meta, dict) and isinstance(probe_meta2, dict):
+                    p2_meta.update(probe_meta2)
+                    p2_meta["probe_join_ms"] = int((time.monotonic() - _tjp) * 1000)
+            except Exception:
+                pass
+        except FuturesTimeoutError:
+            try:
+                p2_probe_fut.cancel()
+            except Exception:
+                pass
+            try:
+                if isinstance(p2_meta, dict):
+                    p2_meta["probe_early_err"] = "timeout_join"
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                if isinstance(p2_meta, dict):
+                    p2_meta["probe_early_err"] = f"error:{type(e).__name__}"
+            except Exception:
+                pass
 
     merged = aio_streams + p2_streams
 
@@ -6278,7 +6761,7 @@ def _compact_fetch_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(meta, dict):
         return {}
     # Only keep the safe/compact keys
-    keep = ("tag", "src", "ok", "status", "bytes", "count", "ms", "last_fetch_ms", "ms_provider", "wait_ms", "late_grace_ms", "http_ms", "read_ms", "json_ms", "post_ms", "req_epoch_ms", "conn_ms", "tls_ms", "pre_net_ms", "svrwait_ms", "soft_timeout_ms", "err")
+    keep = ('tag', 'src', 'ok', 'status', 'bytes', 'count', 'ms', 'last_fetch_ms', 'ms_provider', 'wait_ms', 'late_grace_ms', 'http_ms', 'read_ms', 'json_ms', 'post_ms', 'req_epoch_ms', 'conn_ms', 'tls_ms', 'pre_net_ms', 'svrwait_ms', 'soft_timeout_ms', 'err', 'probe_early', 'probe_ms', 'probe_scanned', 'probe_real', 'probe_stub', 'probe_err', 'probe_join_ms', 'probe_early_err')
     return {k: meta.get(k) for k in keep if k in meta and meta.get(k) not in (None, "", {})}
 
 # Diversify top M while preserving quality: pick from a larger pool, bucketed by resolution, then mix providers/suppliers.
@@ -7063,6 +7546,35 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
         try:
             m = classify_cached(s)
+            # Carry pre-probe markers from early P2 probe (pipeline overlap with AIO fetch).
+            try:
+                _up = s.get("_wrap_usenet_probe")
+                if not _up:
+                    _bh0 = s.get("behaviorHints") if isinstance(s, dict) else None
+                    if isinstance(_bh0, dict):
+                        _up = _bh0.get("_wrap_usenet_probe") or _bh0.get("usenetProbe")
+                if _up:
+                    _up_s = str(_up).upper().strip()
+                    if _up_s in ("REAL", "STUB", "ERR"):
+                        m["usenet_probe"] = _up_s
+                        if _up_s == "REAL" and (s.get("_wrap_usenet_ready") is True):
+                            m["ready"] = True
+                        if _up_s in ("STUB", "ERR"):
+                            try:
+                                m["verify_rank"] = max(int(m.get("verify_rank") or 0), 9999)
+                            except Exception:
+                                m["verify_rank"] = 9999
+                    try:
+                        _r = s.get("_wrap_usenet_probe_reason")
+                        if _r:
+                            m["usenet_probe_reason"] = str(_r)
+                        _b = s.get("_wrap_usenet_probe_bytes")
+                        if _b:
+                            m["usenet_probe_bytes"] = int(_b)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except Exception as e:
             stats.dropped_error += 1
             drop_reasons['classify_exc'] += 1
@@ -9493,7 +10005,8 @@ def stream(type_: str, id_: str):
                                     "py_tb_mark_only": int(getattr(stats, "ms_py_tb_mark_only", 0) or 0),
                                     "py_ff_overhead": int(getattr(stats, "ms_py_ff_overhead", 0) or 0),
                                     "usenet_ready_match": int(getattr(stats, "ms_usenet_ready_match", 0) or 0),
-                                    "usenet_probe": int(getattr(stats, "ms_usenet_probe", 0) or 0),
+                                    "usenet_probe": int(max(int(getattr(stats, "ms_usenet_probe", 0) or 0), int(((getattr(stats, "fetch_p2", {}) or {}).get("probe_ms")) or 0))),
+                                    "usenet_probe_join": int(((getattr(stats, "fetch_p2", {}) or {}).get("probe_join_ms")) or 0),
                                     "fetch_wall": int(getattr(stats, "ms_fetch_wall", 0) or 0),
                                     "py_pre_wrap": max(int(getattr(stats, "ms_py_ff", 0) or 0) - int(getattr(stats, "ms_py_wrap_emit", 0) or 0), 0),
                                     "overhead": int(getattr(stats, "ms_overhead", 0) or 0),
@@ -9703,7 +10216,7 @@ def stream(type_: str, id_: str):
                 "parallel_slack_ms=%s "
                 "tmdb_ms=%s py_ff_ms=%s py_clean_ms=%s title_ms=%s py_sort_ms=%s py_mix_ms=%s "
                 "py_tb_prep_ms=%s tb_api_ms=%s py_tb_mark_ms=%s "
-                "tb_webdav_ms=%s tb_usenet_ms=%s usenet_ready_ms=%s usenet_probe_ms=%s "
+                "tb_webdav_ms=%s tb_usenet_ms=%s usenet_ready_ms=%s usenet_probe_ms=%s usenet_probe_join_ms=%s "
                 "py_dedup_ms=%s py_wrap_emit_ms=%s py_ff_overhead_ms=%s py_pre_wrap_ms=%s overhead_ms=%s",
                 _rid(),
                 int(ms_total),
@@ -9748,7 +10261,8 @@ def stream(type_: str, id_: str):
                 int(getattr(stats, "ms_tb_webdav", 0) or 0),
                 int(getattr(stats, "ms_tb_usenet", 0) or 0),
                 int(getattr(stats, "ms_usenet_ready_match", 0) or 0),
-                int(getattr(stats, "ms_usenet_probe", 0) or 0),
+                int(max(int(getattr(stats, "ms_usenet_probe", 0) or 0), int(((getattr(stats, "fetch_p2", {}) or {}).get("probe_ms")) or 0))),
+                int(((getattr(stats, "fetch_p2", {}) or {}).get("probe_join_ms")) or 0),
                 int(getattr(stats, "ms_py_dedup", 0) or 0),
                 int(getattr(stats, "ms_py_wrap_emit", 0) or 0),
                 int(getattr(stats, "ms_py_ff_overhead", 0) or 0),
