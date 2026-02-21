@@ -1623,11 +1623,17 @@ async def _usenet_range_probe_is_real_async(
                         continue
                     return (False, last_err, 0)
 
-                body = await r.read()
-                last_bytes = len(body)
+                                # Read only a tiny prefix so probes complete quickly even if the server ignores Range
+                # We read stub_len+1 bytes: if we can read more than stub_len, treat as REAL.
+                want = int(stub_len) + 1
+                chunk = await r.content.read(want)
+                last_bytes = len(chunk)
+
+                if last_bytes < int(stub_len):
+                    return (False, "SHORT", last_bytes)
 
                 # EXACT SAME CHECK AS YOUR STANDALONE PROBE:
-                # If we only get the stub bytes back, treat as STUB.
+                # If we only get exactly stub_len bytes back, treat as STUB.
                 if last_bytes == int(stub_len):
                     return (False, "STUB_LEN", last_bytes)
                 return (True, "REAL", last_bytes)
