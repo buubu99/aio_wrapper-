@@ -3600,7 +3600,17 @@ def _before_request() -> None:
         return jsonify(body), code
 
 def _rid() -> str:
-    return g.request_id if has_request_context() and hasattr(g, "request_id") else "GLOBAL"
+    # Prefer Flask request id when in request context; otherwise fall back to thread-local rid
+    # so background tasks (e.g., early usenet probe) can still log with the correct rid.
+    if has_request_context() and hasattr(g, "request_id"):
+        return g.request_id
+    try:
+        rid = getattr(_TLS, "rid", None)
+        if rid:
+            return str(rid)
+    except Exception:
+        pass
+    return "GLOBAL"
 
 def _mark() -> str:
     """Request correlation marker from client header (X-REQ-MARK)."""
@@ -5947,18 +5957,27 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
         p2_harvested = True
 
 
-    def _probe_p2_streams_impl(_streams: List[Dict[str, Any]]):
+    def _probe_p2_streams_impl(_streams: List[Dict[str, Any]], _rid_value: str):
         """Run usenet playability probe on prov2 streams only, and attach markers onto stream dicts.
-        This is safe to run in a background thread while AIO is still fetching."""
+        This is safe to run in a background thread while AIO is still fetching.
+
+        IMPORTANT: This is the ONLY place we run the usenet probe (no late/global probe) to avoid double work.
+        """
+        _prev_rid = getattr(_TLS, "rid", None)
+        try:
+            _TLS.rid = str(_rid_value or "GLOBAL")
+        except Exception:
+            pass
+
         t0p = time.monotonic()
         try:
             # Build lightweight (stream, meta) pairs for the probe. Provider ND is treated as usenet.
-            _pairs = []
+            _pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
             for _s in (_streams or []):
                 if isinstance(_s, dict):
                     _pairs.append((_s, {"provider": "ND"}))
             if not _pairs:
-                return _streams, {"probe_early": True, "probe_ms": 0, "probe_scanned": 0}
+                return _streams, {"probe_early": True, "probe_ms": 0, "probe_scanned": 0, "probe_real": 0, "probe_stub": 0, "probe_err": 0}
 
             _pairs2 = _apply_usenet_playability_probe(
                 _pairs,
@@ -6010,10 +6029,16 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
             ms = int((time.monotonic() - t0p) * 1000)
             return out, {"probe_early": True, "probe_ms": ms, "probe_scanned": int(len(_pairs)), "probe_real": int(real), "probe_stub": int(stub), "probe_err": int(err)}
         except Exception as _e:
+            return _streams, {"probe_early": True, "probe_early_err": f"error:{type(_e).__name__}"}
+        finally:
             try:
-                return _streams, {"probe_early": True, "probe_early_err": f"error:{type(_e).__name__}"}
+                if _prev_rid is None:
+                    if hasattr(_TLS, "rid"):
+                        delattr(_TLS, "rid")
+                else:
+                    _TLS.rid = _prev_rid
             except Exception:
-                return _streams, {"probe_early": True, "probe_early_err": "error"}
+                pass
 
     def _start_p2_probe_early():
         nonlocal p2_probe_fut
@@ -6023,7 +6048,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
             return
         # Start probe in the background so it overlaps with AIO join time.
         try:
-            p2_probe_fut = _get_fetch_executor().submit(_probe_p2_streams_impl, list(p2_streams))
+            p2_probe_fut = _get_fetch_executor().submit(_probe_p2_streams_impl, list(p2_streams), _rid())
         except Exception:
             p2_probe_fut = None
 
@@ -8207,37 +8232,10 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         stats.ms_py_sort += int((time.monotonic() - _t_sort0) * 1000)
     except Exception:
         pass
-    # Direct Usenet playability probe (REAL vs STUB) - replaces NZBGeek readiness when enabled.
-    # This runs AFTER global sort/dedup and marks/demotes stubs so playable links float upward.
-    if (not fast_mode) and has_usenet and USENET_PROBE_ENABLE:
-        try:
-            t_up0 = time.monotonic()
-            out_pairs = _apply_usenet_playability_probe(
-                out_pairs,
-                top_n=int(USENET_PROBE_TOP_N or 0),
-                target_real=int(USENET_PROBE_TARGET_REAL or 0),
-                timeout_s=float(USENET_PROBE_TIMEOUT_S or 4.0),
-                budget_s=float(USENET_PROBE_BUDGET_S or 8.5),
-                range_end=int(USENET_PROBE_RANGE_END or 16440),
-                stub_len=int(USENET_PROBE_STUB_LEN or 16440),
-                retries=int(USENET_PROBE_RETRIES or 0),
-                concurrency=int(USENET_PROBE_CONCURRENCY or 8),
-                drop_stubs=bool(USENET_PROBE_DROP_STUBS),
-                drop_fails=bool(USENET_PROBE_DROP_FAILS),
-                mark_ready=bool(USENET_PROBE_MARK_READY),
-                stats=stats,
-            )
-            stats.ms_usenet_probe = int((time.monotonic() - t_up0) * 1000)
-            _t_sort0 = time.monotonic()
-            out_pairs.sort(key=sort_key)
-            try:
-                stats.ms_py_sort += int((time.monotonic() - _t_sort0) * 1000)
-            except Exception:
-                pass
-        except Exception as _e:
-            logger.debug("USENET_PROBE_ERR rid=%s err=%s", rid, _e)
+        # NOTE: Usenet probe is executed ONLY in the early P2 pipeline (overlapped with AIO fetch).
+    # Do NOT run a second global probe here; that would double the latency and defeats the purpose of worker2 overlap.
 
-    # Parallel verification (batched for speed; only verify top-N after global sort)
+# Parallel verification (batched for speed; only verify top-N after global sort)
     if (not fast_mode) and VERIFY_STREAM and (not (is_android and ANDROID_VERIFY_OFF)):
         try:
             top_n = ANDROID_VERIFY_TOP_N if (is_android or is_iphone) else VERIFY_DESKTOP_TOP_N
