@@ -5,3 +5,4 @@ gunicorn
 python-levenshtein
 uvicorn
 ua-parser
+aiohttp
