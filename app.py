@@ -1626,6 +1626,16 @@ async def _usenet_range_probe_is_real_async(
         if pending:
             _ = await asyncio.gather(*pending, return_exceptions=True)
 
+        # Ensure we always return a result for every URL.
+        # Any URL still pending at the budget wall is reported as BUDGET.
+        try:
+            for t in pending:
+                u = task_url.get(t, "")
+                if u:
+                    results.append((u, False, 0, "BUDGET"))
+        except Exception:
+            pass
+
     return results
 
 async def _probe_single(
@@ -1667,7 +1677,7 @@ async def _probe_single(
             except Exception as e:
                 if attempt == retries:
                     return (url, False, 0, f"FAIL_{type(e).__name__}")
-                await asyncio.sleep(0.5)  # Backoff
+                await asyncio.sleep(0.3)  # Backoff
     return (url, False, 0, "MAX_RETRIES")
 
 
@@ -1804,6 +1814,11 @@ def _apply_usenet_playability_probe(
                 urls.append(u)
                 url_to_idx[u] = idx
 
+            # Probe shorter URLs first (more deterministic + matches the manual probe script).
+            try:
+                urls.sort(key=len)
+            except Exception:
+                pass
             async def _main() -> List[Tuple[str, bool, int, str]]:
                 return await _usenet_range_probe_is_real_async(
                     urls,
@@ -1819,10 +1834,11 @@ def _apply_usenet_playability_probe(
 
             batch_res = asyncio.run(_main()) if urls else []
             url_to_res = {u: (bool(ok), int(size or 0), str(reason)) for (u, ok, size, reason) in (batch_res or [])}
-
             for u, idx in url_to_idx.items():
                 r = url_to_res.get(u)
                 if r is None:
+                    # Budget wall reached before this URL completed; mark explicitly.
+                    probe_results.append((idx, False, 'BUDGET', 0))
                     continue
                 ok, nbytes, reason = r
                 probe_results.append((idx, bool(ok), str(reason), int(nbytes or 0)))
@@ -1831,17 +1847,27 @@ def _apply_usenet_playability_probe(
             probe_results = []
 
     idx_to_res = {i: (ok, reason, nbytes) for (i, ok, reason, nbytes) in probe_results}
-
     for i in cand:
         if i not in idx_to_res:
+            # No result came back for this candidate (budget wall or probe error).
             budget_idx.append(i)
+            s, m = pairs[i]
+            if isinstance(m, dict):
+                err_idx.append(i)
+                m['usenet_probe'] = 'ERR'
+                m['usenet_probe_reason'] = 'BUDGET'
+                m['usenet_probe_bytes'] = 0
             continue
         ok, reason, nbytes = idx_to_res[i]
         s, m = pairs[i]
         if not isinstance(m, dict):
             continue
-        if str(reason) == "BUDGET":
+        if str(reason) == 'BUDGET':
             budget_idx.append(i)
+            err_idx.append(i)
+            m['usenet_probe'] = 'ERR'
+            m['usenet_probe_reason'] = 'BUDGET'
+            m['usenet_probe_bytes'] = int(nbytes or 0)
             continue
         if ok:
             real_idx.append(i)
