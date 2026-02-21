@@ -428,7 +428,7 @@ USE_NZBGEEK_READY = _parse_bool(os.environ.get("USE_NZBGEEK_READY", "1"), True)
 # Direct Usenet playability probe (replaces NZBGeek readiness as "source of truth" when enabled).
 # Uses a tiny byte-range GET to distinguish REAL vs STUB proxy links.
 USENET_PROBE_ENABLE = _parse_bool(os.environ.get("USENET_PROBE_ENABLE", "0"), False)
-USENET_PROBE_TOP_N = _safe_int(os.environ.get("USENET_PROBE_TOP_N", os.environ.get("USENET_PROBE_TOP", "50")), 50)
+USENET_PROBE_TOP_N = _safe_int(os.environ.get("USENET_PROBE_TOP_N", os.environ.get("USENET_PROBE_TOP", "60")), 60)
 # Stop early once we have this many REAL usenet links (keeps latency down).
 USENET_PROBE_TARGET_REAL = _safe_int(os.environ.get("USENET_PROBE_TARGET_REAL", "12"), 12)
 USENET_PROBE_TIMEOUT_S = _safe_float(os.environ.get("USENET_PROBE_TIMEOUT_S", "4.0"), 4.0)
@@ -438,7 +438,7 @@ USENET_PROBE_REAL_TOP10_PCT = _safe_float(os.environ.get("USENET_PROBE_REAL_TOP1
 USENET_PROBE_REAL_TOP20_N = _safe_int(os.environ.get("USENET_PROBE_REAL_TOP20_N", "20"), 20)
 _tmp_verify_retries = _safe_int(os.environ.get("VERIFY_RETRIES", "0"), 0)
 USENET_PROBE_RETRIES = _safe_int(os.environ.get("USENET_PROBE_RETRIES", str(_tmp_verify_retries)), _tmp_verify_retries)
-USENET_PROBE_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY", "20"), 20)
+USENET_PROBE_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY", "40"), 40)
 USENET_PROBE_RANGE_END = _safe_int(os.environ.get("USENET_PROBE_RANGE_END", "16440"), 16440)
 # If we read exactly this many bytes back from the range probe, treat it as a "stub".
 USENET_PROBE_STUB_LEN = _safe_int(os.environ.get("USENET_PROBE_STUB_LEN", "16440"), 16440)
