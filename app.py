@@ -1577,13 +1577,11 @@ async def _usenet_range_probe_is_real_async(
         except Exception:
             pass
         try:
-            sys.stdout.write(_msg + '
-'); sys.stdout.flush()
+            sys.stdout.write(_msg + "\n"); sys.stdout.flush()
         except Exception:
             pass
         try:
-            sys.stderr.write(_msg + '
-'); sys.stderr.flush()
+            sys.stderr.write(_msg + "\n"); sys.stderr.flush()
         except Exception:
             pass
 
