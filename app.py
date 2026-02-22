@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+import sys
 import unicodedata
 import uuid
 import difflib
@@ -1562,15 +1563,29 @@ async def _usenet_range_probe_is_real_async(
             task_url[t] = url
 
         # Wait for all with overall budget timeout (partial results if exceeded)
+        _t0 = time.monotonic()
         done, pending = await asyncio.wait(tasks, timeout=budget_s)
-
-        if pending:
-            logger.info(
-                "PROBE_PARTIAL: %d/%d completed in %.2f s",
-                int(len(done)),
-                int(len(tasks)),
-                float(budget_s),
-            )
+        _elapsed = time.monotonic() - _t0
+        _msg = f"PROBE_PARTIAL: {int(len(done))}/{int(len(tasks))} completed in {float(min(_elapsed, float(budget_s))):.2f} s"
+        try:
+            logger.info(_msg)
+        except Exception:
+            pass
+        # Force the line through common Render/Gunicorn log paths (stdout+stderr+gunicorn.error).
+        try:
+            logging.getLogger('gunicorn.error').info(_msg)
+        except Exception:
+            pass
+        try:
+            sys.stdout.write(_msg + '
+'); sys.stdout.flush()
+        except Exception:
+            pass
+        try:
+            sys.stderr.write(_msg + '
+'); sys.stderr.flush()
+        except Exception:
+            pass
 
         for t in done:
             u = task_url.get(t, "")
