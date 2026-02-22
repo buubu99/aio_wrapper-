@@ -2168,6 +2168,87 @@ def _apply_usenet_real_priority_mix(
 
     out = head + tail
 
+    # --- Presentation shake: spread REAL-usenet items within Top10 and within positions 11–20 ---
+    # We keep the *quotas* unchanged (cap10/min20) and only reorder within the bracket slices
+    # to avoid clumping (e.g., [1..6] then [11..14]).
+    def _is_real_usenet_pair(p: Tuple[Dict[str, Any], Dict[str, Any]]) -> bool:
+        try:
+            _s, _m = p
+            return str((_m or {}).get("usenet_probe") or "") == "REAL" and _is_usenet_pair((_s, _m))
+        except Exception:
+            return False
+
+    def _shake_slice(
+        slice_pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
+        *,
+        pin_first: bool,
+    ) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """Deterministically interleave REAL-usenet with others to reduce consecutive runs."""
+        if not slice_pairs:
+            return slice_pairs
+
+        first_pair: Optional[Tuple[Dict[str, Any], Dict[str, Any]]] = None
+        rest = slice_pairs
+        if pin_first and len(slice_pairs) >= 1:
+            first_pair = slice_pairs[0]
+            rest = slice_pairs[1:]
+
+        real = [p for p in rest if _is_real_usenet_pair(p)]
+        other = [p for p in rest if not _is_real_usenet_pair(p)]
+
+        # Nothing to interleave
+        if len(real) <= 1 or len(other) == 0:
+            return slice_pairs
+
+        out2: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+
+        # If the pinned first is REAL-usenet and we have others, prefer an "other" at slot 2 to avoid REAL-REAL.
+        if first_pair is not None and _is_real_usenet_pair(first_pair) and other:
+            out2.append(other.pop(0))
+
+        gaps = len(other) + 1
+        base, rem = divmod(len(real), gaps)
+        gap_counts = [base] * gaps
+
+        # Distribute any remainder away from the very first gap so we don't front-load REALs.
+        if rem:
+            order = list(range(1, gaps)) + [0]
+            for i in range(rem):
+                gap_counts[order[i % gaps]] += 1
+
+        ri = 0
+        oi = 0
+        for g in range(gaps):
+            for _ in range(gap_counts[g]):
+                if ri < len(real):
+                    out2.append(real[ri])
+                    ri += 1
+            if oi < len(other):
+                out2.append(other[oi])
+                oi += 1
+
+        # Safety: append any leftovers (shouldn't happen, but keep stable/deterministic).
+        if ri < len(real):
+            out2.extend(real[ri:])
+        if oi < len(other):
+            out2.extend(other[oi:])
+
+        if first_pair is not None:
+            return [first_pair] + out2
+        return out2
+
+    # Shake Top10 (pin slot #1 for stability)
+    if len(out) > 1:
+        top10_end = min(len(out), top10_window)
+        if top10_end > 1:
+            out[:top10_end] = _shake_slice(out[:top10_end], pin_first=True)
+
+        # Shake positions 11–20 (pin slot #11 for stability)
+        if len(out) > top10_window:
+            top20_end = min(len(out), top20_window)
+            if top20_end - top10_window > 1:
+                out[top10_window:top20_end] = _shake_slice(out[top10_window:top20_end], pin_first=True)
+
     try:
         # Stats/log helper (no URLs)
         in_top10 = 0
