@@ -1995,6 +1995,8 @@ def _apply_usenet_playability_probe(
         pass
 
     return pairs
+
+
 def _apply_usenet_real_priority_mix(
     pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
     *,
@@ -2003,12 +2005,17 @@ def _apply_usenet_real_priority_mix(
     top20_n: int,
     stats: Optional["PipeStats"] = None,
 ) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
-    """Re-order *delivered slice* so probed REAL usenet links are prioritized deterministically.
+    """Shape the *delivered slice* using probe classifications (deterministic + stable).
 
-    Policy (defaults):
-      - Cap REAL usenet inside top-10 to ~50% (so debrid stays visible).
-      - Promote remaining REAL usenet into the rest of top-20.
-      - Everything else stays in original order (debrid sort order preserved).
+    IMPORTANT: Only items with meta['usenet_probe'] == 'REAL' are considered "REAL usenet".
+    STUB/ERR/BUDGET/unprobed entries do NOT count toward quotas.
+
+    Policy:
+      - TOP10: cap REAL usenet inside the first 10 to ~top10_pct (keeps debrid visible),
+               and when enough REAL exist, force that many REAL usenet to appear in top-10.
+      - TOP20: ensure at least top20_n REAL usenet appear in the first 20 (best-effort),
+               without violating the TOP10 cap.
+      - Everything else preserves original relative order as much as possible.
     """
     if not pairs:
         return pairs
@@ -2057,37 +2064,49 @@ def _apply_usenet_real_priority_mix(
             n = ""
         return (u, ih, n)
 
+    def _is_real_usenet(pair: Tuple[Dict[str, Any], Dict[str, Any]]) -> bool:
+        _s, _m = pair
+        if not isinstance(_m, dict):
+            return False
+        if not _is_usenet_pair(pair):
+            return False
+        return str(_m.get("usenet_probe") or "") == "REAL"
+
     # REAL usenet list (preserve current order)
     real_usenet: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-    for p in pairs[:]:
-        s, m = p
-        if not isinstance(m, dict):
-            continue
-        if not _is_usenet_pair(p):
-            continue
-        if str(m.get("usenet_probe") or "") != "REAL":
-            continue
-        real_usenet.append(p)
+    for p in pairs:
+        if _is_real_usenet(p):
+            real_usenet.append(p)
 
     if not real_usenet:
         return pairs
 
-    top10_n = min(10, deliver_n)
-    top20_n_eff = min(max(0, int(top20_n or 20)), deliver_n)
+    # Windows are fixed: TOP10=10, TOP20=20 (clamped by deliver_n)
+    top10_window = min(10, deliver_n)
+    top20_window = min(20, deliver_n)
+
+    # TOP10 cap (pct)
     try:
         pct = float(top10_pct or 0.5)
     except Exception:
         pct = 0.5
     pct = max(0.0, min(1.0, pct))
-    cap10 = int(float(top10_n) * pct)
-    cap10 = max(0, min(cap10, top10_n, len(real_usenet)))
-    cap20 = max(0, min(top20_n_eff, len(real_usenet)))
+    cap10 = int(float(top10_window) * pct)
+    cap10 = max(0, min(cap10, top10_window, len(real_usenet)))
 
-    # Build head with a strict cap inside top10.
+    # TOP20 minimum count (best-effort)
+    try:
+        min20 = int(top20_n or 0)
+    except Exception:
+        min20 = 0
+    min20 = max(0, min(min20, top20_window))
+    if min20 < cap10:
+        min20 = min(cap10, top20_window)
+
     used = set()
-
     head: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
-    # 1) Put first cap10 REAL usenet into the head.
+
+    # 1) Put first cap10 REAL usenet into the head (forces them into TOP10 when available).
     for p in real_usenet[:cap10]:
         k = _key_of(p)
         if k in used:
@@ -2095,34 +2114,43 @@ def _apply_usenet_real_priority_mix(
         head.append(p)
         used.add(k)
 
-    # 2) Fill remaining top10 slots with best non-REAL items (preserve current order),
-    #    and avoid accidentally adding more REAL usenet in top10 (strict cap).
+    # 2) Fill remaining TOP10 slots with best non-REAL items (preserve current order),
+    #    and keep additional REAL usenet out of TOP10 (strict cap).
     for p in pairs:
-        if len(head) >= top10_n:
+        if len(head) >= top10_window:
             break
         k = _key_of(p)
         if k in used:
             continue
-        # Strict cap: keep additional REAL usenet out of top10.
-        _m = p[1]
-        if isinstance(_m, dict) and str(_m.get("usenet_probe") or "") == "REAL" and _is_usenet_pair(p):
+        if _is_real_usenet(p):
             continue
         head.append(p)
         used.add(k)
 
-    # 3) Promote remaining REAL usenet into the rest of top20.
-    for p in real_usenet[cap10:cap20]:
-        if len(head) >= top20_n_eff:
-            break
-        k = _key_of(p)
-        if k in used:
-            continue
-        head.append(p)
-        used.add(k)
+    # 3) Ensure TOP20 has at least min20 REAL usenet (best-effort) without violating TOP10 cap.
+    #    Promote next REAL usenet into positions 11..20 first.
+    have_real = 0
+    for _p in head[:top20_window]:
+        if _is_real_usenet(_p):
+            have_real += 1
 
-    # 4) Fill to top20 with remaining items (preserve order).
+    need_more = max(0, min20 - have_real)
+    if need_more > 0:
+        for p in real_usenet[cap10:]:
+            if len(head) >= top20_window:
+                break
+            if need_more <= 0:
+                break
+            k = _key_of(p)
+            if k in used:
+                continue
+            head.append(p)
+            used.add(k)
+            need_more -= 1
+
+    # 4) Fill to TOP20 with remaining items (preserve order).
     for p in pairs:
-        if len(head) >= top20_n_eff:
+        if len(head) >= top20_window:
             break
         k = _key_of(p)
         if k in used:
@@ -2130,7 +2158,7 @@ def _apply_usenet_real_priority_mix(
         head.append(p)
         used.add(k)
 
-    # 5) Append the remainder in original order (including extra REAL usenet beyond top20 if any).
+    # 5) Append the remainder in original order.
     tail: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     for p in pairs:
         k = _key_of(p)
@@ -2146,19 +2174,24 @@ def _apply_usenet_real_priority_mix(
         in_top20 = 0
         pos_top10 = []
         pos_top20 = []
-        for i, (_s0, _m0) in enumerate(out[:max(top20_n_eff, top10_n)], start=1):
+        for i, (_s0, _m0) in enumerate(out[:top20_window], start=1):
             if not isinstance(_m0, dict):
                 continue
-            if str(_m0.get("usenet_probe") or "") == "REAL":
-                if i <= top10_n:
+            if str(_m0.get("usenet_probe") or "") == "REAL" and _is_usenet_pair((_s0, _m0)):
+                if i <= top10_window:
                     in_top10 += 1
                     pos_top10.append(i)
-                if i <= top20_n_eff:
+                if i <= top20_window:
                     in_top20 += 1
                     pos_top20.append(i)
+
+        short10 = max(0, cap10 - in_top10)
+        short20 = max(0, min20 - in_top20)
+
         logger.info(
-            "USENET_REAL_MIX rid=%s real_total=%s real_top10=%s real_top20=%s cap10=%s top20=%s",
-            _rid(), int(len(real_usenet)), int(in_top10), int(in_top20), int(cap10), int(top20_n_eff),
+            "USENET_REAL_MIX rid=%s real_total=%s cap10=%s min20=%s win10=%s win20=%s real_top10=%s real_top20=%s short10=%s short20=%s",
+            _rid(), int(len(real_usenet)), int(cap10), int(min20), int(top10_window), int(top20_window),
+            int(in_top10), int(in_top20), int(short10), int(short20),
         )
         try:
             logger.info("USENET_REAL_POS rid=%s pos_top10=%s pos_top20=%s", _rid(), pos_top10, pos_top20)
@@ -2170,12 +2203,15 @@ def _apply_usenet_real_priority_mix(
                 stats.counts_out["usenet_real_total"] = int(len(real_usenet))
                 stats.counts_out["usenet_real_top10"] = int(in_top10)
                 stats.counts_out["usenet_real_top20"] = int(in_top20)
+                stats.counts_out["usenet_real_cap10"] = int(cap10)
+                stats.counts_out["usenet_real_min20"] = int(min20)
             except Exception:
                 pass
     except Exception:
         pass
 
     return out
+
 
 
 
@@ -9408,8 +9444,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
 
     # --- Usenet REAL priority mix (final-order shaping)
-    # If we have probed REAL usenet links, ensure they are visible early without letting usenet dominate top-10.
-    # Policy: ~50% of top-10 from REAL usenet, and promote remaining REAL usenet into top-20.
+    # If we have probed REAL usenet links, shape the final order using ONLY the probe=REAL list.
+    # Policy: cap REAL usenet inside top-10 by pct, and ensure at least N REAL usenet inside top-20 (best-effort).
     if USENET_PROBE_ENABLE and candidates and deliver_cap_eff > 0:
         try:
             candidates = _apply_usenet_real_priority_mix(
