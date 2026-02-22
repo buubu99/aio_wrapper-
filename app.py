@@ -10432,6 +10432,20 @@ def stream(type_: str, id_: str):
                     json.dumps(stats.counts_out, separators=(",", ":"), sort_keys=True),
                 )
 
+                # Always emit a probe summary line near WRAP_COUNTS so it is present even if earlier
+                # probe logs are missing from the captured window.
+                try:
+                    _p2 = stats.fetch_p2 or {}
+                    if any(k in _p2 for k in ("probe_scanned","probe_real","probe_stub","probe_err","probe_budget","probe_ms","probe_join_ms")):
+                        logger.info(
+                            "USENET_PROBE_SUMMARY rid=%s mark=%s scanned=%s real=%s stub=%s err=%s budget=%s probe_ms=%s join_ms=%s",
+                            _rid(), _mark(),
+                            _p2.get("probe_scanned"), _p2.get("probe_real"), _p2.get("probe_stub"),
+                            _p2.get("probe_err"), _p2.get("probe_budget"), _p2.get("probe_ms"), _p2.get("probe_join_ms"),
+                        )
+                except Exception:
+                    pass
+
             except Exception:
                 pass
 
