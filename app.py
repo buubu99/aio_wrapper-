@@ -1532,7 +1532,24 @@ async def _usenet_range_probe_is_real_async(
             _auth = aiohttp.BasicAuth(_u, _p)
     except Exception:
         _auth = None
-    connector = aiohttp.TCPConnector(limit=int(concurrency), limit_per_host=min(4, int(concurrency)), ttl_dns_cache=300)
+    # Per-host concurrency is the true throttle when all URLs share one host.
+    # Default stays 4 to preserve current behavior; raise via USENET_PROBE_LIMIT_PER_HOST.
+    try:
+        _lph_env = int(os.getenv("USENET_PROBE_LIMIT_PER_HOST", "4") or 4)
+    except Exception:
+        _lph_env = 4
+    eff_lph = max(1, min(int(concurrency), int(len(urls) or 1), int(_lph_env or 4)))
+    try:
+        logger.info("USENET_PROBE_CONN rid=%s conc=%s lph=%s budget_s=%.2f timeout_s=%.2f retries=%s",
+                    _rid(), int(concurrency), int(eff_lph), float(budget_s), float(timeout_s), int(retries))
+    except Exception:
+        pass
+    connector = aiohttp.TCPConnector(
+        limit=max(int(concurrency), int(eff_lph)),
+        limit_per_host=int(eff_lph),
+        ttl_dns_cache=300,
+        keepalive_timeout=30,
+    )
     async with aiohttp.ClientSession(auth=_auth, connector=connector) as session:
         tasks: List[asyncio.Task] = []
         task_url: Dict[asyncio.Task, str] = {}
@@ -1597,15 +1614,30 @@ async def _probe_single(
 ) -> Tuple[str, bool, int, str]:
     # IMPORTANT: acquire the semaphore per-attempt (not across the whole retry loop),
     # so a slow attempt doesn't "hog" a slot during backoff.
+    # Optional: use a shorter total timeout on attempt #1 to keep throughput high,
+    # while still preserving correctness via attempt #2 (the "rescue" attempt).
+    # Default is disabled (0 or unset) to preserve current behavior unless explicitly enabled.
+    try:
+        _a1 = float(os.getenv("USENET_PROBE_ATTEMPT1_TIMEOUT_S", "0") or 0.0)
+    except Exception:
+        _a1 = 0.0
+
     for attempt in range(1, retries + 1):
         try:
             headers = {"Range": f"bytes=0-{range_end}"}
+            # Attempt-specific timeout: attempt#1 can be shorter (if enabled), later attempts use the full timeout_s.
+            this_total = float(timeout_s)
+            if attempt == 1 and _a1 and _a1 > 0:
+                this_total = max(0.5, min(float(timeout_s), float(_a1)))
+            # Keep connect phase snappy (common cause of head-of-line blocking under budget).
+            sock_connect_s = min(2.0, this_total) if attempt > 1 else min(1.5, this_total)
+
             async with sem:
                 async with session.get(
                     url,
                     headers=headers,
                     allow_redirects=True,
-                    timeout=aiohttp.ClientTimeout(total=timeout_s, sock_connect=min(2.0, timeout_s), sock_read=timeout_s),
+                    timeout=aiohttp.ClientTimeout(total=this_total, sock_connect=sock_connect_s, sock_read=this_total),
                 ) as resp:
                     # Read only what we need (protects budget if a server ignores Range).
                     # We never need more than (stub_len+1) to decide REAL vs STUB.
@@ -5939,6 +5971,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
     aio_fut = None
     p2_fut = None
     p2_probe_fut = None  # async early usenet probe pipeline
+    p2_probe_t0 = None  # monotonic start time for early probe (for join timeout tuning)
 
     if AIO_BASE and not iphone_usenet_mode:
         aio_fut = _get_fetch_executor().submit(get_streams_single, AIO_BASE, AIO_AUTH, type_, upstream_id, AIO_TAG, (ANDROID_AIO_TIMEOUT if is_android else DESKTOP_AIO_TIMEOUT))
@@ -6076,13 +6109,19 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                 pass
 
     def _start_p2_probe_early():
-        nonlocal p2_probe_fut
+        nonlocal p2_probe_fut, p2_probe_t0
         if p2_probe_fut is not None:
             return
         if not (USENET_PROBE_ENABLE and p2_streams):
             return
         # Start probe in the background so it overlaps with AIO join time.
         try:
+            p2_probe_t0 = time.monotonic()
+            try:
+                if isinstance(p2_meta, dict):
+                    p2_meta["probe_start_ms"] = int((p2_probe_t0 - t0) * 1000)
+            except Exception:
+                pass
             p2_probe_fut = _get_fetch_executor().submit(_probe_p2_streams_impl, list(p2_streams), _rid())
         except Exception:
             p2_probe_fut = None
@@ -6222,18 +6261,46 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
             _aio_cache_set(aio_key, aio_streams, aio_in, int(aio_ms_remote or 0))
 
 
-    # Join early P2 probe (if started) before merging streams, bounded by request deadline.
+    # Join early P2 probe (if started) before merging streams.
+    # IMPORTANT: probe itself has its own hard budget (USENET_PROBE_BUDGET_S). If we only join
+    # until the fetch-wall deadline, we can miss probe results even though the probe completed
+    # "correctly" within its budget (seen as probe_early_err=timeout_join in logs).
     if p2_probe_fut is not None:
         try:
-            remp = max(0.05, deadline - time.monotonic())
+            now = time.monotonic()
+            rem_fetch = max(0.05, deadline - now)
+
+            # How much probe time is left (based on recorded start + probe budget).
+            try:
+                pb = float(USENET_PROBE_BUDGET_S or 0.0)
+            except Exception:
+                pb = 0.0
+            if pb <= 0:
+                pb = 0.1
+            if p2_probe_t0 is None:
+                p2_probe_t0 = now  # best-effort fallback
+            probe_elapsed = max(0.0, now - float(p2_probe_t0))
+            probe_rem = max(0.05, float(pb) - float(probe_elapsed))
+
+            # Allow a small slack beyond fetch-wall specifically to capture probe results.
+            # This should be safe on Tier-1: it is bounded and only applies when probe was started.
+            try:
+                join_slack = float(os.getenv("USENET_PROBE_JOIN_SLACK_S", "1.5") or 1.5)
+            except Exception:
+                join_slack = 1.5
+
+            join_timeout = min(probe_rem + 0.10, rem_fetch + max(0.0, join_slack))
+            join_timeout = max(0.05, float(join_timeout))
+
             _tjp = time.monotonic()
-            p2_streams2, probe_meta2 = p2_probe_fut.result(timeout=remp)
+            p2_streams2, probe_meta2 = p2_probe_fut.result(timeout=join_timeout)
             if isinstance(p2_streams2, list):
                 p2_streams = p2_streams2
             try:
                 if isinstance(p2_meta, dict) and isinstance(probe_meta2, dict):
                     p2_meta.update(probe_meta2)
                     p2_meta["probe_join_ms"] = int((time.monotonic() - _tjp) * 1000)
+                    p2_meta["probe_join_timeout_s"] = float(join_timeout)
             except Exception:
                 pass
         except FuturesTimeoutError:
@@ -6244,12 +6311,15 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
             try:
                 if isinstance(p2_meta, dict):
                     p2_meta["probe_early_err"] = "timeout_join"
+                    p2_meta["probe_join_timeout_s"] = float(join_timeout) if 'join_timeout' in locals() else None
             except Exception:
                 pass
         except Exception as e:
             try:
                 if isinstance(p2_meta, dict):
                     p2_meta["probe_early_err"] = f"error:{type(e).__name__}"
+            except Exception:
+                pass
             except Exception:
                 pass
 
