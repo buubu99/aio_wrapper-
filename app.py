@@ -1969,13 +1969,32 @@ def _apply_usenet_playability_probe(
             try:
                 from collections import Counter
                 _rc = Counter([str(r[3]) for r in (batch_res or [])])
-                # Add pending-as-budget too (we log counts, not URLs)
+                # Defensive: if batch_res is missing entries, count them as BUDGET (not ERR).
                 _budget_missing = max(0, len(urls) - len(batch_res or []))
                 if _budget_missing:
-                    _rc["(missing)"] += _budget_missing
-                logger.info("USENET_PROBE_REASONS rid=%s ver=v16 reasons=%s", _rid(), dict(_rc.most_common(8)))
-            except Exception:
-                pass
+                    _rc["BUDGET"] += _budget_missing
+
+                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v16 reasons={dict(_rc.most_common(8))}'
+                logger.info(_reasons_msg)
+                try:
+                    logging.getLogger("gunicorn.error").info(_reasons_msg)
+                except Exception:
+                    pass
+                try:
+                    sys.stdout.write(_reasons_msg + "\n")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+                try:
+                    sys.stderr.write(_reasons_msg + "\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    logger.warning("USENET_PROBE_REASONS_ERR rid=%s err=%s", _rid(), type(e).__name__)
+                except Exception:
+                    pass
 
             for u, idx in url_to_idx.items():
                 r = url_to_res.get(u)
@@ -6283,7 +6302,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                 stats=None,
             )
 
-            real = stub = err = 0
+            real = stub = err = budget = 0
             scanned = 0
             out_all: List[Dict[str, Any]] = []
             for _s, _m in _pairs2:
@@ -6295,7 +6314,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                     up = str((_m or {}).get("usenet_probe") or "").upper().strip()
                 except Exception:
                     up = ""
-                if up in ("REAL", "STUB", "ERR"):
+                if up in ("REAL", "STUB", "ERR", "BUDGET"):
                     _s["_wrap_usenet_probe"] = up
                     try:
                         if up == "REAL" and bool((_m or {}).get("ready")):
@@ -6315,6 +6334,8 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                         stub += 1
                     elif up == "ERR":
                         err += 1
+                    elif up == "BUDGET":
+                        budget += 1
                 out_all.append(_s)
 
             # Apply drop policy here (only drop streams that were actually probed as STUB/ERR).
@@ -6336,7 +6357,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                 out = out_all
 
             ms = int((time.monotonic() - t0p) * 1000)
-            return out, {"probe_early": True, "probe_ms": ms, "probe_scanned": int(scanned), "probe_real": int(real), "probe_stub": int(stub), "probe_err": int(err)}
+            return out, {"probe_early": True, "probe_ms": ms, "probe_scanned": int(scanned), "probe_real": int(real), "probe_stub": int(stub), "probe_err": int(err), "probe_budget": int(budget)}
         except Exception as _e:
             return _streams, {"probe_early": True, "probe_early_err": f"error:{type(_e).__name__}"}
         finally:
