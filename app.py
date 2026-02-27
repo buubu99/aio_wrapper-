@@ -1522,20 +1522,7 @@ async def _usenet_range_probe_is_real_async(
     Enforces budget_s as a hard timeout, returning partial results if exceeded.
     """
     results = []
-    # Retry-lane semaphore split: keep attempt#1 throughput high while preventing retries from hogging all slots.
-    try:
-        _retry_slots_env = int(os.getenv("USENET_PROBE_RETRY_SLOTS", "") or 0)
-    except Exception:
-        _retry_slots_env = 0
-    if _retry_slots_env and int(_retry_slots_env) > 0:
-        retry_slots = max(1, min(int(concurrency) - 1, int(_retry_slots_env)))
-    else:
-        # Default: ~20% of conc, capped for small conc.
-        retry_slots = max(1, min(3, int(max(1, int(concurrency) // 5))))
-        retry_slots = min(retry_slots, max(1, int(concurrency) - 1))
-    first_slots = max(1, int(concurrency) - int(retry_slots))
-    sem_first = asyncio.Semaphore(first_slots)
-    sem_retry = asyncio.Semaphore(retry_slots)
+    sem = asyncio.Semaphore(concurrency)
     # Use session-level BasicAuth (matches the user's manual probe). This preserves auth across redirects.
     _auth = None
     try:
@@ -1554,8 +1541,8 @@ async def _usenet_range_probe_is_real_async(
         _lph_env = 4
     eff_lph = max(1, min(int(concurrency), int(len(urls) or 1), int(_lph_env or 4)))
     try:
-        logger.info("USENET_PROBE_CONN rid=%s conc=%s lph=%s lane1=%s lane2=%s budget_s=%.2f timeout_s=%.2f retries=%s",
-                    _rid(), int(concurrency), int(eff_lph), int(first_slots), int(retry_slots), float(budget_s), float(timeout_s), int(retries))
+        logger.info("USENET_PROBE_CONN rid=%s conc=%s lph=%s budget_s=%.2f timeout_s=%.2f retries=%s",
+                    _rid(), int(concurrency), int(eff_lph), float(budget_s), float(timeout_s), int(retries))
     except Exception:
         pass
     connector = aiohttp.TCPConnector(
@@ -1573,7 +1560,7 @@ async def _usenet_range_probe_is_real_async(
 
         for url in urls:
             t = asyncio.create_task(
-                _probe_single(session, url, sem_first, sem_retry, retries, timeout_s, stub_len, range_end or stub_len, max_bytes, guard, deadline=_deadline)
+                _probe_single(session, url, sem, retries, timeout_s, stub_len, range_end or stub_len, max_bytes, guard, deadline=_deadline)
             )
             tasks.append(t)
             task_url[t] = url
@@ -1647,8 +1634,7 @@ async def _usenet_range_probe_is_real_async(
 async def _probe_single(
     session: aiohttp.ClientSession,
     url: str,
-    sem_first: asyncio.Semaphore,
-    sem_retry: asyncio.Semaphore,
+    sem: asyncio.Semaphore,
     retries: int,
     timeout_s: float,
     stub_len: int,
@@ -1692,8 +1678,7 @@ async def _probe_single(
 
             # Acquire the per-attempt concurrency slot.
             # If the batch hits the overall wall while waiting here, CancelledError will be mapped to BUDGET below.
-            lane_sem = sem_first if attempt == 1 else sem_retry
-            await lane_sem.acquire()
+            await sem.acquire()
             try:
                 # Recompute remaining after waiting for a slot.
                 remaining2 = float(deadline - time.monotonic())
@@ -1747,7 +1732,7 @@ async def _probe_single(
 
             finally:
                 try:
-                    lane_sem.release()
+                    sem.release()
                 except Exception:
                     pass
 
