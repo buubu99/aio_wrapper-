@@ -1754,63 +1754,36 @@ def _apply_usenet_playability_probe(
             pass
         return False
 
-    from collections import Counter
-
     cand: List[int] = []
     seen_url: set[str] = set()
-    skip = Counter()
-
     for i, (s, m) in enumerate(pairs):
         try:
             _up0 = str((m or {}).get("usenet_probe") or "").upper().strip()
             if _up0 in ("REAL", "STUB", "ERR"):
-                skip["already_probed"] += 1
                 continue
         except Exception:
             pass
-
         if not _is_usenet_pair((s, m)):
-            skip["not_usenet_pair"] += 1
             continue
-
         try:
             bh = (s.get("behaviorHints") or {}) if isinstance(s, dict) else {}
             if isinstance(bh, dict) and bh.get("proxyHeaders"):
-                skip["proxyHeaders"] += 1
                 continue
         except Exception:
             pass
-
         u = ""
         try:
             u = (s.get("url") or "") if isinstance(s, dict) else ""
         except Exception:
             u = ""
         if not u:
-            try:
-                eu = (s.get("externalUrl") or "") if isinstance(s, dict) else ""
-            except Exception:
-                eu = ""
-            if eu:
-                skip["missing_url_has_externalUrl"] += 1
-            else:
-                skip["missing_url"] += 1
             continue
-
         if u in seen_url:
-            skip["dup_url"] += 1
             continue
         seen_url.add(u)
-
         cand.append(i)
         if len(cand) >= tn:
-            skip["hit_top_n"] += 1
             break
-
-    try:
-        logger.info("USENET_PROBE_CAND rid=%s total_pairs=%d cand=%d tn=%d skip=%s", _rid(), len(pairs), len(cand), tn, dict(skip))
-    except Exception:
-        pass
 
     try:
         for _ci in cand:
@@ -6175,51 +6148,6 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
 
         t0p = time.monotonic()
         try:
-            # Debug: summarize raw PROV2 streams before probe candidate filtering.
-            try:
-                from collections import Counter
-                _raw = _streams or []
-                _c = Counter()
-                _seen = set()
-                _s0 = None
-                for _s in _raw:
-                    if not isinstance(_s, dict):
-                        _c['not_dict'] += 1
-                        continue
-                    if _s0 is None:
-                        _s0 = _s
-                    _u = str((_s.get('url') or '')).strip()
-                    _eu = str((_s.get('externalUrl') or '')).strip()
-                    _bh = _s.get('behaviorHints') or {}
-                    if isinstance(_bh, dict) and _bh.get('proxyHeaders'):
-                        _c['proxyHeaders'] += 1
-                    if _u:
-                        _c['has_url'] += 1
-                        if 'replay' in _u.lower():
-                            _c['url_has_replay'] += 1
-                        if _u in _seen:
-                            _c['dup_url'] += 1
-                        else:
-                            _seen.add(_u)
-                    else:
-                        _c['missing_url'] += 1
-                        if _eu:
-                            _c['externalUrl_only'] += 1
-                            if 'replay' in _eu.lower():
-                                _c['ext_has_replay'] += 1
-                def _snip(_x, _n=120):
-                    try:
-                        return str(_x)[:_n]
-                    except Exception:
-                        return ''
-                logger.info(
-                    'P2_RAW_SHAPE rid=%s total=%d counts=%s sample_url=%s sample_ext=%s',
-                    _rid(), len(_raw), dict(_c),
-                    _snip((_s0 or {}).get('url','')), _snip((_s0 or {}).get('externalUrl','')),
-                )
-            except Exception:
-                pass
-
             # Build lightweight (stream, meta) pairs for the probe. Provider ND is treated as usenet.
             _pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
             for _s in (_streams or []):
