@@ -1555,9 +1555,12 @@ async def _usenet_range_probe_is_real_async(
         tasks: List[asyncio.Task] = []
         task_url: Dict[asyncio.Task, str] = {}
 
+        # Stallguard v3: deadline for budget-aware per-attempt timeouts
+        _deadline = time.monotonic() + float(budget_s)
+
         for url in urls:
             t = asyncio.create_task(
-                _probe_single(session, url, sem, retries, timeout_s, stub_len, range_end or stub_len, max_bytes, guard)
+                _probe_single(session, url, sem, retries, timeout_s, stub_len, range_end or stub_len, max_bytes, guard, deadline=_deadline)
             )
             tasks.append(t)
             task_url[t] = url
@@ -1624,6 +1627,8 @@ async def _probe_single(
     range_end: int,
     max_bytes: int,
     guard: bool,
+    *,
+    deadline: float,
 ) -> Tuple[str, bool, int, str]:
     # IMPORTANT: acquire the semaphore per-attempt (not across the whole retry loop),
     # so a slow attempt doesn't "hog" a slot during backoff.
@@ -1637,55 +1642,85 @@ async def _probe_single(
 
     for attempt in range(1, retries + 1):
         try:
+
+            # Stallguard v3: clamp attempt timeouts to remaining budget and hard-guard hangs.
+            remaining = float(deadline - time.monotonic())
+            # If we're basically out of time, bail immediately instead of starting a doomed attempt.
+            if remaining <= 0.35:
+                return (url, False, 0, "BUDGET")
+
             headers = {"Range": f"bytes=0-{range_end}"}
             # Attempt-specific timeout: attempt#1 can be shorter (if enabled), later attempts use the full timeout_s.
             this_total = float(timeout_s)
             if attempt == 1 and _a1 and _a1 > 0:
                 this_total = max(0.5, min(float(timeout_s), float(_a1)))
+
+            # Clamp attempt timeout to the remaining global budget (leave a small safety margin).
+            this_total = min(this_total, max(0.10, remaining - 0.15))
+            if this_total <= 0.10:
+                return (url, False, 0, "BUDGET")
+
             # Keep connect phase snappy (common cause of head-of-line blocking under budget).
             sock_connect_s = min(2.0, this_total) if attempt > 1 else min(1.5, this_total)
 
-            async with sem:
-                async with session.get(
-                    url,
-                    headers=headers,
-                    allow_redirects=True,
-                    timeout=aiohttp.ClientTimeout(total=this_total, sock_connect=sock_connect_s, sock_read=this_total),
-                ) as resp:
-                    # Read only what we need (protects budget if a server ignores Range).
-                    # We never need more than (stub_len+1) to decide REAL vs STUB.
-                    # Still respect max_bytes as a hard guard rail.
-                    want_need = int(stub_len + 1)
-                    if guard and int(max_bytes) < want_need:
-                        # Can't ever distinguish REAL vs STUB if we refuse to read at least stub_len+1 bytes
-                        return (url, False, int(max_bytes), "MISCONFIG_MAX_BYTES")
+            async def _one_attempt() -> Tuple[str, bool, int, str]:
+                async with sem:
+                    async with session.get(
+                        url,
+                        headers=headers,
+                        allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=this_total, sock_connect=sock_connect_s, sock_read=this_total),
+                    ) as resp:
+                        # Read only what we need (protects budget if a server ignores Range).
+                        # We never need more than (stub_len+1) to decide REAL vs STUB.
+                        # Still respect max_bytes as a hard guard rail.
+                        want_need = int(stub_len + 1)
+                        if guard and int(max_bytes) < want_need:
+                            # Can't ever distinguish REAL vs STUB if we refuse to read at least stub_len+1 bytes
+                            return (url, False, int(max_bytes), "MISCONFIG_MAX_BYTES")
 
-                    # IMPORTANT: aiohttp's .read(n) may return fewer than n bytes even when more are available.
-                    # So we accumulate until we have enough to decide (stub_len+1) or we hit EOF / max_bytes.
-                    cap = int(max_bytes) + 1  # +1 lets us detect oversize/ignored-range safely
-                    buf = bytearray()
-                    async for chunk in resp.content.iter_chunked(8192):
-                        if not chunk:
-                            break
-                        remaining = cap - len(buf)
-                        if remaining <= 0:
-                            break
-                        buf.extend(chunk[:remaining])
-                        if len(buf) >= want_need:
-                            break
-                    size = len(buf)
+                        # IMPORTANT: aiohttp's .read(n) may return fewer than n bytes even when more are available.
+                        # So we accumulate until we have enough to decide (stub_len+1) or we hit EOF / max_bytes.
+                        cap = int(max_bytes) + 1  # +1 lets us detect oversize/ignored-range safely
+                        buf = bytearray()
+                        async for chunk in resp.content.iter_chunked(8192):
+                            if not chunk:
+                                break
+                            remaining_cap = cap - len(buf)
+                            if remaining_cap <= 0:
+                                break
+                            buf.extend(chunk[:remaining_cap])
+                            if len(buf) >= want_need:
+                                break
+                        size = len(buf)
 
-                    if guard and size > int(max_bytes):
-                        return (url, False, size, "OVERSIZE")
+                        if guard and size > int(max_bytes):
+                            return (url, False, size, "OVERSIZE")
 
-                    # Manual-probe compatible: REAL is strictly > stub_len.
-                    if size > stub_len:
-                        return (url, True, size, "REAL")
-                    if size == stub_len:
-                        return (url, False, size, "STUB")
+                        # Manual-probe compatible: REAL is strictly > stub_len.
+                        if size > stub_len:
+                            return (url, True, size, "REAL")
+                        if size == stub_len:
+                            return (url, False, size, "STUB")
 
-                    # Anything shorter than stub_len is effectively a stub/invalid proxy.
-                    return (url, False, size, "SHORT")
+                        # Anything shorter than stub_len is effectively a stub/invalid proxy.
+                        return (url, False, size, "SHORT")
+
+            # Hard stall guard: covers weird hangs (connector queue/DNS/TLS/proxy oddities) that don't trip aiohttp timeouts reliably.
+            guard_timeout = min(float(this_total + 0.25), max(0.05, float(deadline - time.monotonic() - 0.05)))
+            if guard_timeout <= 0.05:
+                return (url, False, 0, "BUDGET")
+
+            return await asyncio.wait_for(_one_attempt(), timeout=guard_timeout)
+
+        except asyncio.TimeoutError:
+            # Explicit timeout (either from aiohttp or the hard wait_for guard).
+            if attempt == retries:
+                return (url, False, 0, "FAIL_TimeoutError")
+            await asyncio.sleep(0.3)  # Backoff
+        except asyncio.CancelledError:
+            # Typically means the batch hit the overall budget wall.
+            return (url, False, 0, "BUDGET")
         except Exception as e:
             if attempt == retries:
                 return (url, False, 0, f"FAIL_{type(e).__name__}")
