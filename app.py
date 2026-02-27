@@ -1569,24 +1569,6 @@ async def _usenet_range_probe_is_real_async(
         _t0 = time.monotonic()
         done, pending = await asyncio.wait(tasks, timeout=budget_s)
         _elapsed = time.monotonic() - _t0
-        _msg = f"PROBE_PARTIAL: {int(len(done))}/{int(len(tasks))} completed in {float(min(_elapsed, float(budget_s))):.2f} s"
-        try:
-            logger.info(_msg)
-        except Exception:
-            pass
-        # Force the line through common Render/Gunicorn log paths (stdout+stderr+gunicorn.error).
-        try:
-            logging.getLogger('gunicorn.error').info(_msg)
-        except Exception:
-            pass
-        try:
-            sys.stdout.write(_msg + "\n"); sys.stdout.flush()
-        except Exception:
-            pass
-        try:
-            sys.stderr.write(_msg + "\n"); sys.stderr.flush()
-        except Exception:
-            pass
 
         for t in done:
             u = task_url.get(t, "")
@@ -1612,6 +1594,38 @@ async def _usenet_range_probe_is_real_async(
                 u = task_url.get(t, "")
                 if u:
                     results.append((u, False, 0, "BUDGET"))
+        except Exception:
+            pass
+
+        # Emit a single authoritative line that is internally consistent:
+        # - done/pending are asyncio task states at the wall
+        # - tested/budget are semantic outcomes (budget includes early BUDGET returns + pending-at-wall)
+        try:
+            _total = int(len(tasks))
+            _done = int(len(done))
+            _pending = int(len(pending))
+            _budget = 0
+            for (_u, _ok, _sz, _rs) in (results or []):
+                if str(_rs).upper().startswith("BUDGET"):
+                    _budget += 1
+            _tested = max(0, _total - int(_budget))
+            _msg = f"PROBE_PARTIAL: done={_done}/{_total} in {float(min(_elapsed, float(budget_s))):.2f} s (tested={_tested} budget={int(_budget)} pending={_pending})"
+        except Exception:
+            _msg = f"PROBE_PARTIAL: done={int(len(done))}/{int(len(tasks))} in {float(min(_elapsed, float(budget_s))):.2f} s"
+        try:
+            logger.info(_msg)
+        except Exception:
+            pass
+        try:
+            logging.getLogger("gunicorn.error").info(_msg)
+        except Exception:
+            pass
+        try:
+            sys.stdout.write(_msg + "\n"); sys.stdout.flush()
+        except Exception:
+            pass
+        try:
+            sys.stderr.write(_msg + "\n"); sys.stderr.flush()
         except Exception:
             pass
 
@@ -7153,7 +7167,7 @@ def _compact_fetch_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(meta, dict):
         return {}
     # Only keep the safe/compact keys
-    keep = ('tag', 'src', 'ok', 'status', 'bytes', 'count', 'ms', 'last_fetch_ms', 'ms_provider', 'wait_ms', 'late_grace_ms', 'http_ms', 'read_ms', 'json_ms', 'post_ms', 'req_epoch_ms', 'conn_ms', 'tls_ms', 'pre_net_ms', 'svrwait_ms', 'soft_timeout_ms', 'err', 'probe_early', 'probe_ms', 'probe_scanned', 'probe_real', 'probe_stub', 'probe_err', 'probe_join_ms', 'probe_early_err')
+    keep = ('tag', 'src', 'ok', 'status', 'bytes', 'count', 'ms', 'last_fetch_ms', 'ms_provider', 'wait_ms', 'late_grace_ms', 'http_ms', 'read_ms', 'json_ms', 'post_ms', 'req_epoch_ms', 'conn_ms', 'tls_ms', 'pre_net_ms', 'svrwait_ms', 'soft_timeout_ms', 'err', 'probe_early', 'probe_ms', 'probe_scanned', 'probe_real', 'probe_stub', 'probe_err', 'probe_budget', 'probe_join_ms', 'probe_early_err')
     return {k: meta.get(k) for k in keep if k in meta and meta.get(k) not in (None, "", {})}
 
 # Diversify top M while preserving quality: pick from a larger pool, bucketed by resolution, then mix providers/suppliers.
