@@ -1630,11 +1630,12 @@ async def _probe_single(
     *,
     deadline: float,
 ) -> Tuple[str, bool, int, str]:
-    # IMPORTANT: acquire the semaphore per-attempt (not across the whole retry loop),
-    # so a slow attempt doesn't "hog" a slot during backoff.
-    # Optional: use a shorter total timeout on attempt #1 to keep throughput high,
-    # while still preserving correctness via attempt #2 (the "rescue" attempt).
-    # Default is disabled (0 or unset) to preserve current behavior unless explicitly enabled.
+    # Stallguard v4: IMPORTANT semantic fix
+    # - We do NOT include semaphore waiting inside the hard wait_for guard.
+    #   Waiting for a slot is not a "probe attempt" and should not be counted as FAIL_TimeoutError.
+    # - We acquire the semaphore first, then hard-guard only the network+read section.
+    # This prevents "33 FAIL_TimeoutError" from tasks that never got a slot.
+
     try:
         _a1 = float(os.getenv("USENET_PROBE_ATTEMPT1_TIMEOUT_S", "0") or 0.0)
     except Exception:
@@ -1642,46 +1643,56 @@ async def _probe_single(
 
     for attempt in range(1, retries + 1):
         try:
-
-            # Stallguard v3: clamp attempt timeouts to remaining budget and hard-guard hangs.
+            # Remaining global budget for this task.
             remaining = float(deadline - time.monotonic())
-            # If we're basically out of time, bail immediately instead of starting a doomed attempt.
             if remaining <= 0.35:
                 return (url, False, 0, "BUDGET")
 
-            headers = {"Range": f"bytes=0-{range_end}"}
-            # Attempt-specific timeout: attempt#1 can be shorter (if enabled), later attempts use the full timeout_s.
+            # Attempt timeout base (attempt #1 can be shorter if configured).
             this_total = float(timeout_s)
             if attempt == 1 and _a1 and _a1 > 0:
                 this_total = max(0.5, min(float(timeout_s), float(_a1)))
 
-            # Clamp attempt timeout to the remaining global budget (leave a small safety margin).
+            # Clamp attempt timeout to remaining budget (leave margin).
             this_total = min(this_total, max(0.10, remaining - 0.15))
             if this_total <= 0.10:
                 return (url, False, 0, "BUDGET")
 
-            # Keep connect phase snappy (common cause of head-of-line blocking under budget).
+            # Keep connect phase snappy.
             sock_connect_s = min(2.0, this_total) if attempt > 1 else min(1.5, this_total)
+            headers = {"Range": f"bytes=0-{range_end}"}
 
-            async def _one_attempt() -> Tuple[str, bool, int, str]:
-                async with sem:
+            # Acquire the per-attempt concurrency slot.
+            # If the batch hits the overall wall while waiting here, CancelledError will be mapped to BUDGET below.
+            await sem.acquire()
+            try:
+                # Recompute remaining after waiting for a slot.
+                remaining2 = float(deadline - time.monotonic())
+                if remaining2 <= 0.35:
+                    return (url, False, 0, "BUDGET")
+
+                # Re-clamp for the actual network section.
+                this_total2 = min(float(this_total), max(0.10, remaining2 - 0.15))
+                if this_total2 <= 0.10:
+                    return (url, False, 0, "BUDGET")
+
+                # Hard guard timeout for the network+read section, also clamped to the global deadline.
+                guard_timeout = min(float(this_total2 + 0.25), max(0.05, float(deadline - time.monotonic() - 0.05)))
+                if guard_timeout <= 0.05:
+                    return (url, False, 0, "BUDGET")
+
+                async def _net_and_read() -> Tuple[str, bool, int, str]:
                     async with session.get(
                         url,
                         headers=headers,
                         allow_redirects=True,
-                        timeout=aiohttp.ClientTimeout(total=this_total, sock_connect=sock_connect_s, sock_read=this_total),
+                        timeout=aiohttp.ClientTimeout(total=this_total2, sock_connect=sock_connect_s, sock_read=this_total2),
                     ) as resp:
-                        # Read only what we need (protects budget if a server ignores Range).
-                        # We never need more than (stub_len+1) to decide REAL vs STUB.
-                        # Still respect max_bytes as a hard guard rail.
                         want_need = int(stub_len + 1)
                         if guard and int(max_bytes) < want_need:
-                            # Can't ever distinguish REAL vs STUB if we refuse to read at least stub_len+1 bytes
                             return (url, False, int(max_bytes), "MISCONFIG_MAX_BYTES")
 
-                        # IMPORTANT: aiohttp's .read(n) may return fewer than n bytes even when more are available.
-                        # So we accumulate until we have enough to decide (stub_len+1) or we hit EOF / max_bytes.
-                        cap = int(max_bytes) + 1  # +1 lets us detect oversize/ignored-range safely
+                        cap = int(max_bytes) + 1
                         buf = bytearray()
                         async for chunk in resp.content.iter_chunked(8192):
                             if not chunk:
@@ -1697,38 +1708,31 @@ async def _probe_single(
                         if guard and size > int(max_bytes):
                             return (url, False, size, "OVERSIZE")
 
-                        # Manual-probe compatible: REAL is strictly > stub_len.
                         if size > stub_len:
                             return (url, True, size, "REAL")
                         if size == stub_len:
                             return (url, False, size, "STUB")
-
-                        # Anything shorter than stub_len is effectively a stub/invalid proxy.
                         return (url, False, size, "SHORT")
 
-            # Hard stall guard: covers weird hangs (connector queue/DNS/TLS/proxy oddities) that don't trip aiohttp timeouts reliably.
-            guard_timeout = min(float(this_total + 0.25), max(0.05, float(deadline - time.monotonic() - 0.05)))
-            if guard_timeout <= 0.05:
-                return (url, False, 0, "BUDGET")
+                return await asyncio.wait_for(_net_and_read(), timeout=guard_timeout)
 
-            return await asyncio.wait_for(_one_attempt(), timeout=guard_timeout)
+            finally:
+                try:
+                    sem.release()
+                except Exception:
+                    pass
 
         except asyncio.TimeoutError:
-            # Explicit timeout (either from aiohttp or the hard wait_for guard).
             if attempt == retries:
                 return (url, False, 0, "FAIL_TimeoutError")
-            await asyncio.sleep(0.3)  # Backoff
+            await asyncio.sleep(0.3)
         except asyncio.CancelledError:
-            # Typically means the batch hit the overall budget wall.
             return (url, False, 0, "BUDGET")
         except Exception as e:
             if attempt == retries:
                 return (url, False, 0, f"FAIL_{type(e).__name__}")
-            await asyncio.sleep(0.3)  # Backoff
+            await asyncio.sleep(0.3)
     return (url, False, 0, "MAX_RETRIES")
-
-
-
 def _apply_usenet_playability_probe(
     pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
     *,
