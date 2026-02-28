@@ -46,7 +46,7 @@ def _safe_ua(ua_str: str, max_len: int = 100) -> str:
     """Truncate/escape UA to keep logs sane."""
     try:
         s = str(ua_str or "")
-        s = s[:max_len].replace('"', '\"').replace("\n", " ").replace("\r", " ")
+        s = s[:max_len].replace('"', '"').replace("\n", " ").replace("\r", " ")
         return s
     except Exception:
         return ""
@@ -278,6 +278,82 @@ def _safe_csv(v, default: str = "") -> list[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
 
+
+
+# ---------------------------
+# Optional .env file loader (so a checked-in or mounted env file can drive os.environ)
+# This is intentionally lightweight (no external deps) and safe by default.
+#
+# - If ENV_FILE is set and exists, we load it first.
+# - Otherwise, if aio_wrapper-add_on.env or .env exists next to this file, we load it.
+# - By default we DO NOT override already-present os.environ keys.
+#   Set ENV_FILE_OVERRIDE=true to force file values to override existing env vars.
+# ---------------------------
+
+def _strip_env_quotes(v: str) -> str:
+    s = "" if v is None else str(v).strip()
+    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
+        return s[1:-1]
+    return s
+
+def _load_env_file(path: str, override: bool = False) -> dict:
+    loaded = 0
+    overridden = 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # tolerate: export KEY=VAL
+                if line.lower().startswith("export "):
+                    line = line[7:].strip()
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = _strip_env_quotes(v)
+                if not k:
+                    continue
+                if (k in os.environ) and (not override):
+                    continue
+                if (k in os.environ) and override:
+                    overridden += 1
+                os.environ[k] = v
+                loaded += 1
+    except Exception as e:
+        logger.warning("ENV_FILE_LOAD_FAIL path=%s err=%s", path, e)
+        return {"path": path, "loaded": 0, "overridden": 0, "ok": False}
+    return {"path": path, "loaded": loaded, "overridden": overridden, "ok": True}
+
+def _maybe_load_env_file() -> None:
+    # Keep this silent unless a file is actually loaded.
+    override = _is_true(os.environ.get("ENV_FILE_OVERRIDE", "false"))
+    candidates = []
+    explicit = (os.environ.get("ENV_FILE") or "").strip()
+    if explicit:
+        candidates.append(explicit)
+    try:
+        here = os.path.dirname(__file__)
+        candidates.extend([
+            os.path.join(here, "aio_wrapper-add_on.env"),
+            os.path.join(here, ".env"),
+        ])
+    except Exception:
+        pass
+
+    for p in candidates:
+        try:
+            if p and os.path.exists(p):
+                r = _load_env_file(p, override=override)
+                if r.get("ok"):
+                    # Don't log values (may include secrets); just log that the file was applied.
+                    logger.info("ENV_FILE_LOADED path=%s override=%s loaded=%s overridden=%s", r.get("path"), override, r.get("loaded"), r.get("overridden"))
+                return
+        except Exception:
+            continue
+
+_maybe_load_env_file()
 # ---------------------------
 # Config (keep env names compatible with your existing Render setup)
 # ---------------------------
@@ -440,6 +516,8 @@ USENET_PROBE_BUDGET_S = _safe_float(os.environ.get("USENET_PROBE_BUDGET_S", "8.5
 USENET_PROBE_DROP_FAILS = _parse_bool(os.environ.get("USENET_PROBE_DROP_FAILS", "1"), True)  # drop probed non-REAL links (STUB/ERR)
 USENET_PROBE_REAL_TOP10_PCT = _safe_float(os.environ.get("USENET_PROBE_REAL_TOP10_PCT", "0.5"), 0.5)
 USENET_PROBE_REAL_TOP20_N = _safe_int(os.environ.get("USENET_PROBE_REAL_TOP20_N", "20"), 20)
+USENET_PROBE_LOG_URLS = _parse_bool(os.environ.get("USENET_PROBE_LOG_URLS", "0"), False)
+USENET_PROBE_LOG_URLS_N = _safe_int(os.environ.get("USENET_PROBE_LOG_URLS_N", "5"), 5)
 _tmp_verify_retries = _safe_int(os.environ.get("VERIFY_RETRIES", "0"), 0)
 USENET_PROBE_RETRIES = _safe_int(os.environ.get("USENET_PROBE_RETRIES", str(_tmp_verify_retries)), _tmp_verify_retries)
 USENET_PROBE_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY", "40"), 40)
@@ -1555,9 +1633,12 @@ async def _usenet_range_probe_is_real_async(
         tasks: List[asyncio.Task] = []
         task_url: Dict[asyncio.Task, str] = {}
 
+        # Stallguard v3: deadline for budget-aware per-attempt timeouts
+        _deadline = time.monotonic() + float(budget_s)
+
         for url in urls:
             t = asyncio.create_task(
-                _probe_single(session, url, sem, retries, timeout_s, stub_len, range_end or stub_len, max_bytes, guard)
+                _probe_single(session, url, sem, retries, timeout_s, stub_len, range_end or stub_len, max_bytes, guard, deadline=_deadline)
             )
             tasks.append(t)
             task_url[t] = url
@@ -1566,24 +1647,6 @@ async def _usenet_range_probe_is_real_async(
         _t0 = time.monotonic()
         done, pending = await asyncio.wait(tasks, timeout=budget_s)
         _elapsed = time.monotonic() - _t0
-        _msg = f"PROBE_PARTIAL: {int(len(done))}/{int(len(tasks))} completed in {float(min(_elapsed, float(budget_s))):.2f} s"
-        try:
-            logger.info(_msg)
-        except Exception:
-            pass
-        # Force the line through common Render/Gunicorn log paths (stdout+stderr+gunicorn.error).
-        try:
-            logging.getLogger('gunicorn.error').info(_msg)
-        except Exception:
-            pass
-        try:
-            sys.stdout.write(_msg + "\n"); sys.stdout.flush()
-        except Exception:
-            pass
-        try:
-            sys.stderr.write(_msg + "\n"); sys.stderr.flush()
-        except Exception:
-            pass
 
         for t in done:
             u = task_url.get(t, "")
@@ -1612,6 +1675,38 @@ async def _usenet_range_probe_is_real_async(
         except Exception:
             pass
 
+        # Emit a single authoritative line that is internally consistent:
+        # - done/pending are asyncio task states at the wall
+        # - tested/budget are semantic outcomes (budget includes early BUDGET returns + pending-at-wall)
+        try:
+            _total = int(len(tasks))
+            _done = int(len(done))
+            _pending = int(len(pending))
+            _budget = 0
+            for (_u, _ok, _sz, _rs) in (results or []):
+                if str(_rs).upper().startswith("BUDGET"):
+                    _budget += 1
+            _tested = max(0, _total - int(_budget))
+            _msg = f"PROBE_PARTIAL: done={_done}/{_total} in {float(min(_elapsed, float(budget_s))):.2f} s (tested={_tested} budget={int(_budget)} pending={_pending})"
+        except Exception:
+            _msg = f"PROBE_PARTIAL: done={int(len(done))}/{int(len(tasks))} in {float(min(_elapsed, float(budget_s))):.2f} s"
+        try:
+            logger.info(_msg)
+        except Exception:
+            pass
+        try:
+            logging.getLogger("gunicorn.error").info(_msg)
+        except Exception:
+            pass
+        try:
+            sys.stdout.write(_msg + "\n"); sys.stdout.flush()
+        except Exception:
+            pass
+        try:
+            sys.stderr.write(_msg + "\n"); sys.stderr.flush()
+        except Exception:
+            pass
+
     return results
 
 async def _probe_single(
@@ -1624,12 +1719,15 @@ async def _probe_single(
     range_end: int,
     max_bytes: int,
     guard: bool,
+    *,
+    deadline: float,
 ) -> Tuple[str, bool, int, str]:
-    # IMPORTANT: acquire the semaphore per-attempt (not across the whole retry loop),
-    # so a slow attempt doesn't "hog" a slot during backoff.
-    # Optional: use a shorter total timeout on attempt #1 to keep throughput high,
-    # while still preserving correctness via attempt #2 (the "rescue" attempt).
-    # Default is disabled (0 or unset) to preserve current behavior unless explicitly enabled.
+    # Stallguard v4: IMPORTANT semantic fix
+    # - We do NOT include semaphore waiting inside the hard wait_for guard.
+    #   Waiting for a slot is not a "probe attempt" and should not be counted as FAIL_TimeoutError.
+    # - We acquire the semaphore first, then hard-guard only the network+read section.
+    # This prevents "33 FAIL_TimeoutError" from tasks that never got a slot.
+
     try:
         _a1 = float(os.getenv("USENET_PROBE_ATTEMPT1_TIMEOUT_S", "0") or 0.0)
     except Exception:
@@ -1637,63 +1735,96 @@ async def _probe_single(
 
     for attempt in range(1, retries + 1):
         try:
-            headers = {"Range": f"bytes=0-{range_end}"}
-            # Attempt-specific timeout: attempt#1 can be shorter (if enabled), later attempts use the full timeout_s.
+            # Remaining global budget for this task.
+            remaining = float(deadline - time.monotonic())
+            if remaining <= 0.35:
+                return (url, False, 0, "BUDGET")
+
+            # Attempt timeout base (attempt #1 can be shorter if configured).
             this_total = float(timeout_s)
             if attempt == 1 and _a1 and _a1 > 0:
                 this_total = max(0.5, min(float(timeout_s), float(_a1)))
-            # Keep connect phase snappy (common cause of head-of-line blocking under budget).
+
+            # Clamp attempt timeout to remaining budget (leave margin).
+            this_total = min(this_total, max(0.10, remaining - 0.15))
+            if this_total <= 0.10:
+                return (url, False, 0, "BUDGET")
+
+            # Keep connect phase snappy.
             sock_connect_s = min(2.0, this_total) if attempt > 1 else min(1.5, this_total)
+            headers = {"Range": f"bytes=0-{range_end}"}
 
-            async with sem:
-                async with session.get(
-                    url,
-                    headers=headers,
-                    allow_redirects=True,
-                    timeout=aiohttp.ClientTimeout(total=this_total, sock_connect=sock_connect_s, sock_read=this_total),
-                ) as resp:
-                    # Read only what we need (protects budget if a server ignores Range).
-                    # We never need more than (stub_len+1) to decide REAL vs STUB.
-                    # Still respect max_bytes as a hard guard rail.
-                    want_need = int(stub_len + 1)
-                    if guard and int(max_bytes) < want_need:
-                        # Can't ever distinguish REAL vs STUB if we refuse to read at least stub_len+1 bytes
-                        return (url, False, int(max_bytes), "MISCONFIG_MAX_BYTES")
+            # Acquire the per-attempt concurrency slot.
+            # If the batch hits the overall wall while waiting here, CancelledError will be mapped to BUDGET below.
+            await sem.acquire()
+            try:
+                # Recompute remaining after waiting for a slot.
+                remaining2 = float(deadline - time.monotonic())
+                if remaining2 <= 0.35:
+                    return (url, False, 0, "BUDGET")
 
-                    # IMPORTANT: aiohttp's .read(n) may return fewer than n bytes even when more are available.
-                    # So we accumulate until we have enough to decide (stub_len+1) or we hit EOF / max_bytes.
-                    cap = int(max_bytes) + 1  # +1 lets us detect oversize/ignored-range safely
-                    buf = bytearray()
-                    async for chunk in resp.content.iter_chunked(8192):
-                        if not chunk:
-                            break
-                        remaining = cap - len(buf)
-                        if remaining <= 0:
-                            break
-                        buf.extend(chunk[:remaining])
-                        if len(buf) >= want_need:
-                            break
-                    size = len(buf)
+                # Re-clamp for the actual network section.
+                this_total2 = min(float(this_total), max(0.10, remaining2 - 0.15))
+                if this_total2 <= 0.10:
+                    return (url, False, 0, "BUDGET")
 
-                    if guard and size > int(max_bytes):
-                        return (url, False, size, "OVERSIZE")
+                # Hard guard timeout for the network+read section, also clamped to the global deadline.
+                guard_timeout = min(float(this_total2 + 0.25), max(0.05, float(deadline - time.monotonic() - 0.05)))
+                if guard_timeout <= 0.05:
+                    return (url, False, 0, "BUDGET")
 
-                    # Manual-probe compatible: REAL is strictly > stub_len.
-                    if size > stub_len:
-                        return (url, True, size, "REAL")
-                    if size == stub_len:
-                        return (url, False, size, "STUB")
+                async def _net_and_read() -> Tuple[str, bool, int, str]:
+                    async with session.get(
+                        url,
+                        headers=headers,
+                        allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=this_total2, sock_connect=sock_connect_s, sock_read=this_total2),
+                    ) as resp:
+                        want_need = int(stub_len + 1)
+                        if guard and int(max_bytes) < want_need:
+                            return (url, False, int(max_bytes), "MISCONFIG_MAX_BYTES")
 
-                    # Anything shorter than stub_len is effectively a stub/invalid proxy.
-                    return (url, False, size, "SHORT")
+                        cap = int(max_bytes) + 1
+                        buf = bytearray()
+                        async for chunk in resp.content.iter_chunked(8192):
+                            if not chunk:
+                                break
+                            remaining_cap = cap - len(buf)
+                            if remaining_cap <= 0:
+                                break
+                            buf.extend(chunk[:remaining_cap])
+                            if len(buf) >= want_need:
+                                break
+                        size = len(buf)
+
+                        if guard and size > int(max_bytes):
+                            return (url, False, size, "OVERSIZE")
+
+                        if size > stub_len:
+                            return (url, True, size, "REAL")
+                        if size == stub_len:
+                            return (url, False, size, "STUB")
+                        return (url, False, size, "SHORT")
+
+                return await asyncio.wait_for(_net_and_read(), timeout=guard_timeout)
+
+            finally:
+                try:
+                    sem.release()
+                except Exception:
+                    pass
+
+        except asyncio.TimeoutError:
+            if attempt == retries:
+                return (url, False, 0, "FAIL_TimeoutError")
+            await asyncio.sleep(0.3)
+        except asyncio.CancelledError:
+            return (url, False, 0, "BUDGET")
         except Exception as e:
             if attempt == retries:
                 return (url, False, 0, f"FAIL_{type(e).__name__}")
-            await asyncio.sleep(0.3)  # Backoff
+            await asyncio.sleep(0.3)
     return (url, False, 0, "MAX_RETRIES")
-
-
-
 def _apply_usenet_playability_probe(
     pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
     *,
@@ -1860,27 +1991,28 @@ def _apply_usenet_playability_probe(
             except Exception:
                 pass
             # Debug visibility: show what we're actually probing (obfuscated).
-            try:
-                from urllib.parse import urlparse
-                _hosts = {}
-                for _u in urls:
-                    try:
-                        _h = urlparse(_u).netloc or "?"
-                    except Exception:
-                        _h = "?"
-                    _hosts[_h] = _hosts.get(_h, 0) + 1
-                _host_top = sorted(_hosts.items(), key=lambda kv: kv[1], reverse=True)[:5]
-                _sample = []
-                for _u in urls[:8]:
-                    try:
-                        _p = urlparse(_u)
-                        _sample.append(f"{_p.scheme}://{_p.netloc}{(_p.path[:40] + ('…' if len(_p.path) > 40 else ''))} (len={len(_u)})")
-                    except Exception:
-                        _sample.append(f"(bad_url len={len(str(_u))})")
-                logger.info("USENET_PROBE_URLS rid=%s hosts=%s sample=%s", _rid(), _host_top, _sample)
-            except Exception:
-                pass
-
+            if USENET_PROBE_LOG_URLS:
+                try:
+                    from urllib.parse import urlparse
+                    _hosts = {}
+                    for _u in urls:
+                        try:
+                            _h = urlparse(_u).netloc or "?"
+                        except Exception:
+                            _h = "?"
+                        _hosts[_h] = _hosts.get(_h, 0) + 1
+                    _host_top = sorted(_hosts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                    _sample = []
+                    for _u in urls[:max(1, min(25, int(USENET_PROBE_LOG_URLS_N or 5)))]:
+                        try:
+                            _p = urlparse(_u)
+                            _sample.append(f"{_p.scheme}://{_p.netloc}{(_p.path[:40] + ('…' if len(_p.path) > 40 else ''))} (len={len(_u)})")
+                        except Exception:
+                            _sample.append(f"(bad_url len={len(str(_u))})")
+                    _probe_urls_log = logger.info if (os.environ.get("USENET_PROBE_LOG_URLS_LEVEL", "DEBUG").upper() == "INFO") else logger.debug
+                    _probe_urls_log("USENET_PROBE_URLS rid=%s hosts=%s sample=%s", _rid(), _host_top, _sample)
+                except Exception:
+                    pass
             # Auto-tune under a hard global budget: avoid spending the whole budget on retrying timeouts.
             eff_conc = int(conc)
             eff_retries = int(retries or 1)
@@ -1930,13 +2062,32 @@ def _apply_usenet_playability_probe(
             try:
                 from collections import Counter
                 _rc = Counter([str(r[3]) for r in (batch_res or [])])
-                # Add pending-as-budget too (we log counts, not URLs)
+                # Defensive: if batch_res is missing entries, count them as BUDGET (not ERR).
                 _budget_missing = max(0, len(urls) - len(batch_res or []))
                 if _budget_missing:
-                    _rc["(missing)"] += _budget_missing
-                logger.info("USENET_PROBE_REASONS rid=%s ver=v16 reasons=%s", _rid(), dict(_rc.most_common(8)))
-            except Exception:
-                pass
+                    _rc["BUDGET"] += _budget_missing
+
+                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v16 reasons={dict(_rc.most_common(8))}'
+                logger.info(_reasons_msg)
+                try:
+                    logging.getLogger("gunicorn.error").info(_reasons_msg)
+                except Exception:
+                    pass
+                try:
+                    sys.stdout.write(_reasons_msg + "\n")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+                try:
+                    sys.stderr.write(_reasons_msg + "\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    logger.warning("USENET_PROBE_REASONS_ERR rid=%s err=%s", _rid(), type(e).__name__)
+                except Exception:
+                    pass
 
             for u, idx in url_to_idx.items():
                 r = url_to_res.get(u)
@@ -3756,6 +3907,17 @@ logging.getLogger().addHandler(handler)
 logging.getLogger().setLevel(LOG_LEVEL)
 logging.getLogger().addFilter(RequestIdFilter())
 logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N} wrap_url_backend={_WRAP_URL_BACKEND} web_concurrency_env={WEB_CONCURRENCY_ENV}")
+
+logger.info(
+    "LOG_FLAGS wrap_log_token_emit=%s wrap_log_token_hit=%s wrap_log_token_full=%s wrap_log_token_sample_pct=%s sort_proof_top_n=%s usenet_probe_log_urls=%s usenet_probe_log_urls_n=%s",
+    _is_true(os.environ.get("WRAP_LOG_TOKEN_EMIT", "false")),
+    _is_true(os.environ.get("WRAP_LOG_TOKEN_HIT", "false")),
+    _is_true(os.environ.get("WRAP_LOG_TOKEN_FULL", "false")),
+    os.environ.get("WRAP_LOG_TOKEN_SAMPLE_PCT", ""),
+    os.environ.get("SORT_PROOF_TOP_N", ""),
+    _is_true(os.environ.get("USENET_PROBE_LOG_URLS", "false")),
+    os.environ.get("USENET_PROBE_LOG_URLS_N", ""),
+)
 
 
 def _debug_log_full_streams(type_: str, id_: str, platform: str, out_for_client: Optional[List[Dict[str, Any]]]) -> None:
@@ -6244,7 +6406,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                 stats=None,
             )
 
-            real = stub = err = 0
+            real = stub = err = budget = 0
             scanned = 0
             out_all: List[Dict[str, Any]] = []
             for _s, _m in _pairs2:
@@ -6256,7 +6418,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                     up = str((_m or {}).get("usenet_probe") or "").upper().strip()
                 except Exception:
                     up = ""
-                if up in ("REAL", "STUB", "ERR"):
+                if up in ("REAL", "STUB", "ERR", "BUDGET"):
                     _s["_wrap_usenet_probe"] = up
                     try:
                         if up == "REAL" and bool((_m or {}).get("ready")):
@@ -6276,6 +6438,8 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                         stub += 1
                     elif up == "ERR":
                         err += 1
+                    elif up == "BUDGET":
+                        budget += 1
                 out_all.append(_s)
 
             # Apply drop policy here (only drop streams that were actually probed as STUB/ERR).
@@ -6297,7 +6461,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                 out = out_all
 
             ms = int((time.monotonic() - t0p) * 1000)
-            return out, {"probe_early": True, "probe_ms": ms, "probe_scanned": int(scanned), "probe_real": int(real), "probe_stub": int(stub), "probe_err": int(err)}
+            return out, {"probe_early": True, "probe_ms": ms, "probe_scanned": int(scanned), "probe_real": int(real), "probe_stub": int(stub), "probe_err": int(err), "probe_budget": int(budget)}
         except Exception as _e:
             return _streams, {"probe_early": True, "probe_early_err": f"error:{type(_e).__name__}"}
         finally:
@@ -7093,7 +7257,7 @@ def _compact_fetch_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(meta, dict):
         return {}
     # Only keep the safe/compact keys
-    keep = ('tag', 'src', 'ok', 'status', 'bytes', 'count', 'ms', 'last_fetch_ms', 'ms_provider', 'wait_ms', 'late_grace_ms', 'http_ms', 'read_ms', 'json_ms', 'post_ms', 'req_epoch_ms', 'conn_ms', 'tls_ms', 'pre_net_ms', 'svrwait_ms', 'soft_timeout_ms', 'err', 'probe_early', 'probe_ms', 'probe_scanned', 'probe_real', 'probe_stub', 'probe_err', 'probe_join_ms', 'probe_early_err')
+    keep = ('tag', 'src', 'ok', 'status', 'bytes', 'count', 'ms', 'last_fetch_ms', 'ms_provider', 'wait_ms', 'late_grace_ms', 'http_ms', 'read_ms', 'json_ms', 'post_ms', 'req_epoch_ms', 'conn_ms', 'tls_ms', 'pre_net_ms', 'svrwait_ms', 'soft_timeout_ms', 'err', 'probe_early', 'probe_ms', 'probe_scanned', 'probe_real', 'probe_stub', 'probe_err', 'probe_budget', 'probe_join_ms', 'probe_early_err')
     return {k: meta.get(k) for k in keep if k in meta and meta.get(k) not in (None, "", {})}
 
 # Diversify top M while preserving quality: pick from a larger pool, bucketed by resolution, then mix providers/suppliers.
@@ -8561,92 +8725,94 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # Proof log: top N after global sort (provider/supplier/res + sort signals)
     try:
-        proof_n = _safe_int(os.environ.get("SORT_PROOF_TOP_N", "8"), 8)
-        proof_n = max(1, min(25, int(proof_n or 8)))
-        topn = []
-        for rank, (s, m) in enumerate(out_pairs[:proof_n], start=1):
-            bh = (s.get("behaviorHints") or {}) if isinstance(s, dict) else {}
-            if not isinstance(bh, dict):
-                bh = {}
-            supplier = (bh.get("wrap_src") or bh.get("source_tag") or (AIO_TAG or "AIO"))
-            desc = ""
-            try:
-                if isinstance(s, dict):
-                    desc = s.get("description") or ""
-            except Exception:
+        proof_n = _safe_int(os.environ.get("SORT_PROOF_TOP_N", "0"), 0)
+        proof_n = max(0, min(25, int(proof_n)))
+        if proof_n > 0:
+            topn = []
+            for rank, (s, m) in enumerate(out_pairs[:proof_n], start=1):
+                bh = (s.get("behaviorHints") or {}) if isinstance(s, dict) else {}
+                if not isinstance(bh, dict):
+                    bh = {}
+                supplier = (bh.get("wrap_src") or bh.get("source_tag") or (AIO_TAG or "AIO"))
                 desc = ""
-            desc_u = str(desc).upper()
-            aio = m.get("aio") if isinstance(m, dict) else None
-            aio_cached = None
-            aio_proxied = None
-            try:
-                if isinstance(aio, dict):
-                    aio_cached = aio.get("cached", None)
-                    aio_proxied = aio.get("proxied", None)
-            except Exception:
+                try:
+                    if isinstance(s, dict):
+                        desc = s.get("description") or ""
+                except Exception:
+                    desc = ""
+                desc_u = str(desc).upper()
+                aio = m.get("aio") if isinstance(m, dict) else None
                 aio_cached = None
                 aio_proxied = None
-            aio_ti = (aio_cached is True and aio_proxied is True) if (USE_AIO_READY and (aio_cached is not None and aio_proxied is not None)) else None
-            tagged_instant = bool(aio_ti) if (aio_ti is not None) else (("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) or ("C:TRUE" in desc_u and ("P:TRUE" in desc_u or _is_controlled_playback_url(s.get("url") if isinstance(s, dict) else None))))
-            # Prefer cached signal from the outgoing stream's behaviorHints (what the client sees).
-            bh = {}
-            try:
-                if isinstance(s, dict):
-                    bh = s.get("behaviorHints") or {}
-            except Exception:
+                try:
+                    if isinstance(aio, dict):
+                        aio_cached = aio.get("cached", None)
+                        aio_proxied = aio.get("proxied", None)
+                except Exception:
+                    aio_cached = None
+                    aio_proxied = None
+                aio_ti = (aio_cached is True and aio_proxied is True) if (USE_AIO_READY and (aio_cached is not None and aio_proxied is not None)) else None
+                tagged_instant = bool(aio_ti) if (aio_ti is not None) else (("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) or ("C:TRUE" in desc_u and ("P:TRUE" in desc_u or _is_controlled_playback_url(s.get("url") if isinstance(s, dict) else None))))
+                # Prefer cached signal from the outgoing stream's behaviorHints (what the client sees).
                 bh = {}
-            cached_bh = bh.get("cached") if isinstance(bh, dict) else None
-            cached_m = m.get("cached", None)
-            cached_disp = cached_bh if cached_bh is not None else cached_m
-            topn.append({
-                "rank": int(rank),
-                "supplier": str(supplier),
-                "prov": str(m.get("provider", "UNK")),
-                "res": str(m.get("res", "SD")),
-                "size_gb": round(float(int(m.get("size") or 0)) / (1024 ** 3), 2),
-                "seeders": int(m.get("seeders") or 0),
-                "cached": cached_disp,
-                "cached_bh": cached_bh,
-                "cached_m": cached_m,
-                "premium_level": m.get("premium_level", None),
-                "ready": bool(m.get("ready", False)),
-                "p1_bucket": int(m.get("p1_bucket") or -1),
-                "p1_class": str(m.get("p1_class") or ""),
-                "p1_q": round(float(m.get("p1_q") or 0.0), 3),
-
-                "tagged_instant": bool(tagged_instant),
-                "instant_val": int(m.get("_instant_val") or 0),
-                "ready_val": int(m.get("_ready_val") or 0),
-                "cached_val": float(m.get("_cached_val") or 0.0),
-                "verify_rank": int(m.get("_verify_rank0") or 0),
-                "sanity": int(m.get("_sanity") or 0),
-                "sanity_reason": str(m.get("_sanity_reason") or ""),
-                "sort_key": sort_key((s, m)),
-            })
-        # Helpful positioning signal: where does the first REMUX land after primary sort?
-        try:
-            remux_pos = next((i + 1 for i, (_s0, _m0) in enumerate(out_pairs) if int(_m0.get("p1_bucket") or 99) == 0), None)
-            if remux_pos is not None:
-                logger.info("P1_REMUX_POS rid=%s pos=%s total=%s", _rid(), remux_pos, len(out_pairs))
-        except Exception:
-            pass
-
-        logger.info("POST_SORT_TOP rid=%s mark=%s topN=%s", _rid(), _mark(), proof_n)
-        for x in topn:
-            sk = x.get("sort_key") or ()
-            sk0 = sk[0] if len(sk) > 0 else None
-            sk1 = sk[1] if len(sk) > 1 else None
-            sk2 = sk[2] if len(sk) > 2 else None
-            sk3 = sk[3] if len(sk) > 3 else None
-            logger.info(
-                "POST_SORT_ITEM rid=%s mark=%s r=%s prov=%s stack=%s res=%s size_gb=%s "
-                "b=%s p1=%s inst=%s ready=%s cached=%s tc=%s tp=%s cbh=%s pbh=%s cm=%s pm=%s "
-                "sk0=%s sk1=%s sk2=%s sk3=%s",
-                _rid(), _mark(), x.get("rank"), x.get("prov"), x.get("stack"), x.get("res"), x.get("size_gb"),
-                x.get("p1_bucket"), x.get("p1_class"), x.get("instant"), x.get("ready"), x.get("cached"),
-                x.get("tagged_cached"), x.get("tagged_proxied"), x.get("cached_bh"), x.get("proxied_bh"),
-                x.get("cached_m"), x.get("proxied_m"), sk0, sk1, sk2, sk3,
-            )
+                try:
+                    if isinstance(s, dict):
+                        bh = s.get("behaviorHints") or {}
+                except Exception:
+                    bh = {}
+                cached_bh = bh.get("cached") if isinstance(bh, dict) else None
+                cached_m = m.get("cached", None)
+                cached_disp = cached_bh if cached_bh is not None else cached_m
+                topn.append({
+                    "rank": int(rank),
+                    "supplier": str(supplier),
+                    "prov": str(m.get("provider", "UNK")),
+                    "res": str(m.get("res", "SD")),
+                    "size_gb": round(float(int(m.get("size") or 0)) / (1024 ** 3), 2),
+                    "seeders": int(m.get("seeders") or 0),
+                    "cached": cached_disp,
+                    "cached_bh": cached_bh,
+                    "cached_m": cached_m,
+                    "premium_level": m.get("premium_level", None),
+                    "ready": bool(m.get("ready", False)),
+                    "p1_bucket": int(m.get("p1_bucket") or -1),
+                    "p1_class": str(m.get("p1_class") or ""),
+                    "p1_q": round(float(m.get("p1_q") or 0.0), 3),
+    
+                    "tagged_instant": bool(tagged_instant),
+                    "instant_val": int(m.get("_instant_val") or 0),
+                    "ready_val": int(m.get("_ready_val") or 0),
+                    "cached_val": float(m.get("_cached_val") or 0.0),
+                    "verify_rank": int(m.get("_verify_rank0") or 0),
+                    "sanity": int(m.get("_sanity") or 0),
+                    "sanity_reason": str(m.get("_sanity_reason") or ""),
+                    "sort_key": sort_key((s, m)),
+                })
+            # Helpful positioning signal: where does the first REMUX land after primary sort?
+            try:
+                remux_pos = next((i + 1 for i, (_s0, _m0) in enumerate(out_pairs) if int(_m0.get("p1_bucket") or 99) == 0), None)
+                if remux_pos is not None:
+                    logger.info("P1_REMUX_POS rid=%s pos=%s total=%s", _rid(), remux_pos, len(out_pairs))
+            except Exception:
+                pass
+    
+            _sort_proof_log = logger.info if (os.environ.get("SORT_PROOF_LEVEL", "DEBUG").upper() == "INFO") else logger.debug
+            _sort_proof_log("POST_SORT_TOP rid=%s mark=%s topN=%s", _rid(), _mark(), proof_n)
+            for x in topn:
+                sk = x.get("sort_key") or ()
+                sk0 = sk[0] if len(sk) > 0 else None
+                sk1 = sk[1] if len(sk) > 1 else None
+                sk2 = sk[2] if len(sk) > 2 else None
+                sk3 = sk[3] if len(sk) > 3 else None
+                _sort_proof_log(
+                    "POST_SORT_ITEM rid=%s mark=%s r=%s prov=%s stack=%s res=%s size_gb=%s "
+                    "b=%s p1=%s inst=%s ready=%s cached=%s tc=%s tp=%s cbh=%s pbh=%s cm=%s pm=%s "
+                    "sk0=%s sk1=%s sk2=%s sk3=%s",
+                    _rid(), _mark(), x.get("rank"), x.get("prov"), x.get("stack"), x.get("res"), x.get("size_gb"),
+                    x.get("p1_bucket"), x.get("p1_class"), x.get("instant"), x.get("ready"), x.get("cached"),
+                    x.get("tagged_cached"), x.get("tagged_proxied"), x.get("cached_bh"), x.get("proxied_bh"),
+                    x.get("cached_m"), x.get("proxied_m"), sk0, sk1, sk2, sk3,
+                )
     except Exception as _e:
         logger.debug("POST_SORT_TOP_ERR rid=%s err=%s", _rid(), _e)
 
