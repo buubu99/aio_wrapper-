@@ -46,7 +46,7 @@ def _safe_ua(ua_str: str, max_len: int = 100) -> str:
     """Truncate/escape UA to keep logs sane."""
     try:
         s = str(ua_str or "")
-        s = s[:max_len].replace('"', '\"').replace("\n", " ").replace("\r", " ")
+        s = s[:max_len].replace('"', '"').replace("\n", " ").replace("\r", " ")
         return s
     except Exception:
         return ""
@@ -516,6 +516,8 @@ USENET_PROBE_BUDGET_S = _safe_float(os.environ.get("USENET_PROBE_BUDGET_S", "8.5
 USENET_PROBE_DROP_FAILS = _parse_bool(os.environ.get("USENET_PROBE_DROP_FAILS", "1"), True)  # drop probed non-REAL links (STUB/ERR)
 USENET_PROBE_REAL_TOP10_PCT = _safe_float(os.environ.get("USENET_PROBE_REAL_TOP10_PCT", "0.5"), 0.5)
 USENET_PROBE_REAL_TOP20_N = _safe_int(os.environ.get("USENET_PROBE_REAL_TOP20_N", "20"), 20)
+USENET_PROBE_LOG_URLS = _parse_bool(os.environ.get("USENET_PROBE_LOG_URLS", "0"), False)
+USENET_PROBE_LOG_URLS_N = _safe_int(os.environ.get("USENET_PROBE_LOG_URLS_N", "5"), 5)
 _tmp_verify_retries = _safe_int(os.environ.get("VERIFY_RETRIES", "0"), 0)
 USENET_PROBE_RETRIES = _safe_int(os.environ.get("USENET_PROBE_RETRIES", str(_tmp_verify_retries)), _tmp_verify_retries)
 USENET_PROBE_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY", "40"), 40)
@@ -1989,27 +1991,28 @@ def _apply_usenet_playability_probe(
             except Exception:
                 pass
             # Debug visibility: show what we're actually probing (obfuscated).
-            try:
-                from urllib.parse import urlparse
-                _hosts = {}
-                for _u in urls:
-                    try:
-                        _h = urlparse(_u).netloc or "?"
-                    except Exception:
-                        _h = "?"
-                    _hosts[_h] = _hosts.get(_h, 0) + 1
-                _host_top = sorted(_hosts.items(), key=lambda kv: kv[1], reverse=True)[:5]
-                _sample = []
-                for _u in urls[:8]:
-                    try:
-                        _p = urlparse(_u)
-                        _sample.append(f"{_p.scheme}://{_p.netloc}{(_p.path[:40] + ('…' if len(_p.path) > 40 else ''))} (len={len(_u)})")
-                    except Exception:
-                        _sample.append(f"(bad_url len={len(str(_u))})")
-                logger.info("USENET_PROBE_URLS rid=%s hosts=%s sample=%s", _rid(), _host_top, _sample)
-            except Exception:
-                pass
-
+            if USENET_PROBE_LOG_URLS:
+                try:
+                    from urllib.parse import urlparse
+                    _hosts = {}
+                    for _u in urls:
+                        try:
+                            _h = urlparse(_u).netloc or "?"
+                        except Exception:
+                            _h = "?"
+                        _hosts[_h] = _hosts.get(_h, 0) + 1
+                    _host_top = sorted(_hosts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                    _sample = []
+                    for _u in urls[:max(1, min(25, int(USENET_PROBE_LOG_URLS_N or 5)))]:
+                        try:
+                            _p = urlparse(_u)
+                            _sample.append(f"{_p.scheme}://{_p.netloc}{(_p.path[:40] + ('…' if len(_p.path) > 40 else ''))} (len={len(_u)})")
+                        except Exception:
+                            _sample.append(f"(bad_url len={len(str(_u))})")
+                    _probe_urls_log = logger.info if (os.environ.get("USENET_PROBE_LOG_URLS_LEVEL", "DEBUG").upper() == "INFO") else logger.debug
+                    _probe_urls_log("USENET_PROBE_URLS rid=%s hosts=%s sample=%s", _rid(), _host_top, _sample)
+                except Exception:
+                    pass
             # Auto-tune under a hard global budget: avoid spending the whole budget on retrying timeouts.
             eff_conc = int(conc)
             eff_retries = int(retries or 1)
@@ -3906,12 +3909,14 @@ logging.getLogger().addFilter(RequestIdFilter())
 logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N} wrap_url_backend={_WRAP_URL_BACKEND} web_concurrency_env={WEB_CONCURRENCY_ENV}")
 
 logger.info(
-    "LOG_FLAGS wrap_log_token_emit=%s wrap_log_token_hit=%s wrap_log_token_full=%s wrap_log_token_sample_pct=%s sort_proof_top_n=%s",
+    "LOG_FLAGS wrap_log_token_emit=%s wrap_log_token_hit=%s wrap_log_token_full=%s wrap_log_token_sample_pct=%s sort_proof_top_n=%s usenet_probe_log_urls=%s usenet_probe_log_urls_n=%s",
     _is_true(os.environ.get("WRAP_LOG_TOKEN_EMIT", "false")),
     _is_true(os.environ.get("WRAP_LOG_TOKEN_HIT", "false")),
     _is_true(os.environ.get("WRAP_LOG_TOKEN_FULL", "false")),
     os.environ.get("WRAP_LOG_TOKEN_SAMPLE_PCT", ""),
     os.environ.get("SORT_PROOF_TOP_N", ""),
+    _is_true(os.environ.get("USENET_PROBE_LOG_URLS", "false")),
+    os.environ.get("USENET_PROBE_LOG_URLS_N", ""),
 )
 
 
@@ -8720,7 +8725,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # Proof log: top N after global sort (provider/supplier/res + sort signals)
     try:
-        proof_n = _safe_int(os.environ.get("SORT_PROOF_TOP_N", "8"), 8)
+        proof_n = _safe_int(os.environ.get("SORT_PROOF_TOP_N", "0"), 0)
         proof_n = max(0, min(25, int(proof_n)))
         if proof_n > 0:
             topn = []
@@ -8791,14 +8796,15 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             except Exception:
                 pass
     
-            logger.info("POST_SORT_TOP rid=%s mark=%s topN=%s", _rid(), _mark(), proof_n)
+            _sort_proof_log = logger.info if (os.environ.get("SORT_PROOF_LEVEL", "DEBUG").upper() == "INFO") else logger.debug
+            _sort_proof_log("POST_SORT_TOP rid=%s mark=%s topN=%s", _rid(), _mark(), proof_n)
             for x in topn:
                 sk = x.get("sort_key") or ()
                 sk0 = sk[0] if len(sk) > 0 else None
                 sk1 = sk[1] if len(sk) > 1 else None
                 sk2 = sk[2] if len(sk) > 2 else None
                 sk3 = sk[3] if len(sk) > 3 else None
-                logger.info(
+                _sort_proof_log(
                     "POST_SORT_ITEM rid=%s mark=%s r=%s prov=%s stack=%s res=%s size_gb=%s "
                     "b=%s p1=%s inst=%s ready=%s cached=%s tc=%s tp=%s cbh=%s pbh=%s cm=%s pm=%s "
                     "sk0=%s sk1=%s sk2=%s sk3=%s",
