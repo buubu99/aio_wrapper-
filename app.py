@@ -278,6 +278,82 @@ def _safe_csv(v, default: str = "") -> list[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
 
+
+
+# ---------------------------
+# Optional .env file loader (so a checked-in or mounted env file can drive os.environ)
+# This is intentionally lightweight (no external deps) and safe by default.
+#
+# - If ENV_FILE is set and exists, we load it first.
+# - Otherwise, if aio_wrapper-add_on.env or .env exists next to this file, we load it.
+# - By default we DO NOT override already-present os.environ keys.
+#   Set ENV_FILE_OVERRIDE=true to force file values to override existing env vars.
+# ---------------------------
+
+def _strip_env_quotes(v: str) -> str:
+    s = "" if v is None else str(v).strip()
+    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
+        return s[1:-1]
+    return s
+
+def _load_env_file(path: str, override: bool = False) -> dict:
+    loaded = 0
+    overridden = 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # tolerate: export KEY=VAL
+                if line.lower().startswith("export "):
+                    line = line[7:].strip()
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = _strip_env_quotes(v)
+                if not k:
+                    continue
+                if (k in os.environ) and (not override):
+                    continue
+                if (k in os.environ) and override:
+                    overridden += 1
+                os.environ[k] = v
+                loaded += 1
+    except Exception as e:
+        logger.warning("ENV_FILE_LOAD_FAIL path=%s err=%s", path, e)
+        return {"path": path, "loaded": 0, "overridden": 0, "ok": False}
+    return {"path": path, "loaded": loaded, "overridden": overridden, "ok": True}
+
+def _maybe_load_env_file() -> None:
+    # Keep this silent unless a file is actually loaded.
+    override = _is_true(os.environ.get("ENV_FILE_OVERRIDE", "false"))
+    candidates = []
+    explicit = (os.environ.get("ENV_FILE") or "").strip()
+    if explicit:
+        candidates.append(explicit)
+    try:
+        here = os.path.dirname(__file__)
+        candidates.extend([
+            os.path.join(here, "aio_wrapper-add_on.env"),
+            os.path.join(here, ".env"),
+        ])
+    except Exception:
+        pass
+
+    for p in candidates:
+        try:
+            if p and os.path.exists(p):
+                r = _load_env_file(p, override=override)
+                if r.get("ok"):
+                    # Don't log values (may include secrets); just log that the file was applied.
+                    logger.info("ENV_FILE_LOADED path=%s override=%s loaded=%s overridden=%s", r.get("path"), override, r.get("loaded"), r.get("overridden"))
+                return
+        except Exception:
+            continue
+
+_maybe_load_env_file()
 # ---------------------------
 # Config (keep env names compatible with your existing Render setup)
 # ---------------------------
@@ -3828,6 +3904,15 @@ logging.getLogger().addHandler(handler)
 logging.getLogger().setLevel(LOG_LEVEL)
 logging.getLogger().addFilter(RequestIdFilter())
 logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N} wrap_url_backend={_WRAP_URL_BACKEND} web_concurrency_env={WEB_CONCURRENCY_ENV}")
+
+logger.info(
+    "LOG_FLAGS wrap_log_token_emit=%s wrap_log_token_hit=%s wrap_log_token_full=%s wrap_log_token_sample_pct=%s sort_proof_top_n=%s",
+    _is_true(os.environ.get("WRAP_LOG_TOKEN_EMIT", "false")),
+    _is_true(os.environ.get("WRAP_LOG_TOKEN_HIT", "false")),
+    _is_true(os.environ.get("WRAP_LOG_TOKEN_FULL", "false")),
+    os.environ.get("WRAP_LOG_TOKEN_SAMPLE_PCT", ""),
+    os.environ.get("SORT_PROOF_TOP_N", ""),
+)
 
 
 def _debug_log_full_streams(type_: str, id_: str, platform: str, out_for_client: Optional[List[Dict[str, Any]]]) -> None:
@@ -8636,91 +8721,92 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     # Proof log: top N after global sort (provider/supplier/res + sort signals)
     try:
         proof_n = _safe_int(os.environ.get("SORT_PROOF_TOP_N", "8"), 8)
-        proof_n = max(1, min(25, int(proof_n or 8)))
-        topn = []
-        for rank, (s, m) in enumerate(out_pairs[:proof_n], start=1):
-            bh = (s.get("behaviorHints") or {}) if isinstance(s, dict) else {}
-            if not isinstance(bh, dict):
-                bh = {}
-            supplier = (bh.get("wrap_src") or bh.get("source_tag") or (AIO_TAG or "AIO"))
-            desc = ""
-            try:
-                if isinstance(s, dict):
-                    desc = s.get("description") or ""
-            except Exception:
+        proof_n = max(0, min(25, int(proof_n)))
+        if proof_n > 0:
+            topn = []
+            for rank, (s, m) in enumerate(out_pairs[:proof_n], start=1):
+                bh = (s.get("behaviorHints") or {}) if isinstance(s, dict) else {}
+                if not isinstance(bh, dict):
+                    bh = {}
+                supplier = (bh.get("wrap_src") or bh.get("source_tag") or (AIO_TAG or "AIO"))
                 desc = ""
-            desc_u = str(desc).upper()
-            aio = m.get("aio") if isinstance(m, dict) else None
-            aio_cached = None
-            aio_proxied = None
-            try:
-                if isinstance(aio, dict):
-                    aio_cached = aio.get("cached", None)
-                    aio_proxied = aio.get("proxied", None)
-            except Exception:
+                try:
+                    if isinstance(s, dict):
+                        desc = s.get("description") or ""
+                except Exception:
+                    desc = ""
+                desc_u = str(desc).upper()
+                aio = m.get("aio") if isinstance(m, dict) else None
                 aio_cached = None
                 aio_proxied = None
-            aio_ti = (aio_cached is True and aio_proxied is True) if (USE_AIO_READY and (aio_cached is not None and aio_proxied is not None)) else None
-            tagged_instant = bool(aio_ti) if (aio_ti is not None) else (("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) or ("C:TRUE" in desc_u and ("P:TRUE" in desc_u or _is_controlled_playback_url(s.get("url") if isinstance(s, dict) else None))))
-            # Prefer cached signal from the outgoing stream's behaviorHints (what the client sees).
-            bh = {}
-            try:
-                if isinstance(s, dict):
-                    bh = s.get("behaviorHints") or {}
-            except Exception:
+                try:
+                    if isinstance(aio, dict):
+                        aio_cached = aio.get("cached", None)
+                        aio_proxied = aio.get("proxied", None)
+                except Exception:
+                    aio_cached = None
+                    aio_proxied = None
+                aio_ti = (aio_cached is True and aio_proxied is True) if (USE_AIO_READY and (aio_cached is not None and aio_proxied is not None)) else None
+                tagged_instant = bool(aio_ti) if (aio_ti is not None) else (("CACHED:TRUE" in desc_u and "PROXIED:TRUE" in desc_u) or ("C:TRUE" in desc_u and ("P:TRUE" in desc_u or _is_controlled_playback_url(s.get("url") if isinstance(s, dict) else None))))
+                # Prefer cached signal from the outgoing stream's behaviorHints (what the client sees).
                 bh = {}
-            cached_bh = bh.get("cached") if isinstance(bh, dict) else None
-            cached_m = m.get("cached", None)
-            cached_disp = cached_bh if cached_bh is not None else cached_m
-            topn.append({
-                "rank": int(rank),
-                "supplier": str(supplier),
-                "prov": str(m.get("provider", "UNK")),
-                "res": str(m.get("res", "SD")),
-                "size_gb": round(float(int(m.get("size") or 0)) / (1024 ** 3), 2),
-                "seeders": int(m.get("seeders") or 0),
-                "cached": cached_disp,
-                "cached_bh": cached_bh,
-                "cached_m": cached_m,
-                "premium_level": m.get("premium_level", None),
-                "ready": bool(m.get("ready", False)),
-                "p1_bucket": int(m.get("p1_bucket") or -1),
-                "p1_class": str(m.get("p1_class") or ""),
-                "p1_q": round(float(m.get("p1_q") or 0.0), 3),
-
-                "tagged_instant": bool(tagged_instant),
-                "instant_val": int(m.get("_instant_val") or 0),
-                "ready_val": int(m.get("_ready_val") or 0),
-                "cached_val": float(m.get("_cached_val") or 0.0),
-                "verify_rank": int(m.get("_verify_rank0") or 0),
-                "sanity": int(m.get("_sanity") or 0),
-                "sanity_reason": str(m.get("_sanity_reason") or ""),
-                "sort_key": sort_key((s, m)),
-            })
-        # Helpful positioning signal: where does the first REMUX land after primary sort?
-        try:
-            remux_pos = next((i + 1 for i, (_s0, _m0) in enumerate(out_pairs) if int(_m0.get("p1_bucket") or 99) == 0), None)
-            if remux_pos is not None:
-                logger.info("P1_REMUX_POS rid=%s pos=%s total=%s", _rid(), remux_pos, len(out_pairs))
-        except Exception:
-            pass
-
-        logger.info("POST_SORT_TOP rid=%s mark=%s topN=%s", _rid(), _mark(), proof_n)
-        for x in topn:
-            sk = x.get("sort_key") or ()
-            sk0 = sk[0] if len(sk) > 0 else None
-            sk1 = sk[1] if len(sk) > 1 else None
-            sk2 = sk[2] if len(sk) > 2 else None
-            sk3 = sk[3] if len(sk) > 3 else None
-            logger.info(
-                "POST_SORT_ITEM rid=%s mark=%s r=%s prov=%s stack=%s res=%s size_gb=%s "
-                "b=%s p1=%s inst=%s ready=%s cached=%s tc=%s tp=%s cbh=%s pbh=%s cm=%s pm=%s "
-                "sk0=%s sk1=%s sk2=%s sk3=%s",
-                _rid(), _mark(), x.get("rank"), x.get("prov"), x.get("stack"), x.get("res"), x.get("size_gb"),
-                x.get("p1_bucket"), x.get("p1_class"), x.get("instant"), x.get("ready"), x.get("cached"),
-                x.get("tagged_cached"), x.get("tagged_proxied"), x.get("cached_bh"), x.get("proxied_bh"),
-                x.get("cached_m"), x.get("proxied_m"), sk0, sk1, sk2, sk3,
-            )
+                try:
+                    if isinstance(s, dict):
+                        bh = s.get("behaviorHints") or {}
+                except Exception:
+                    bh = {}
+                cached_bh = bh.get("cached") if isinstance(bh, dict) else None
+                cached_m = m.get("cached", None)
+                cached_disp = cached_bh if cached_bh is not None else cached_m
+                topn.append({
+                    "rank": int(rank),
+                    "supplier": str(supplier),
+                    "prov": str(m.get("provider", "UNK")),
+                    "res": str(m.get("res", "SD")),
+                    "size_gb": round(float(int(m.get("size") or 0)) / (1024 ** 3), 2),
+                    "seeders": int(m.get("seeders") or 0),
+                    "cached": cached_disp,
+                    "cached_bh": cached_bh,
+                    "cached_m": cached_m,
+                    "premium_level": m.get("premium_level", None),
+                    "ready": bool(m.get("ready", False)),
+                    "p1_bucket": int(m.get("p1_bucket") or -1),
+                    "p1_class": str(m.get("p1_class") or ""),
+                    "p1_q": round(float(m.get("p1_q") or 0.0), 3),
+    
+                    "tagged_instant": bool(tagged_instant),
+                    "instant_val": int(m.get("_instant_val") or 0),
+                    "ready_val": int(m.get("_ready_val") or 0),
+                    "cached_val": float(m.get("_cached_val") or 0.0),
+                    "verify_rank": int(m.get("_verify_rank0") or 0),
+                    "sanity": int(m.get("_sanity") or 0),
+                    "sanity_reason": str(m.get("_sanity_reason") or ""),
+                    "sort_key": sort_key((s, m)),
+                })
+            # Helpful positioning signal: where does the first REMUX land after primary sort?
+            try:
+                remux_pos = next((i + 1 for i, (_s0, _m0) in enumerate(out_pairs) if int(_m0.get("p1_bucket") or 99) == 0), None)
+                if remux_pos is not None:
+                    logger.info("P1_REMUX_POS rid=%s pos=%s total=%s", _rid(), remux_pos, len(out_pairs))
+            except Exception:
+                pass
+    
+            logger.info("POST_SORT_TOP rid=%s mark=%s topN=%s", _rid(), _mark(), proof_n)
+            for x in topn:
+                sk = x.get("sort_key") or ()
+                sk0 = sk[0] if len(sk) > 0 else None
+                sk1 = sk[1] if len(sk) > 1 else None
+                sk2 = sk[2] if len(sk) > 2 else None
+                sk3 = sk[3] if len(sk) > 3 else None
+                logger.info(
+                    "POST_SORT_ITEM rid=%s mark=%s r=%s prov=%s stack=%s res=%s size_gb=%s "
+                    "b=%s p1=%s inst=%s ready=%s cached=%s tc=%s tp=%s cbh=%s pbh=%s cm=%s pm=%s "
+                    "sk0=%s sk1=%s sk2=%s sk3=%s",
+                    _rid(), _mark(), x.get("rank"), x.get("prov"), x.get("stack"), x.get("res"), x.get("size_gb"),
+                    x.get("p1_bucket"), x.get("p1_class"), x.get("instant"), x.get("ready"), x.get("cached"),
+                    x.get("tagged_cached"), x.get("tagged_proxied"), x.get("cached_bh"), x.get("proxied_bh"),
+                    x.get("cached_m"), x.get("proxied_m"), sk0, sk1, sk2, sk3,
+                )
     except Exception as _e:
         logger.debug("POST_SORT_TOP_ERR rid=%s err=%s", _rid(), _e)
 
