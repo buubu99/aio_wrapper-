@@ -1768,7 +1768,7 @@ async def _probe_single(
         pass
     _accept = (os.getenv("USENET_PROBE_ACCEPT") or "*/*").strip() or "*/*"
 
-    for attempt in range(1, retries + 1):
+    for attempt in range(retries + 1):
         try:
             # Remaining global budget for this task.
             remaining = float(deadline - time.monotonic())
@@ -1777,7 +1777,7 @@ async def _probe_single(
 
             # Attempt timeout base (attempt #1 can be shorter if configured).
             this_total = float(timeout_s)
-            if attempt == 1 and _a1 and _a1 > 0:
+            if attempt == 0 and _a1 and _a1 > 0:
                 this_total = max(0.5, min(float(timeout_s), float(_a1)))
 
             # Clamp attempt timeout to remaining budget (leave margin).
@@ -1786,7 +1786,7 @@ async def _probe_single(
                 return (url, False, 0, "BUDGET")
 
             # Keep connect phase snappy.
-            sock_connect_s = min(2.0, this_total) if attempt > 1 else min(1.5, this_total)
+            sock_connect_s = min(2.0, this_total) if attempt > 0 else min(1.5, this_total)
             headers = {"Range": f"bytes=0-{range_end}"}
             if _ua:
                 headers["Accept"] = _accept
