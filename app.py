@@ -1643,8 +1643,6 @@ async def _usenet_range_probe_is_real_async(
         # Fall back to old format
         logger.info("USENET_PROBE_CONN rid=%s conc=%s lph=%s budget_s=%.2f timeout_s=%.2f retries=%s",
                     _rid(), int(concurrency), int(eff_lph), float(budget_s), float(timeout_s), int(retries))
-except Exception:
-    pass
     connector = aiohttp.TCPConnector(
         limit=max(int(concurrency), int(eff_lph)),
         limit_per_host=int(eff_lph),
