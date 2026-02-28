@@ -1733,6 +1733,18 @@ async def _probe_single(
     except Exception:
         _a1 = 0.0
 
+    # Probe request fingerprint override (OPT-IN).
+    # If USENET_PROBE_UA/USENET_PROBE_USER_AGENT is not set, probing behaves exactly as before (no UA/Accept headers, no status-fastfail).
+    _ua_raw = (os.getenv("USENET_PROBE_UA", "") or os.getenv("USENET_PROBE_USER_AGENT", "") or "")
+    _ua = str(_ua_raw).strip()
+    try:
+        _ua_l = _ua.lower()
+        if _ua_l in ("0", "false", "none", "off", "disable", "disabled"):
+            _ua = ""
+    except Exception:
+        pass
+    _accept = (os.getenv("USENET_PROBE_ACCEPT") or "*/*").strip() or "*/*"
+
     for attempt in range(1, retries + 1):
         try:
             # Remaining global budget for this task.
@@ -1753,6 +1765,9 @@ async def _probe_single(
             # Keep connect phase snappy.
             sock_connect_s = min(2.0, this_total) if attempt > 1 else min(1.5, this_total)
             headers = {"Range": f"bytes=0-{range_end}"}
+            if _ua:
+                headers["Accept"] = _accept
+                headers["User-Agent"] = _ua
 
             # Acquire the per-attempt concurrency slot.
             # If the batch hits the overall wall while waiting here, CancelledError will be mapped to BUDGET below.
@@ -1780,6 +1795,8 @@ async def _probe_single(
                         allow_redirects=True,
                         timeout=aiohttp.ClientTimeout(total=this_total2, sock_connect=sock_connect_s, sock_read=this_total2),
                     ) as resp:
+                        if _ua and int(resp.status) != 206:
+                            return (url, False, 0, f"FAIL_http_{int(resp.status)}")
                         want_need = int(stub_len + 1)
                         if guard and int(max_bytes) < want_need:
                             return (url, False, int(max_bytes), "MISCONFIG_MAX_BYTES")
