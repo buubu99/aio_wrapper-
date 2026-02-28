@@ -1619,10 +1619,32 @@ async def _usenet_range_probe_is_real_async(
         _lph_env = 4
     eff_lph = max(1, min(int(concurrency), int(len(urls) or 1), int(_lph_env or 4)))
     try:
+        # Log probe config including attempt1 + whether a probe UA is enabled (without leaking the UA itself).
+        try:
+            attempt1_timeout_s = float(os.getenv("USENET_PROBE_ATTEMPT1_TIMEOUT_S", "2.0") or 2.0)
+        except Exception:
+            attempt1_timeout_s = 2.0
+        ua_raw = (os.getenv("USENET_PROBE_UA", "") or os.getenv("USENET_PROBE_USER_AGENT", "") or "")
+        ua_cfg = str(ua_raw).strip()
+        if ua_cfg and len(ua_cfg) >= 2 and ua_cfg[0] == ua_cfg[-1] and ua_cfg[0] in ('"', "'"):
+            ua_cfg = ua_cfg[1:-1].strip()
+        try:
+            if ua_cfg.lower() in ("0", "false", "none", "off", "disable", "disabled"):
+                ua_cfg = ""
+        except Exception:
+            pass
+        ua_on = bool(ua_cfg)
+        ua_len = (len(ua_cfg) if ua_cfg else 0)
+
+        logger.info("USENET_PROBE_CONN rid=%s conc=%s lph=%s budget_s=%.2f timeout_s=%.2f retries=%s attempt1_s=%.2f ua_on=%s ua_len=%s",
+                    _rid(), int(concurrency), int(eff_lph), float(budget_s), float(timeout_s), int(retries),
+                    float(attempt1_timeout_s), bool(ua_on), int(ua_len))
+    except Exception:
+        # Fall back to old format
         logger.info("USENET_PROBE_CONN rid=%s conc=%s lph=%s budget_s=%.2f timeout_s=%.2f retries=%s",
                     _rid(), int(concurrency), int(eff_lph), float(budget_s), float(timeout_s), int(retries))
-    except Exception:
-        pass
+except Exception:
+    pass
     connector = aiohttp.TCPConnector(
         limit=max(int(concurrency), int(eff_lph)),
         limit_per_host=int(eff_lph),
@@ -1737,6 +1759,9 @@ async def _probe_single(
     # If USENET_PROBE_UA/USENET_PROBE_USER_AGENT is not set, probing behaves exactly as before (no UA/Accept headers, no status-fastfail).
     _ua_raw = (os.getenv("USENET_PROBE_UA", "") or os.getenv("USENET_PROBE_USER_AGENT", "") or "")
     _ua = str(_ua_raw).strip()
+    # Allow quoted values in Render env vars, e.g. USENET_PROBE_UA="Mozilla/5.0 ..."
+    if _ua and len(_ua) >= 2 and _ua[0] == _ua[-1] and _ua[0] in ('"', "'"):
+        _ua = _ua[1:-1].strip()
     try:
         _ua_l = _ua.lower()
         if _ua_l in ("0", "false", "none", "off", "disable", "disabled"):
@@ -1795,7 +1820,7 @@ async def _probe_single(
                         allow_redirects=True,
                         timeout=aiohttp.ClientTimeout(total=this_total2, sock_connect=sock_connect_s, sock_read=this_total2),
                     ) as resp:
-                        if _ua and int(resp.status) != 206:
+                        if int(resp.status) != 206:
                             return (url, False, 0, f"FAIL_http_{int(resp.status)}")
                         want_need = int(stub_len + 1)
                         if guard and int(max_bytes) < want_need:
