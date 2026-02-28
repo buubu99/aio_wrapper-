@@ -1733,24 +1733,6 @@ async def _probe_single(
     except Exception:
         _a1 = 0.0
 
-    # Probe request fingerprint controls (helps avoid proxy/WAF 403s and inconsistent first-touch behavior).
-    _accept = (os.getenv("USENET_PROBE_ACCEPT") or "*/*").strip() or "*/*"
-
-    _ua_raw = os.getenv("USENET_PROBE_UA", None)
-    if _ua_raw is None:
-        _ua_raw = os.getenv("USENET_PROBE_USER_AGENT", None)
-
-    _ua_default = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
-    if _ua_raw is None:
-        _ua = _ua_default
-    else:
-        _ua = str(_ua_raw).strip()
-        _ua_l = _ua.lower()
-        if _ua_l in ("0", "false", "none", "off", "disable", "disabled"):
-            _ua = ""
-        elif not _ua:
-            _ua = _ua_default
-
     for attempt in range(1, retries + 1):
         try:
             # Remaining global budget for this task.
@@ -1770,9 +1752,7 @@ async def _probe_single(
 
             # Keep connect phase snappy.
             sock_connect_s = min(2.0, this_total) if attempt > 1 else min(1.5, this_total)
-            headers = {"Range": f"bytes=0-{range_end}", "Accept": _accept}
-            if _ua:
-                headers["User-Agent"] = _ua
+            headers = {"Range": f"bytes=0-{range_end}"}
 
             # Acquire the per-attempt concurrency slot.
             # If the batch hits the overall wall while waiting here, CancelledError will be mapped to BUDGET below.
@@ -1800,9 +1780,6 @@ async def _probe_single(
                         allow_redirects=True,
                         timeout=aiohttp.ClientTimeout(total=this_total2, sock_connect=sock_connect_s, sock_read=this_total2),
                     ) as resp:
-                        if int(resp.status) != 206:
-                            # Fast-fail on forbidden/rate-limited/upstream errors instead of misclassifying as SHORT.
-                            return (url, False, 0, f"FAIL_http_{int(resp.status)}")
                         want_need = int(stub_len + 1)
                         if guard and int(max_bytes) < want_need:
                             return (url, False, int(max_bytes), "MISCONFIG_MAX_BYTES")
