@@ -1652,56 +1652,79 @@ async def _usenet_range_probe_is_real_async(
         keepalive_timeout=30,
     )
     async with aiohttp.ClientSession(auth=_auth, connector=connector) as session:
-        tasks: List[asyncio.Task] = []
-        task_url: Dict[asyncio.Task, str] = {}
-
         # Stallguard v3: deadline for budget-aware per-attempt timeouts
         _deadline = time.monotonic() + float(budget_s)
 
-        for url in urls:
-            t = asyncio.create_task(
-                _probe_single(session, url, sem, retries, timeout_s, stub_len, range_end or stub_len, max_bytes, guard, deadline=_deadline, host_sem=_host_sem_for(url))
-            )
-            tasks.append(t)
-            task_url[t] = url
+        # Worker-pool scheduler (IMPORTANT):
+        # Do NOT create one task per URL (40 tasks) and then let 30 sit queued behind sem/host_sem.
+        # That pattern causes many tasks to hit the global wall and get reported as BUDGET, and can
+        # cancel in-flight work at the wall. Instead, run a fixed pool of workers that pulls URLs
+        # from a queue until the deadline/budget is reached.
+        url_q: asyncio.Queue = asyncio.Queue()
+        for _u in urls:
+            url_q.put_nowait(_u)
 
-        # Wait for all with overall budget timeout (partial results if exceeded)
+        res_map: Dict[str, Tuple[str, bool, int, str]] = {}
+        res_lock = asyncio.Lock()
+
+        async def worker() -> None:
+            while True:
+                remaining0 = float(_deadline - time.monotonic())
+                if remaining0 <= 0.35:
+                    return
+                try:
+                    u = url_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+
+                try:
+                    r = await _probe_single(
+                        session,
+                        u,
+                        sem,
+                        retries,
+                        timeout_s,
+                        stub_len,
+                        range_end or stub_len,
+                        max_bytes,
+                        guard,
+                        deadline=_deadline,
+                        host_sem=_host_sem_for(u),
+                    )
+                except Exception as e:
+                    r = (u, False, 0, f"FAIL_{type(e).__name__}")
+
+                async with res_lock:
+                    # Keep first result for each URL (stable); ignore duplicates
+                    if u not in res_map:
+                        res_map[u] = r
+
+        n_workers = max(1, min(int(concurrency or 1), int(len(urls) or 1)))
+        workers: List[asyncio.Task] = [asyncio.create_task(worker()) for _ in range(n_workers)]
+
+        # Wait for worker pool with overall budget timeout (partial results if exceeded)
         _t0 = time.monotonic()
-        done, pending = await asyncio.wait(tasks, timeout=budget_s)
+        done, pending = await asyncio.wait(workers, timeout=budget_s)
         _elapsed = time.monotonic() - _t0
 
-        for t in done:
-            u = task_url.get(t, "")
-            try:
-                res = t.result()
-                if res:
-                    results.append(res)
-            except Exception as e:
-                logger.warning("PROBE_EXC url=%s err=%s", u, type(e).__name__)
-                if u:
-                    results.append((u, False, 0, f"FAIL_{type(e).__name__}"))
-
-        # Cancel pending to enforce budget; caller will treat missing URLs as BUDGET
+        # Cancel any remaining workers to enforce budget
         for t in pending:
             t.cancel()
         if pending:
             _ = await asyncio.gather(*pending, return_exceptions=True)
 
-        # Ensure we always return a result for every URL.
-        # Any URL still pending at the budget wall is reported as BUDGET.
-        try:
-            for t in pending:
-                u = task_url.get(t, "")
-                if u:
-                    results.append((u, False, 0, "BUDGET"))
-        except Exception:
-            pass
+        # Build results list. Ensure every URL has an explicit result; missing => BUDGET.
+        results = list(res_map.values())
+        seen_urls = set(res_map.keys())
+        for u in urls:
+            if u not in seen_urls:
+                results.append((u, False, 0, "BUDGET"))
 
         # Emit a single authoritative line that is internally consistent:
-        # - done/pending are asyncio task states at the wall
-        # - tested/budget are semantic outcomes (budget includes early BUDGET returns + pending-at-wall)
+        # - done/pending refer to worker tasks, not per-URL tasks
+        # - tested/budget are semantic outcomes across URLs
         try:
-            _total = int(len(tasks))
+            _total = int(len(urls))
             _done = int(len(done))
             _pending = int(len(pending))
             _budget = 0
@@ -1709,9 +1732,9 @@ async def _usenet_range_probe_is_real_async(
                 if str(_rs).upper().startswith("BUDGET"):
                     _budget += 1
             _tested = max(0, _total - int(_budget))
-            _msg = f"PROBE_PARTIAL: done={_done}/{_total} in {float(min(_elapsed, float(budget_s))):.2f} s (tested={_tested} budget={int(_budget)} pending={_pending})"
+            _msg = f"PROBE_PARTIAL: done={_done}/{int(len(workers))} in {float(min(_elapsed, float(budget_s))):.2f} s (tested={_tested} budget={int(_budget)} pending={_pending})"
         except Exception:
-            _msg = f"PROBE_PARTIAL: done={int(len(done))}/{int(len(tasks))} in {float(min(_elapsed, float(budget_s))):.2f} s"
+            _msg = f"PROBE_PARTIAL: done={int(len(done))}/{int(len(workers))} in {float(min(_elapsed, float(budget_s))):.2f} s"
         try:
             logger.info(_msg)
         except Exception:
