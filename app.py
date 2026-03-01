@@ -1775,7 +1775,12 @@ async def _probe_single(
 
             # Keep connect phase snappy.
             sock_connect_s = min(2.0, this_total) if attempt > 1 else min(1.5, this_total)
-            headers = {"Range": f"bytes=0-{range_end}"}
+            headers = {
+                "Range": f"bytes=0-{range_end}",
+                "Accept-Encoding": "identity",
+                "User-Agent": os.environ.get("USENET_PROBE_UA", "Mozilla/5.0"),
+                "Accept": "*/*",
+            }
 
             # Acquire per-host slot (outside request timeout) then per-attempt concurrency slot.
             # This prevents aiohttp connector-queue delays from consuming the per-attempt timeout and
@@ -1815,9 +1820,16 @@ async def _probe_single(
                         async with session.get(
                             url,
                             headers=headers,
-                            allow_redirects=True,
+                            allow_redirects=False,
                             timeout=aiohttp.ClientTimeout(total=this_total2, sock_connect=sock_connect_s, sock_read=this_total2),
                         ) as resp:
+                            # Expect Range response. Fail fast on non-206 to avoid wasting budget on HTML/error bodies.
+                            if resp.status != 206:
+                                try:
+                                    resp.release()
+                                except Exception:
+                                    pass
+                                return (url, False, 0, f"HTTP_{int(getattr(resp, 'status', 0) or 0)}")
                             want_need = int(stub_len + 1)
                             if guard and int(max_bytes) < want_need:
                                 return (url, False, int(max_bytes), "MISCONFIG_MAX_BYTES")
@@ -2027,12 +2039,7 @@ def _apply_usenet_playability_probe(
                     continue  # Skip multi-hop proxy/replay URLs
                 urls.append(u)
                 url_to_idx[u] = idx
-
-            # Probe shorter URLs first (more deterministic + matches the manual probe script).
-            try:
-                urls.sort(key=len)
-            except Exception:
-                pass
+            # Preserve original candidate order (do not reorder by URL length).
             # Debug visibility: show what we're actually probing (obfuscated).
             if USENET_PROBE_LOG_URLS:
                 try:
