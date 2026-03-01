@@ -1618,113 +1618,68 @@ async def _usenet_range_probe_is_real_async(
     except Exception:
         _lph_env = 4
     eff_lph = max(1, min(int(concurrency), int(len(urls) or 1), int(_lph_env or 4)))
-
-    # Per-host semaphore (applied outside request timeout).
-    # NOTE: host == proxy netloc (e.g. buubuu99-aiostreams.*). Upstreams may vary, but the proxy
-    # is the choke-point our client connects to, so throttling here prevents connector-queue timeouts.
-    from urllib.parse import urlparse as _urlparse
-    _host_sems: Dict[str, asyncio.Semaphore] = {}
-
-    def _host_sem_for(u: str) -> asyncio.Semaphore:
-        try:
-            h = (_urlparse(u).netloc or "").lower().split("@")[-1]
-        except Exception:
-            h = ""
-        if not h:
-            h = "__nohost__"
-        s = _host_sems.get(h)
-        if s is None:
-            s = asyncio.Semaphore(int(eff_lph))
-            _host_sems[h] = s
-        return s
     try:
         logger.info("USENET_PROBE_CONN rid=%s conc=%s lph=%s budget_s=%.2f timeout_s=%.2f retries=%s",
                     _rid(), int(concurrency), int(eff_lph), float(budget_s), float(timeout_s), int(retries))
     except Exception:
         pass
-    # Mode-B semantics: do NOT use aiohttp's connector per-host queue as the throttle.
-    # Connector queue time counts inside ClientTimeout and shows up as misleading ERR_TH.
-    # We cap per-host ourselves (host_sem) BEFORE starting the request timeout.
     connector = aiohttp.TCPConnector(
-        limit=0,
-        limit_per_host=0,
+        limit=max(int(concurrency), int(eff_lph)),
+        limit_per_host=int(eff_lph),
         ttl_dns_cache=300,
         keepalive_timeout=30,
     )
     async with aiohttp.ClientSession(auth=_auth, connector=connector) as session:
+        tasks: List[asyncio.Task] = []
+        task_url: Dict[asyncio.Task, str] = {}
+
         # Stallguard v3: deadline for budget-aware per-attempt timeouts
         _deadline = time.monotonic() + float(budget_s)
 
-        # Worker-pool scheduler (IMPORTANT):
-        # Do NOT create one task per URL (40 tasks) and then let 30 sit queued behind sem/host_sem.
-        # That pattern causes many tasks to hit the global wall and get reported as BUDGET, and can
-        # cancel in-flight work at the wall. Instead, run a fixed pool of workers that pulls URLs
-        # from a queue until the deadline/budget is reached.
-        url_q: asyncio.Queue = asyncio.Queue()
-        for _u in urls:
-            url_q.put_nowait(_u)
+        for url in urls:
+            t = asyncio.create_task(
+                _probe_single(session, url, sem, retries, timeout_s, stub_len, range_end or stub_len, max_bytes, guard, deadline=_deadline)
+            )
+            tasks.append(t)
+            task_url[t] = url
 
-        res_map: Dict[str, Tuple[str, bool, int, str]] = {}
-        res_lock = asyncio.Lock()
-
-        async def worker() -> None:
-            while True:
-                remaining0 = float(_deadline - time.monotonic())
-                if remaining0 <= 0.35:
-                    return
-                try:
-                    u = url_q.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
-
-                try:
-                    r = await _probe_single(
-                        session,
-                        u,
-                        sem,
-                        retries,
-                        timeout_s,
-                        stub_len,
-                        range_end or stub_len,
-                        max_bytes,
-                        guard,
-                        deadline=_deadline,
-                        host_sem=_host_sem_for(u),
-                    )
-                except Exception as e:
-                    r = (u, False, 0, f"FAIL_{type(e).__name__}")
-
-                async with res_lock:
-                    # Keep first result for each URL (stable); ignore duplicates
-                    if u not in res_map:
-                        res_map[u] = r
-
-        n_workers = max(1, min(int(concurrency or 1), int(len(urls) or 1)))
-        workers: List[asyncio.Task] = [asyncio.create_task(worker()) for _ in range(n_workers)]
-
-        # Wait for worker pool with overall budget timeout (partial results if exceeded)
+        # Wait for all with overall budget timeout (partial results if exceeded)
         _t0 = time.monotonic()
-        done, pending = await asyncio.wait(workers, timeout=budget_s)
+        done, pending = await asyncio.wait(tasks, timeout=budget_s)
         _elapsed = time.monotonic() - _t0
 
-        # Cancel any remaining workers to enforce budget
+        for t in done:
+            u = task_url.get(t, "")
+            try:
+                res = t.result()
+                if res:
+                    results.append(res)
+            except Exception as e:
+                logger.warning("PROBE_EXC url=%s err=%s", u, type(e).__name__)
+                if u:
+                    results.append((u, False, 0, f"FAIL_{type(e).__name__}"))
+
+        # Cancel pending to enforce budget; caller will treat missing URLs as BUDGET
         for t in pending:
             t.cancel()
         if pending:
             _ = await asyncio.gather(*pending, return_exceptions=True)
 
-        # Build results list. Ensure every URL has an explicit result; missing => BUDGET.
-        results = list(res_map.values())
-        seen_urls = set(res_map.keys())
-        for u in urls:
-            if u not in seen_urls:
-                results.append((u, False, 0, "BUDGET"))
+        # Ensure we always return a result for every URL.
+        # Any URL still pending at the budget wall is reported as BUDGET.
+        try:
+            for t in pending:
+                u = task_url.get(t, "")
+                if u:
+                    results.append((u, False, 0, "BUDGET"))
+        except Exception:
+            pass
 
         # Emit a single authoritative line that is internally consistent:
-        # - done/pending refer to worker tasks, not per-URL tasks
-        # - tested/budget are semantic outcomes across URLs
+        # - done/pending are asyncio task states at the wall
+        # - tested/budget are semantic outcomes (budget includes early BUDGET returns + pending-at-wall)
         try:
-            _total = int(len(urls))
+            _total = int(len(tasks))
             _done = int(len(done))
             _pending = int(len(pending))
             _budget = 0
@@ -1732,9 +1687,9 @@ async def _usenet_range_probe_is_real_async(
                 if str(_rs).upper().startswith("BUDGET"):
                     _budget += 1
             _tested = max(0, _total - int(_budget))
-            _msg = f"PROBE_PARTIAL: done={_done}/{int(len(workers))} in {float(min(_elapsed, float(budget_s))):.2f} s (tested={_tested} budget={int(_budget)} pending={_pending})"
+            _msg = f"PROBE_PARTIAL: done={_done}/{_total} in {float(min(_elapsed, float(budget_s))):.2f} s (tested={_tested} budget={int(_budget)} pending={_pending})"
         except Exception:
-            _msg = f"PROBE_PARTIAL: done={int(len(done))}/{int(len(workers))} in {float(min(_elapsed, float(budget_s))):.2f} s"
+            _msg = f"PROBE_PARTIAL: done={int(len(done))}/{int(len(tasks))} in {float(min(_elapsed, float(budget_s))):.2f} s"
         try:
             logger.info(_msg)
         except Exception:
@@ -1766,7 +1721,6 @@ async def _probe_single(
     guard: bool,
     *,
     deadline: float,
-    host_sem: Optional[asyncio.Semaphore] = None,
 ) -> Tuple[str, bool, int, str]:
     # Stallguard v4: IMPORTANT semantic fix
     # - We do NOT include semaphore waiting inside the hard wait_for guard.
@@ -1798,99 +1752,67 @@ async def _probe_single(
 
             # Keep connect phase snappy.
             sock_connect_s = min(2.0, this_total) if attempt > 1 else min(1.5, this_total)
-            headers = {
-                "Range": f"bytes=0-{range_end}",
-                "Accept-Encoding": "identity",
-                "User-Agent": os.environ.get("USENET_PROBE_UA", "Mozilla/5.0"),
-                "Accept": "*/*",
-            }
+            headers = {"Range": f"bytes=0-{range_end}"}
 
-            # Acquire per-host slot (outside request timeout) then per-attempt concurrency slot.
-            # This prevents aiohttp connector-queue delays from consuming the per-attempt timeout and
-            # showing up as misleading header timeouts.
-            host_acquired = False
-            if host_sem is not None:
-                remaining_h = float(deadline - time.monotonic())
-                if remaining_h <= 0.35:
-                    return (url, False, 0, "BUDGET")
-                try:
-                    await asyncio.wait_for(host_sem.acquire(), timeout=max(0.05, remaining_h - 0.05))
-                    host_acquired = True
-                except asyncio.TimeoutError:
-                    return (url, False, 0, "BUDGET")
-
+            # Acquire the per-attempt concurrency slot.
+            # If the batch hits the overall wall while waiting here, CancelledError will be mapped to BUDGET below.
+            await sem.acquire()
             try:
-                # Acquire the per-attempt concurrency slot.
-                # If the batch hits the overall wall while waiting here, CancelledError will be mapped to BUDGET below.
-                await sem.acquire()
-                try:
-                    # Recompute remaining after waiting for a slot.
-                    remaining2 = float(deadline - time.monotonic())
-                    if remaining2 <= 0.35:
-                        return (url, False, 0, "BUDGET")
+                # Recompute remaining after waiting for a slot.
+                remaining2 = float(deadline - time.monotonic())
+                if remaining2 <= 0.35:
+                    return (url, False, 0, "BUDGET")
 
-                    # Re-clamp for the actual network section.
-                    this_total2 = min(float(this_total), max(0.10, remaining2 - 0.15))
-                    if this_total2 <= 0.10:
-                        return (url, False, 0, "BUDGET")
+                # Re-clamp for the actual network section.
+                this_total2 = min(float(this_total), max(0.10, remaining2 - 0.15))
+                if this_total2 <= 0.10:
+                    return (url, False, 0, "BUDGET")
 
-                    # Hard guard timeout for the network+read section, also clamped to the global deadline.
-                    guard_timeout = min(float(this_total2 + 0.25), max(0.05, float(deadline - time.monotonic() - 0.05)))
-                    if guard_timeout <= 0.05:
-                        return (url, False, 0, "BUDGET")
+                # Hard guard timeout for the network+read section, also clamped to the global deadline.
+                guard_timeout = min(float(this_total2 + 0.25), max(0.05, float(deadline - time.monotonic() - 0.05)))
+                if guard_timeout <= 0.05:
+                    return (url, False, 0, "BUDGET")
 
-                    async def _net_and_read() -> Tuple[str, bool, int, str]:
-                        async with session.get(
-                            url,
-                            headers=headers,
-                            allow_redirects=False,
-                            timeout=aiohttp.ClientTimeout(total=this_total2, sock_connect=sock_connect_s, sock_read=this_total2),
-                        ) as resp:
-                            # Expect Range response. Fail fast on non-206 to avoid wasting budget on HTML/error bodies.
-                            if resp.status != 206:
-                                try:
-                                    resp.release()
-                                except Exception:
-                                    pass
-                                return (url, False, 0, f"HTTP_{int(getattr(resp, 'status', 0) or 0)}")
-                            want_need = int(stub_len + 1)
-                            if guard and int(max_bytes) < want_need:
-                                return (url, False, int(max_bytes), "MISCONFIG_MAX_BYTES")
+                async def _net_and_read() -> Tuple[str, bool, int, str]:
+                    async with session.get(
+                        url,
+                        headers=headers,
+                        allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=this_total2, sock_connect=sock_connect_s, sock_read=this_total2),
+                    ) as resp:
+                        want_need = int(stub_len + 1)
+                        if guard and int(max_bytes) < want_need:
+                            return (url, False, int(max_bytes), "MISCONFIG_MAX_BYTES")
 
-                            cap = int(max_bytes) + 1
-                            buf = bytearray()
-                            async for chunk in resp.content.iter_chunked(8192):
-                                if not chunk:
-                                    break
-                                remaining_cap = cap - len(buf)
-                                if remaining_cap <= 0:
-                                    break
-                                buf.extend(chunk[:remaining_cap])
-                                if len(buf) >= want_need:
-                                    break
-                            size = len(buf)
+                        cap = int(max_bytes) + 1
+                        buf = bytearray()
+                        async for chunk in resp.content.iter_chunked(8192):
+                            if not chunk:
+                                break
+                            remaining_cap = cap - len(buf)
+                            if remaining_cap <= 0:
+                                break
+                            buf.extend(chunk[:remaining_cap])
+                            if len(buf) >= want_need:
+                                break
+                        size = len(buf)
 
-                            if guard and size > int(max_bytes):
-                                return (url, False, size, "OVERSIZE")
+                        if guard and size > int(max_bytes):
+                            return (url, False, size, "OVERSIZE")
 
-                            if size > stub_len:
-                                return (url, True, size, "REAL")
-                            if size == stub_len:
-                                return (url, False, size, "STUB")
-                            return (url, False, size, "SHORT")
+                        if size > stub_len:
+                            return (url, True, size, "REAL")
+                        if size == stub_len:
+                            return (url, False, size, "STUB")
+                        return (url, False, size, "SHORT")
 
-                    return await asyncio.wait_for(_net_and_read(), timeout=guard_timeout)
-                finally:
-                    try:
-                        sem.release()
-                    except Exception:
-                        pass
+                return await asyncio.wait_for(_net_and_read(), timeout=guard_timeout)
+
             finally:
-                if host_acquired:
-                    try:
-                        host_sem.release()
-                    except Exception:
-                        pass
+                try:
+                    sem.release()
+                except Exception:
+                    pass
 
         except asyncio.TimeoutError:
             if attempt == retries:
@@ -2062,7 +1984,12 @@ def _apply_usenet_playability_probe(
                     continue  # Skip multi-hop proxy/replay URLs
                 urls.append(u)
                 url_to_idx[u] = idx
-            # Preserve original candidate order (do not reorder by URL length).
+
+            # Probe shorter URLs first (more deterministic + matches the manual probe script).
+            try:
+                urls.sort(key=len)
+            except Exception:
+                pass
             # Debug visibility: show what we're actually probing (obfuscated).
             if USENET_PROBE_LOG_URLS:
                 try:
