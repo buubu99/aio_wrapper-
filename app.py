@@ -1805,7 +1805,7 @@ async def _usenet_range_probe_is_real_async(
                             int(range_end or stub_len),
                             int(max_bytes),
                             bool(guard),
-                            deadline=float(deadline),
+                            deadline=float(stop_at),
                             attempt1_timeout_s=float(wave_a1_override or 0.0),
                         )
                     )
@@ -1830,7 +1830,7 @@ async def _usenet_range_probe_is_real_async(
                         res = (u, False, 0, f"FAIL_{type(e).__name__}")
                     if u:
                         results_map[u] = (u, bool(res[1]), int(res[2] or 0), str(res[3]))
-                        if str(res[3]) == "TIMEOUT_HEADERS":
+                        if str(res[3]) in ("TIMEOUT_HEADERS", "TIMEOUT_GUARD"):
                             timeout_hdr_urls.append(u)
 
                 if time.monotonic() >= float(deadline) - 0.10:
@@ -1872,6 +1872,11 @@ async def _usenet_range_probe_is_real_async(
                     break
 
             if retry_urls and (time.monotonic() < float(deadline) - 0.25):
+                try:
+                    logger.info("USENET_PROBE_HYBRID rid=%s phase=retry th=%s cap_n=%s retry_urls=%s a2=%.2f", _rid(), int(th), int(cap_n), int(len(retry_urls)), float(a2_s))
+                except Exception:
+                    pass
+
                 await _run_wave(
                     retry_urls,
                     wave_timeout_s=float(a2_s),
@@ -2344,13 +2349,19 @@ def _apply_usenet_playability_probe(
                 except Exception:
                     pass
         else:
-            if str(reason) in ("STUB_LEN", "STUB", "SHORT") or str(reason).startswith("SHORT_"):
+            rs = str(reason)
+            # IMPORTANT semantics: timeouts are "unfinished" work, not hard ERR.
+            # Keep the specific reason in usenet_probe_reason for debugging and hybrid retries.
+            if rs.startswith("TIMEOUT_") or rs in ("MAX_RETRIES",):
+                budget_idx.append(i)
+                m["usenet_probe"] = "BUDGET"
+            elif rs in ("STUB_LEN", "STUB", "SHORT") or rs.startswith("SHORT_"):
                 stub_idx.append(i)
                 m["usenet_probe"] = "STUB"
             else:
                 err_idx.append(i)
                 m["usenet_probe"] = "ERR"
-            m["usenet_probe_reason"] = str(reason)
+            m["usenet_probe_reason"] = rs
             m["usenet_probe_bytes"] = int(nbytes or 0)
 
     drop_idx = set()
