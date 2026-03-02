@@ -2006,27 +2006,23 @@ async def _usenet_range_probe_is_real_async(
             else:
                 results.append((u, False, 0, "BUDGET"))
 
-        # Emit authoritative partial summary
+                # Emit authoritative partial summary
         try:
-            _total = int(len(tasks))
-            _done = int(len(done))
-            _pending = int(len(pending))
+            _total = int(len(urls))
+            _attempted = int(len(last_map))  # urls that produced at least one result (attempted)
+            _pending = max(0, _total - _attempted)
             _budget = 0
             for (_u, _ok, _sz, _rs) in (results or []):
                 if str(_rs).upper().startswith("BUDGET"):
                     _budget += 1
             _tested = max(0, _total - int(_budget))
-            _msg = f"PROBE_PARTIAL: done={_done}/{_total} in {float(min(_elapsed, float(budget_s))):.2f} s (tested={_tested} budget={int(_budget)} pending={_pending})"
+            _msg = f"PROBE_PARTIAL: done={_attempted}/{_total} in {float(min(_elapsed, float(budget_s))):.2f} s (tested={_tested} budget={int(_budget)} pending={int(_pending)})"
         except Exception:
-            _msg = f"PROBE_PARTIAL: done={int(len(done))}/{int(len(tasks))} in {float(min(_elapsed, float(budget_s))):.2f} s"
+            _msg = f"PROBE_PARTIAL: done=?/{int(len(urls))} in {float(min(_elapsed, float(budget_s))):.2f} s"
         try:
             logger.info(_msg)
         except Exception:
-            try:
-                print(_msg)
-            except Exception:
-                pass
-
+            pass
 
     return results
 
