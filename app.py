@@ -651,6 +651,41 @@ if VERIFY_DROP_STUBS and not VERIFY_STUB_MAX_BYTES_RAW:
 # ---------- FETCH EXECUTOR + AIO CACHE ----------
 WRAP_FETCH_WORKERS = int(os.getenv("WRAP_FETCH_WORKERS") or os.getenv("FETCH_WORKERS") or "8")
 
+# Dedicated probe executor (so usenet probe does not queue behind fetch tasks under load)
+WRAP_PROBE_WORKERS = int(os.getenv("WRAP_PROBE_WORKERS") or "2")
+
+_PROBE_EXECUTOR = None
+_PROBE_EXECUTOR_PID = None
+_PROBE_EXECUTOR_LOCK = threading.Lock()
+
+def _get_probe_executor() -> ThreadPoolExecutor:
+    """Fork-safe per-worker executor for the usenet probe pipeline.
+
+    Keep this small to avoid overloading upstream proxy; concurrency is also governed inside the probe.
+    """
+    global _PROBE_EXECUTOR, _PROBE_EXECUTOR_PID
+    pid = os.getpid()
+    with _PROBE_EXECUTOR_LOCK:
+        if _PROBE_EXECUTOR is None or _PROBE_EXECUTOR_PID != pid:
+            try:
+                if _PROBE_EXECUTOR is not None:
+                    _PROBE_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                try:
+                    if _PROBE_EXECUTOR is not None:
+                        _PROBE_EXECUTOR.shutdown(wait=False)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            _PROBE_EXECUTOR = ThreadPoolExecutor(
+                max_workers=WRAP_PROBE_WORKERS,
+                thread_name_prefix="wrapprobe",
+            )
+            _PROBE_EXECUTOR_PID = pid
+        return _PROBE_EXECUTOR
+
+
 # Fork-safe per-worker fetch executor (Gunicorn may preload/fork).
 _FETCH_EXECUTOR = None
 _FETCH_EXECUTOR_PID = None
@@ -1583,6 +1618,138 @@ def sniff_magic(data: bytes) -> str:
         return "unknown"
 
 
+# ---------------------------
+# Usenet probe concurrency governor (per worker-process)
+# We cannot coordinate across Render workers, but we CAN avoid melting the proxy
+# when multiple /stream requests overlap in the same process.
+# ---------------------------
+_USENET_PROBE_ACTIVE_LOCK = threading.Lock()
+_USENET_PROBE_ACTIVE = 0
+
+def _usenet_probe_active_inc() -> int:
+    global _USENET_PROBE_ACTIVE
+    try:
+        with _USENET_PROBE_ACTIVE_LOCK:
+            _USENET_PROBE_ACTIVE += 1
+            return int(_USENET_PROBE_ACTIVE)
+    except Exception:
+        return 1
+
+def _usenet_probe_active_dec() -> int:
+    global _USENET_PROBE_ACTIVE
+    try:
+        with _USENET_PROBE_ACTIVE_LOCK:
+            _USENET_PROBE_ACTIVE = max(0, int(_USENET_PROBE_ACTIVE) - 1)
+            return int(_USENET_PROBE_ACTIVE)
+    except Exception:
+        return 0
+
+def _usenet_probe_active_get() -> int:
+    try:
+        with _USENET_PROBE_ACTIVE_LOCK:
+            return int(_USENET_PROBE_ACTIVE)
+    except Exception:
+        return 0
+
+
+async def _probe_once(
+    session: aiohttp.ClientSession,
+    url: str,
+    sem: asyncio.Semaphore,
+    *,
+    attempt_no: int,
+    total_timeout_s: float,
+    stub_len: int,
+    range_end: int,
+    max_bytes: int,
+    guard: bool,
+    deadline: float,
+) -> Tuple[str, bool, int, str]:
+    """Single probe attempt (no per-URL retry loop).
+
+    Reasons are kept backward-compatible with existing downstream logic:
+      REAL / STUB / SHORT / BUDGET / FAIL_TimeoutError / FAIL_<ExcName>
+    """
+    try:
+        remaining = float(deadline - time.monotonic())
+        if remaining <= 0.35:
+            return (url, False, 0, "BUDGET")
+
+        # Clamp per-attempt timeout to remaining budget (leave margin).
+        this_total = float(total_timeout_s)
+        this_total = min(this_total, max(0.10, remaining - 0.15))
+        if this_total <= 0.10:
+            return (url, False, 0, "BUDGET")
+
+        # Keep connect phase snappy (attempt #1 slightly tighter).
+        sock_connect_s = min(1.5, this_total) if int(attempt_no) == 1 else min(2.0, this_total)
+        headers = {"Range": f"bytes=0-{int(range_end)}", "Accept-Encoding": "identity"}
+
+        # Acquire a concurrency slot (not counted as FAIL_TimeoutError).
+        await sem.acquire()
+        try:
+            remaining2 = float(deadline - time.monotonic())
+            if remaining2 <= 0.35:
+                return (url, False, 0, "BUDGET")
+
+            this_total2 = min(float(this_total), max(0.10, remaining2 - 0.15))
+            if this_total2 <= 0.10:
+                return (url, False, 0, "BUDGET")
+
+            guard_timeout = min(float(this_total2 + 0.25), max(0.05, float(deadline - time.monotonic() - 0.05)))
+            if guard_timeout <= 0.05:
+                return (url, False, 0, "BUDGET")
+
+            async def _net_and_read() -> Tuple[str, bool, int, str]:
+                async with session.get(
+                    url,
+                    headers=headers,
+                    allow_redirects=True,
+                    timeout=aiohttp.ClientTimeout(total=this_total2, sock_connect=sock_connect_s, sock_read=this_total2),
+                ) as resp:
+                    want_need = int(stub_len + 1)
+                    if guard and int(max_bytes) < want_need:
+                        return (url, False, int(max_bytes), "MISCONFIG_MAX_BYTES")
+
+                    cap = int(max_bytes) + 1
+                    buf = bytearray()
+                    async for chunk in resp.content.iter_chunked(8192):
+                        if not chunk:
+                            break
+                        remaining_cap = cap - len(buf)
+                        if remaining_cap <= 0:
+                            break
+                        buf.extend(chunk[:remaining_cap])
+                        if len(buf) >= want_need:
+                            break
+
+                    size = int(len(buf))
+
+                    if guard and size > int(max_bytes):
+                        return (url, False, size, "OVERSIZE")
+
+                    if size > int(stub_len):
+                        return (url, True, size, "REAL")
+                    if size == int(stub_len):
+                        return (url, False, size, "STUB")
+                    return (url, False, size, "SHORT")
+
+            return await asyncio.wait_for(_net_and_read(), timeout=float(guard_timeout))
+
+        finally:
+            try:
+                sem.release()
+            except Exception:
+                pass
+
+    except asyncio.TimeoutError:
+        return (url, False, 0, "FAIL_TimeoutError")
+    except asyncio.CancelledError:
+        return (url, False, 0, "BUDGET")
+    except Exception as e:
+        return (url, False, 0, f"FAIL_{type(e).__name__}")
+
+
 async def _usenet_range_probe_is_real_async(
     urls: List[str],
     concurrency: int = 30,
@@ -1594,189 +1761,346 @@ async def _usenet_range_probe_is_real_async(
     guard: bool = True,
     budget_s: float = 8.5,  # Default from env; pass actual from os.environ
 ) -> List[Tuple[str, bool, int, str]]:
+    """Probe a list of URLs to determine if they are real or stubs.
+
+    v18 behavior (fixes v17 regression):
+      - Keep the concurrency governor/backoff (cap ~8; busy backoff ~6).
+      - Restore per-URL immediate retry loop (so attempt #2 can happen early, not only at the end of the budget).
+        This matches the more stable behavior you observed pre-v17 and avoids "round1 consumes whole budget so round2 never runs".
+      - Preserve budget semantics: pending at wall and too-late attempts become BUDGET, not FAIL_TimeoutError.
     """
-    Asynchronously probe a list of URLs to determine if they are real or stubs.
-    Returns a list of (url, is_real, size, reason) for each URL.
-    Enforces budget_s as a hard timeout, returning partial results if exceeded.
-    """
-    results = []
-    sem = asyncio.Semaphore(concurrency)
-    # Use session-level BasicAuth (matches the user's manual probe). This preserves auth across redirects.
+    if not urls:
+        return []
+
+    # ---- Effective concurrency (governor) ----
+    base_conc = max(1, int(concurrency or 1))
+    try:
+        cap_conc = int(os.getenv("USENET_PROBE_CONCURRENCY_CAP", "8") or 8)
+    except Exception:
+        cap_conc = 8
+    cap_conc = max(1, int(cap_conc))
+
+    try:
+        busy_conc = int(os.getenv("USENET_PROBE_BUSY_CONCURRENCY", "6") or 6)
+    except Exception:
+        busy_conc = 6
+    busy_conc = max(1, int(busy_conc))
+
+    active_now = _usenet_probe_active_get()
+    conc_eff = min(base_conc, cap_conc)
+    conc_why = []
+    if conc_eff != base_conc:
+        conc_why.append("cap")
+    if int(active_now) >= 2:
+        conc_eff2 = min(int(conc_eff), int(busy_conc))
+        if conc_eff2 != conc_eff:
+            conc_why.append("busy_backoff")
+        conc_eff = conc_eff2
+
+    # ---- Per-host throttle ----
+    try:
+        _lph_env = int(os.getenv("USENET_PROBE_LIMIT_PER_HOST", "4") or 4)
+    except Exception:
+        _lph_env = 4
+    eff_lph = max(1, min(int(conc_eff), int(len(urls) or 1), int(_lph_env or 4)))
+
+    # ---- Attempt timeouts ----
+    try:
+        _a1 = float(os.getenv("USENET_PROBE_ATTEMPT1_TIMEOUT_S", "0") or 0.0)
+    except Exception:
+        _a1 = 0.0
+    attempt1_s = float(timeout_s)
+    if _a1 and _a1 > 0:
+        attempt1_s = max(0.5, min(float(timeout_s), float(_a1)))
+    attempt2_s = float(timeout_s)
+
+    # Small retry cooldown (matches older stable behavior).
+    try:
+        retry_sleep_s = float(os.getenv("USENET_PROBE_RETRY_SLEEP_S", "0.30") or 0.30)
+    except Exception:
+        retry_sleep_s = 0.30
+    retry_sleep_s = max(0.0, min(1.0, float(retry_sleep_s)))
+
+    eff_retries = max(1, int(retries or 1))
+
+    # ---- Auth (same as prior) ----
     _auth = None
     try:
-        # Prefer explicit PROV2_AUTH; otherwise fall back to the wrapper's main AIO auth.
         _auth_str = (PROV2_AUTH or "") or (AIO_AUTH or "") or os.environ.get("PROV2_AUTH", "") or os.environ.get("AIOSTREAMS_AUTH", "") or os.environ.get("AIO_AUTH", "")
         if _auth_str and ":" in _auth_str:
             _u, _p = _auth_str.split(":", 1)
             _auth = aiohttp.BasicAuth(_u, _p)
     except Exception:
         _auth = None
-    # Per-host concurrency is the true throttle when all URLs share one host.
-    # Default stays 4 to preserve current behavior; raise via USENET_PROBE_LIMIT_PER_HOST.
+
     try:
-        _lph_env = int(os.getenv("USENET_PROBE_LIMIT_PER_HOST", "4") or 4)
-    except Exception:
-        _lph_env = 4
-    eff_lph = max(1, min(int(concurrency), int(len(urls) or 1), int(_lph_env or 4)))
-    try:
-        logger.info("USENET_PROBE_CONN rid=%s conc=%s lph=%s budget_s=%.2f timeout_s=%.2f retries=%s",
-                    _rid(), int(concurrency), int(eff_lph), float(budget_s), float(timeout_s), int(retries))
+        logger.info(
+            "USENET_PROBE_CONN rid=%s ver=v22 active=%s conc_in=%s conc_eff=%s lph=%s budget_s=%.2f a1=%.2f a2=%.2f retries=%s why=%s",
+            _rid(), int(active_now), int(base_conc), int(conc_eff), int(eff_lph), float(budget_s),
+            float(attempt1_s), float(attempt2_s), int(eff_retries), conc_why,
+        )
     except Exception:
         pass
+
     connector = aiohttp.TCPConnector(
-        limit=max(int(concurrency), int(eff_lph)),
+        limit=max(int(conc_eff), int(eff_lph)),
         limit_per_host=int(eff_lph),
         ttl_dns_cache=300,
         keepalive_timeout=30,
     )
+
+    sem = asyncio.Semaphore(int(conc_eff))
+    deadline = float(time.monotonic()) + float(budget_s)
+
+    results: List[Tuple[str, bool, int, str]] = []
+    task_url: Dict[asyncio.Task, str] = {}
+
     async with aiohttp.ClientSession(auth=_auth, connector=connector) as session:
-        tasks: List[asyncio.Task] = []
-        task_url: Dict[asyncio.Task, str] = {}
-
-        # Stallguard v3: deadline for budget-aware per-attempt timeouts
-        _deadline = time.monotonic() + float(budget_s)
-
-        # Optional PREWARM to manufacture the "2nd request is better" effect inside the first request.
-        # This is intentionally tiny: touch a few URLs with Range 0-0 using the SAME session/connector,
-        # so subsequent probes benefit from warmed DNS/TLS/connection/redirect path.
+        # ---- PREWARM (manufacture warm-proxy effect for first request) ----
+        # Proven by local script: a tiny touch phase (Range 0-0) dramatically reduces BUDGET on the first run.
         try:
-            _pw_enable = (os.getenv("USENET_PROBE_PREWARM_ENABLE", "false") or "false").strip().lower() in ("1","true","yes","y","on")
+            _pw_enable = str(os.getenv("USENET_PROBE_PREWARM_ENABLE", "false") or "false").lower() in ("1","true","yes","on")
         except Exception:
             _pw_enable = False
-        if _pw_enable and urls:
+        if _pw_enable:
             try:
                 _pw_n = int(os.getenv("USENET_PROBE_PREWARM_N", "8") or 8)
             except Exception:
                 _pw_n = 8
+            _pw_n = max(0, min(int(_pw_n), int(len(urls))))
             try:
                 _pw_wall = float(os.getenv("USENET_PROBE_PREWARM_WALL_S", "1.2") or 1.2)
             except Exception:
                 _pw_wall = 1.2
+            _pw_wall = max(0.1, min(3.0, float(_pw_wall)))
             try:
-                _pw_timeout = float(os.getenv("USENET_PROBE_PREWARM_TIMEOUT_S", "0.6") or 0.6)
+                _pw_to = float(os.getenv("USENET_PROBE_PREWARM_TIMEOUT_S", "0.6") or 0.6)
             except Exception:
-                _pw_timeout = 0.6
-            try:
-                _pw_range = (os.getenv("USENET_PROBE_PREWARM_RANGE", "bytes=0-0") or "bytes=0-0").strip()
-            except Exception:
+                _pw_to = 0.6
+            _pw_to = max(0.15, min(1.5, float(_pw_to)))
+            _pw_range = str(os.getenv("USENET_PROBE_PREWARM_RANGE", "bytes=0-0") or "bytes=0-0").strip()
+            if not _pw_range.lower().startswith("bytes="):
                 _pw_range = "bytes=0-0"
-            # Clamp so PREWARM can never eat the whole budget even if misconfigured.
-            _pw_wall = max(0.10, min(float(_pw_wall), float(budget_s) * 0.25))
-            _pw_timeout = max(0.10, min(float(_pw_timeout), float(_pw_wall)))
-            _pw_n = max(0, min(int(_pw_n), int(len(urls))))
-            if _pw_n > 0 and _pw_wall > 0.10:
-                _pw_t0 = time.perf_counter()
-                _pw_deadline = time.monotonic() + float(_pw_wall)
-                _pw_sem = asyncio.Semaphore(max(1, min(int(concurrency), int(eff_lph), int(_pw_n))))
-                _pw_headers = {
-                    "Range": str(_pw_range),
-                    "Accept": "*/*",
-                    "Accept-Encoding": "identity",
-                    "User-Agent": "Mozilla/5.0",
-                }
-
-                async def _pw_touch(_u: str) -> None:
-                    # Best-effort only; never raises.
+            try:
+                _pw_conc_env = int(os.getenv("USENET_PROBE_PREWARM_CONC", "8") or 8)
+            except Exception:
+                _pw_conc_env = 8
+            _pw_conc = max(1, min(int(_pw_conc_env), int(conc_eff), int(eff_lph), 16))
+            # Keep prewarm inside the same global budget wall.
+            _pw_deadline = float(time.monotonic()) + float(min(_pw_wall, max(0.1, float(deadline - time.monotonic() - 0.35))))
+            _pw_sem = asyncio.Semaphore(int(_pw_conc))
+            _pw_sel = list(urls[:int(_pw_n)])
+        
+            async def _pw_touch(u: str) -> None:
+                if float(_pw_deadline - time.monotonic()) <= 0.05:
+                    return
+                async with _pw_sem:
+                    rem = float(_pw_deadline - time.monotonic())
+                    if rem <= 0.05:
+                        return
+                    tot = min(float(_pw_to), rem)
+                    headers = {
+                        "Range": _pw_range,
+                        "Accept": "*/*",
+                        "Accept-Encoding": "identity",
+                        "User-Agent": "Mozilla/5.0",
+                    }
                     try:
-                        if time.monotonic() >= _pw_deadline:
-                            return
-                        # Also respect the overall probe budget wall.
-                        if float(_deadline - time.monotonic()) <= 0.35:
-                            return
-                        await _pw_sem.acquire()
-                        try:
-                            rem = float(_pw_deadline - time.monotonic())
-                            if rem <= 0.05:
-                                return
-                            tot = min(float(_pw_timeout), max(0.10, rem))
-                            async with session.get(
-                                _u,
-                                headers=_pw_headers,
-                                allow_redirects=True,
-                                timeout=aiohttp.ClientTimeout(total=tot, sock_connect=min(1.0, tot), sock_read=tot),
-                            ) as _r:
-                                _r.release()
-                        finally:
-                            try:
-                                _pw_sem.release()
-                            except Exception:
-                                pass
+                        async with session.get(
+                            u,
+                            headers=headers,
+                            allow_redirects=True,
+                            timeout=aiohttp.ClientTimeout(total=tot, sock_connect=min(1.0, tot), sock_read=tot),
+                        ) as resp:
+                            resp.release()
                     except Exception:
                         return
-
-                _pw_sel = urls[:_pw_n]
-                _pw_tasks = [asyncio.create_task(_pw_touch(_u)) for _u in _pw_sel]
-                try:
-                    _pw_done, _pw_pending = await asyncio.wait(_pw_tasks, timeout=float(_pw_wall))
-                except Exception:
-                    _pw_done, _pw_pending = set(), set()
-                # Cancel anything still pending and ALWAYS collect results to avoid "Task exception was never retrieved".
-                for _t in list(_pw_pending or []):
-                    try:
-                        _t.cancel()
-                    except Exception:
-                        pass
-                _ = await asyncio.gather(*_pw_tasks, return_exceptions=True)
-                _pw_ms = int((time.perf_counter() - _pw_t0) * 1000)
-                try:
-                    logger.info("USENET_PROBE_PREWARM rid=%s touched=%s ms=%s", _rid(), int(len(_pw_sel)), int(_pw_ms))
-                except Exception:
-                    pass
-
-        for url in urls:
-            t = asyncio.create_task(
-                _probe_single(session, url, sem, retries, timeout_s, stub_len, range_end or stub_len, max_bytes, guard, deadline=_deadline)
-            )
-            tasks.append(t)
-            task_url[t] = url
-
-        # Wait for all with overall budget timeout (partial results if exceeded)
-        _t0 = time.monotonic()
-        done, pending = await asyncio.wait(tasks, timeout=budget_s)
-        _elapsed = time.monotonic() - _t0
-
-        for t in done:
-            u = task_url.get(t, "")
+        
+            _pw_t0 = time.monotonic()
+            _pw_tasks = [asyncio.create_task(_pw_touch(u)) for u in _pw_sel]
             try:
-                res = t.result()
-                if res:
-                    results.append(res)
-            except Exception as e:
-                logger.warning("PROBE_EXC url=%s err=%s", u, type(e).__name__)
-                if u:
-                    results.append((u, False, 0, f"FAIL_{type(e).__name__}"))
+                await asyncio.wait(_pw_tasks, timeout=float(_pw_wall))
+                await asyncio.gather(*_pw_tasks, return_exceptions=True)
+            except Exception:
+                pass
+            _pw_ms = int((time.monotonic() - _pw_t0) * 1000)
+            try:
+                logger.info("USENET_PROBE_PREWARM rid=%s ver=v22 touched=%s conc=%s ms=%s", _rid(), int(_pw_n), int(_pw_conc), int(_pw_ms))
+            except Exception:
+                pass
+        
 
-        # Cancel pending to enforce budget; caller will treat missing URLs as BUDGET
-        for t in pending:
+        async def one_url(u: str) -> Tuple[str, bool, int, str]:
+            # Immediate retry loop per URL (attempt #2 can happen early).
+            last = (u, False, 0, "BUDGET")
+            for attempt in range(1, int(eff_retries) + 1):
+                # remaining global budget
+                rem = float(deadline - time.monotonic())
+                if rem <= 0.35:
+                    return (u, False, 0, "BUDGET")
+
+                this_timeout = float(attempt1_s) if attempt == 1 else float(attempt2_s)
+                res = await _probe_once(
+                    session,
+                    u,
+                    sem,
+                    attempt_no=int(attempt),
+                    total_timeout_s=float(this_timeout),
+                    stub_len=int(stub_len),
+                    range_end=int(range_end or stub_len),
+                    max_bytes=int(max_bytes),
+                    guard=bool(guard),
+                    deadline=float(deadline),
+                )
+
+                last = res
+                rs = str(res[3])
+
+                # Success or short/stub are terminal.
+                if rs in ("REAL", "STUB", "SHORT"):
+                    return res
+
+                # Budget is terminal.
+                if rs.upper().startswith("BUDGET"):
+                    return res
+
+                # Retry only for FAIL_* if we still have attempts left.
+                if attempt < int(eff_retries) and rs.startswith("FAIL_"):
+                    if retry_sleep_s > 0:
+                        await asyncio.sleep(float(retry_sleep_s))
+                    continue
+
+                return res
+            return last
+
+
+        # ---- Fair coverage-first with early retries (hybrid scheduler) ----
+        # Goal: maximize UNIQUE urls tested within budget. We avoid spending early time on retries
+        # when there are still many URLs that haven't had attempt #1 yet, but we still allow
+        # retries to happen before the global wall if time permits.
+        from collections import defaultdict, deque
+
+        attempts = defaultdict(int)   # url -> attempt count
+        last_map: Dict[str, Tuple[str, bool, int, str]] = {}
+        final_map: Dict[str, Tuple[str, bool, int, str]] = {}
+
+        primary = deque(list(urls))
+        retryq  = deque()
+
+        q_lock = asyncio.Lock()
+
+        async def _pop_next() -> Optional[str]:
+            async with q_lock:
+                if primary:
+                    return primary.popleft()
+                if retryq:
+                    return retryq.popleft()
+                return None
+
+        async def _push_retry(u: str, *, front: bool = False) -> None:
+            async with q_lock:
+                if front:
+                    retryq.appendleft(u)
+                else:
+                    retryq.append(u)
+
+        async def worker() -> None:
+            while True:
+                # Global wall check (small margin)
+                if float(deadline - time.monotonic()) <= 0.35:
+                    return
+                u = await _pop_next()
+                if not u:
+                    return
+                if u in final_map:
+                    continue
+
+                attempts[u] += 1
+                attempt_no = int(attempts[u])
+
+                this_timeout = float(attempt1_s) if attempt_no == 1 else float(attempt2_s)
+                res = await _probe_once(
+                    session,
+                    u,
+                    sem,
+                    attempt_no=attempt_no,
+                    total_timeout_s=float(this_timeout),
+                    stub_len=int(stub_len),
+                    range_end=int(range_end or stub_len),
+                    max_bytes=int(max_bytes),
+                    guard=bool(guard),
+                    deadline=float(deadline),
+                )
+
+                last_map[u] = res
+                rs = str(res[3])
+
+                # Terminal outcomes
+                if rs in ("REAL", "STUB", "SHORT") or rs.upper().startswith("BUDGET") or attempt_no >= int(eff_retries):
+                    final_map[u] = res
+                    continue
+
+                # Retry policy:
+                # - Retry only FAIL_* outcomes.
+                # - If there are still primary URLs left, enqueue retry to the back (coverage-first).
+                # - If primary is empty, allow immediate retry (front) so we can finish within budget.
+                if rs.startswith("FAIL_") and attempt_no < int(eff_retries):
+                    # If we are very close to the wall, don't schedule a retry that can't finish.
+                    rem = float(deadline - time.monotonic())
+                    if rem <= max(0.75, float(retry_sleep_s) + 0.50):
+                        final_map[u] = res
+                        continue
+
+                    async with q_lock:
+                        has_primary = bool(primary)
+                    await _push_retry(u, front=(not has_primary))
+                    if retry_sleep_s > 0:
+                        await asyncio.sleep(float(retry_sleep_s))
+                    continue
+
+                final_map[u] = res
+
+        # Run a fixed worker pool.
+        workers = [asyncio.create_task(worker()) for _ in range(int(conc_eff))]
+        _t0 = time.monotonic()
+        donew, pendingw = await asyncio.wait(workers, timeout=float(budget_s))
+        _elapsed = float(time.monotonic() - _t0)
+        for t in pendingw:
             t.cancel()
-        if pending:
-            _ = await asyncio.gather(*pending, return_exceptions=True)
+        if pendingw:
+            _ = await asyncio.gather(*pendingw, return_exceptions=True)
 
-        # Ensure we always return a result for every URL.
-        # Any URL still pending at the budget wall is reported as BUDGET.
-        try:
-            for t in pending:
-                u = task_url.get(t, "")
-                if u:
-                    results.append((u, False, 0, "BUDGET"))
-        except Exception:
-            pass
+        # Build ordered results for all urls. Anything not finalized is BUDGET unless we have a last attempt.
+        for u in urls:
+            if u in final_map:
+                results.append(final_map[u])
+            elif u in last_map:
+                results.append(last_map[u])
+            else:
+                results.append((u, False, 0, "BUDGET"))
 
-        # Emit a single authoritative line that is internally consistent:
-        # - done/pending are asyncio task states at the wall
-        # - tested/budget are semantic outcomes (budget includes early BUDGET returns + pending-at-wall)
+        # Emit authoritative partial summary (internally consistent)
         try:
-            _total = int(len(tasks))
-            _done = int(len(done))
-            _pending = int(len(pending))
+            _total = int(len(urls))
+            _attempted = int(len(last_map))
+            _pending = max(0, _total - _attempted)
+            _ok = 0
+            _timeout = 0
             _budget = 0
-            for (_u, _ok, _sz, _rs) in (results or []):
-                if str(_rs).upper().startswith("BUDGET"):
+            for (_u, _okb, _sz, _rs) in (results or []):
+                rs = str(_rs)
+                if rs in ("REAL", "STUB", "SHORT"):
+                    _ok += 1
+                elif rs.upper().startswith("BUDGET"):
                     _budget += 1
-            _tested = max(0, _total - int(_budget))
-            _msg = f"PROBE_PARTIAL: done={_done}/{_total} in {float(min(_elapsed, float(budget_s))):.2f} s (tested={_tested} budget={int(_budget)} pending={_pending})"
+                elif rs.startswith("FAIL_TimeoutError") or rs.startswith("FAIL_"):
+                    _timeout += 1
+            _msg = (
+                f"PROBE_PARTIAL: done={_attempted}/{_total} in {float(min(_elapsed, float(budget_s))):.2f} s "
+                f"(ok={_ok} timeout={_timeout} budget={_budget} pending={_pending})"
+            )
         except Exception:
-            _msg = f"PROBE_PARTIAL: done={int(len(done))}/{int(len(tasks))} in {float(min(_elapsed, float(budget_s))):.2f} s"
+            _msg = f"PROBE_PARTIAL: done=?/{int(len(urls))} in {float(min(_elapsed, float(budget_s))):.2f} s"
         try:
             logger.info(_msg)
         except Exception:
@@ -1784,122 +2108,6 @@ async def _usenet_range_probe_is_real_async(
 
     return results
 
-async def _probe_single(
-    session: aiohttp.ClientSession,
-    url: str,
-    sem: asyncio.Semaphore,
-    retries: int,
-    timeout_s: float,
-    stub_len: int,
-    range_end: int,
-    max_bytes: int,
-    guard: bool,
-    *,
-    deadline: float,
-) -> Tuple[str, bool, int, str]:
-    # Stallguard v4: IMPORTANT semantic fix
-    # - We do NOT include semaphore waiting inside the hard wait_for guard.
-    #   Waiting for a slot is not a "probe attempt" and should not be counted as FAIL_TimeoutError.
-    # - We acquire the semaphore first, then hard-guard only the network+read section.
-    # This prevents "33 FAIL_TimeoutError" from tasks that never got a slot.
-
-    try:
-        _a1 = float(os.getenv("USENET_PROBE_ATTEMPT1_TIMEOUT_S", "0") or 0.0)
-    except Exception:
-        _a1 = 0.0
-
-    for attempt in range(1, retries + 1):
-        try:
-            # Remaining global budget for this task.
-            remaining = float(deadline - time.monotonic())
-            if remaining <= 0.35:
-                return (url, False, 0, "BUDGET")
-
-            # Attempt timeout base (attempt #1 can be shorter if configured).
-            this_total = float(timeout_s)
-            if attempt == 1 and _a1 and _a1 > 0:
-                this_total = max(0.5, min(float(timeout_s), float(_a1)))
-
-            # Clamp attempt timeout to remaining budget (leave margin).
-            this_total = min(this_total, max(0.10, remaining - 0.15))
-            if this_total <= 0.10:
-                return (url, False, 0, "BUDGET")
-
-            # Keep connect phase snappy.
-            sock_connect_s = min(2.0, this_total) if attempt > 1 else min(1.5, this_total)
-            headers = {"Range": f"bytes=0-{range_end}"}
-
-            # Acquire the per-attempt concurrency slot.
-            # If the batch hits the overall wall while waiting here, CancelledError will be mapped to BUDGET below.
-            await sem.acquire()
-            try:
-                # Recompute remaining after waiting for a slot.
-                remaining2 = float(deadline - time.monotonic())
-                if remaining2 <= 0.35:
-                    return (url, False, 0, "BUDGET")
-
-                # Re-clamp for the actual network section.
-                this_total2 = min(float(this_total), max(0.10, remaining2 - 0.15))
-                if this_total2 <= 0.10:
-                    return (url, False, 0, "BUDGET")
-
-                # Hard guard timeout for the network+read section, also clamped to the global deadline.
-                guard_timeout = min(float(this_total2 + 0.25), max(0.05, float(deadline - time.monotonic() - 0.05)))
-                if guard_timeout <= 0.05:
-                    return (url, False, 0, "BUDGET")
-
-                async def _net_and_read() -> Tuple[str, bool, int, str]:
-                    async with session.get(
-                        url,
-                        headers=headers,
-                        allow_redirects=True,
-                        timeout=aiohttp.ClientTimeout(total=this_total2, sock_connect=sock_connect_s, sock_read=this_total2),
-                    ) as resp:
-                        want_need = int(stub_len + 1)
-                        if guard and int(max_bytes) < want_need:
-                            return (url, False, int(max_bytes), "MISCONFIG_MAX_BYTES")
-
-                        cap = int(max_bytes) + 1
-                        buf = bytearray()
-                        async for chunk in resp.content.iter_chunked(8192):
-                            if not chunk:
-                                break
-                            remaining_cap = cap - len(buf)
-                            if remaining_cap <= 0:
-                                break
-                            buf.extend(chunk[:remaining_cap])
-                            if len(buf) >= want_need:
-                                break
-                        size = len(buf)
-
-                        if guard and size > int(max_bytes):
-                            return (url, False, size, "OVERSIZE")
-
-                        if size > stub_len:
-                            return (url, True, size, "REAL")
-                        if size == stub_len:
-                            return (url, False, size, "STUB")
-                        return (url, False, size, "SHORT")
-
-                return await asyncio.wait_for(_net_and_read(), timeout=guard_timeout)
-
-            finally:
-                try:
-                    sem.release()
-                except Exception:
-                    pass
-
-        except asyncio.TimeoutError:
-            if attempt == retries:
-                return (url, False, 0, "FAIL_TimeoutError")
-            await asyncio.sleep(0.3)
-        except asyncio.CancelledError:
-            return (url, False, 0, "BUDGET")
-        except Exception as e:
-            if attempt == retries:
-                return (url, False, 0, f"FAIL_{type(e).__name__}")
-            await asyncio.sleep(0.3)
-    return (url, False, 0, "MAX_RETRIES")
 def _apply_usenet_playability_probe(
     pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
     *,
@@ -2062,14 +2270,9 @@ def _apply_usenet_playability_probe(
 
             # Probe shorter URLs first (more deterministic + matches the manual probe script).
             try:
-                _sort_len = (os.getenv("USENET_PROBE_SORT_BY_LEN", "true") or "true").strip().lower() in ("1","true","yes","y","on")
+                urls.sort(key=len)
             except Exception:
-                _sort_len = True
-            if _sort_len:
-                try:
-                    urls.sort(key=len)
-                except Exception:
-                    pass
+                pass
             # Debug visibility: show what we're actually probing (obfuscated).
             if USENET_PROBE_LOG_URLS:
                 try:
@@ -2122,18 +2325,25 @@ def _apply_usenet_playability_probe(
                     guard=bool(RANGE_PROBE_GUARD),
                     budget_s=float(budget),
                 )
-
-            batch_res = asyncio.run(_main()) if urls else []
+            batch_res = []
+            if urls:
+                _active_probe = _usenet_probe_active_inc()
+                try:
+                    batch_res = asyncio.run(_main())
+                finally:
+                    _ = _usenet_probe_active_dec()
             url_to_res = {u: (bool(ok), int(size or 0), str(reason)) for (u, ok, size, reason) in (batch_res or [])}
             # Small sample of outcomes (first 5) for debugging host/status issues
             try:
                 _samp=[]
                 for (_u,_ok,_sz,_rs) in (batch_res or [])[:5]:
+                    _disp_sz = "-" if str(_rs).upper().startswith("BUDGET") and int((_sz or 0)) == 0 else str(_sz)
                     try:
-                        _p=urlparse(_u)
-                        _samp.append(f"{_p.netloc} {_rs} {_sz}")
+                        _p = urlparse(_u)
+                        _host = _p.netloc or "(bad_url)"
+                        _samp.append(f"{_host} {_rs} {_disp_sz}")
                     except Exception:
-                        _samp.append(f"(bad_url) {_rs} {_sz}")
+                        _samp.append(f"(bad_url) {_rs} {_disp_sz}")
                 if _samp:
                     logger.info("USENET_PROBE_SAMPLE rid=%s sample=%s", _rid(), _samp)
             except Exception:
@@ -2147,22 +2357,9 @@ def _apply_usenet_playability_probe(
                 if _budget_missing:
                     _rc["BUDGET"] += _budget_missing
 
-                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v16 reasons={dict(_rc.most_common(8))}'
+                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v22 reasons={dict(_rc.most_common(8))}'
                 logger.info(_reasons_msg)
-                try:
-                    logging.getLogger("gunicorn.error").info(_reasons_msg)
-                except Exception:
-                    pass
-                try:
-                    sys.stdout.write(_reasons_msg + "\n")
-                    sys.stdout.flush()
-                except Exception:
-                    pass
-                try:
-                    sys.stderr.write(_reasons_msg + "\n")
-                    sys.stderr.flush()
-                except Exception:
-                    pass
+                # Avoid duplicate lines in Render logs: logger output is already captured.
             except Exception as e:
                 try:
                     logger.warning("USENET_PROBE_REASONS_ERR rid=%s err=%s", _rid(), type(e).__name__)
@@ -6568,7 +6765,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                     p2_meta["probe_start_ms"] = int((p2_probe_t0 - t0) * 1000)
             except Exception:
                 pass
-            p2_probe_fut = _get_fetch_executor().submit(_probe_p2_streams_impl, list(p2_streams), _rid())
+            p2_probe_fut = _get_probe_executor().submit(_probe_p2_streams_impl, list(p2_streams), _rid())
         except Exception:
             p2_probe_fut = None
 
