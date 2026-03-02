@@ -1763,10 +1763,10 @@ async def _usenet_range_probe_is_real_async(
 ) -> List[Tuple[str, bool, int, str]]:
     """Probe a list of URLs to determine if they are real or stubs.
 
-    v18 behavior (fixes v17 regression):
+    v20 behavior:
       - Keep the concurrency governor/backoff (cap ~8; busy backoff ~6).
-      - Restore per-URL immediate retry loop (so attempt #2 can happen early, not only at the end of the budget).
-        This matches the more stable behavior you observed pre-v17 and avoids "round1 consumes whole budget so round2 never runs".
+      - Keep the coverage-friendly queue (primary URLs first) and per-URL retry loop.
+      - Add a tiny PREWARM phase (Range 0-0 touches) to manufacture the "second run is better" effect inside the first 12s window.
       - Preserve budget semantics: pending at wall and too-late attempts become BUDGET, not FAIL_TimeoutError.
     """
     if not urls:
@@ -1821,6 +1821,32 @@ async def _usenet_range_probe_is_real_async(
         retry_sleep_s = 0.30
     retry_sleep_s = max(0.0, min(1.0, float(retry_sleep_s)))
 
+
+    # ---- Prewarm (manufacture the "second run is better" effect inside the first request) ----
+    # Mac proof (same title, same 40 URLs):
+    #   COLD tested=16 timeout=7 budget=17
+    #   PREWARM+RUN tested=30 timeout=8 budget=2
+    _prewarm_enable = (os.getenv("USENET_PROBE_PREWARM_ENABLE", "true") or "true").strip().lower() in ("1","true","yes","y","on")
+    try:
+        _prewarm_n = int(os.getenv("USENET_PROBE_PREWARM_N", "8") or 8)
+    except Exception:
+        _prewarm_n = 8
+    _prewarm_n = max(0, min(40, int(_prewarm_n)))
+
+    try:
+        _prewarm_wall_s = float(os.getenv("USENET_PROBE_PREWARM_WALL_S", "1.2") or 1.2)
+    except Exception:
+        _prewarm_wall_s = 1.2
+    _prewarm_wall_s = max(0.0, min(3.0, float(_prewarm_wall_s)))
+
+    try:
+        _prewarm_timeout_s = float(os.getenv("USENET_PROBE_PREWARM_TIMEOUT_S", "0.6") or 0.6)
+    except Exception:
+        _prewarm_timeout_s = 0.6
+    _prewarm_timeout_s = max(0.05, min(2.0, float(_prewarm_timeout_s)))
+
+    _prewarm_range = (os.getenv("USENET_PROBE_PREWARM_RANGE", "bytes=0-0") or "bytes=0-0").strip()
+
     eff_retries = max(1, int(retries or 1))
 
     # ---- Auth (same as prior) ----
@@ -1835,7 +1861,7 @@ async def _usenet_range_probe_is_real_async(
 
     try:
         logger.info(
-            "USENET_PROBE_CONN rid=%s ver=v19 active=%s conc_in=%s conc_eff=%s lph=%s budget_s=%.2f a1=%.2f a2=%.2f retries=%s why=%s",
+            "USENET_PROBE_CONN rid=%s ver=v20 active=%s conc_in=%s conc_eff=%s lph=%s budget_s=%.2f a1=%.2f a2=%.2f retries=%s why=%s",
             _rid(), int(active_now), int(base_conc), int(conc_eff), int(eff_lph), float(budget_s),
             float(attempt1_s), float(attempt2_s), int(eff_retries), conc_why,
         )
@@ -1856,6 +1882,50 @@ async def _usenet_range_probe_is_real_async(
     task_url: Dict[asyncio.Task, str] = {}
 
     async with aiohttp.ClientSession(auth=_auth, connector=connector) as session:
+
+        # --- PREWARM phase (tiny, bounded) ---
+        # Touch a few URLs with Range 0-0 to prime DNS/TLS/proxy-path + upstream cache.
+        # We reuse the SAME aiohttp session/connector so the warm effect carries into the real probe.
+        if _prewarm_enable and _prewarm_n > 0 and _prewarm_wall_s > 0.0:
+            _pw_start = time.perf_counter()
+            _pw_deadline = min(float(deadline), float(time.monotonic() + _prewarm_wall_s))
+            _pw_sem = asyncio.Semaphore(max(1, min(int(conc_eff), int(_prewarm_n))))
+
+            async def _pw_touch(u: str) -> None:
+                if float(_pw_deadline - time.monotonic()) <= 0.05:
+                    return
+                async with _pw_sem:
+                    rem = float(_pw_deadline - time.monotonic())
+                    if rem <= 0.05:
+                        return
+                    tot = min(float(_prewarm_timeout_s), rem)
+                    headers = {
+                        "Range": str(_prewarm_range),
+                        "Accept": "*/*",
+                        "Accept-Encoding": "identity",
+                        "User-Agent": USER_AGENT_BROWSER,
+                    }
+                    try:
+                        async with session.get(
+                            u,
+                            headers=headers,
+                            allow_redirects=True,
+                            timeout=aiohttp.ClientTimeout(total=tot, sock_connect=min(1.0, tot), sock_read=tot),
+                        ) as r:
+                            r.release()
+                    except Exception:
+                        return
+
+            _pw_urls = list(urls[: int(_prewarm_n)])
+            _pw_tasks = [asyncio.create_task(_pw_touch(u)) for u in _pw_urls]
+            _done, _pending = await asyncio.wait(_pw_tasks, timeout=max(0.0, float(_pw_deadline - time.monotonic())))
+            for t in _pending:
+                t.cancel()
+            await asyncio.gather(*_pending, return_exceptions=True)
+
+            _pw_ms = int((time.perf_counter() - _pw_start) * 1000)
+            logger.info("USENET_PROBE_PREWARM touched=%d ms=%d", len(_pw_urls), _pw_ms)
+
 
         async def one_url(u: str) -> Tuple[str, bool, int, str]:
             # Immediate retry loop per URL (attempt #2 can happen early).
@@ -2275,7 +2345,7 @@ def _apply_usenet_playability_probe(
                 if _budget_missing:
                     _rc["BUDGET"] += _budget_missing
 
-                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v19 reasons={dict(_rc.most_common(8))}'
+                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v20 reasons={dict(_rc.most_common(8))}'
                 logger.info(_reasons_msg)
                 # Avoid duplicate lines in Render logs: logger output is already captured.
             except Exception as e:
