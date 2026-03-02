@@ -1835,7 +1835,7 @@ async def _usenet_range_probe_is_real_async(
 
     try:
         logger.info(
-            "USENET_PROBE_CONN rid=%s ver=v18 active=%s conc_in=%s conc_eff=%s lph=%s budget_s=%.2f a1=%.2f a2=%.2f retries=%s why=%s",
+            "USENET_PROBE_CONN rid=%s ver=v19 active=%s conc_in=%s conc_eff=%s lph=%s budget_s=%.2f a1=%.2f a2=%.2f retries=%s why=%s",
             _rid(), int(active_now), int(base_conc), int(conc_eff), int(eff_lph), float(budget_s),
             float(attempt1_s), float(attempt2_s), int(eff_retries), conc_why,
         )
@@ -1900,35 +1900,111 @@ async def _usenet_range_probe_is_real_async(
                 return res
             return last
 
-        tasks = []
-        for u in urls:
-            t = asyncio.create_task(one_url(u))
-            tasks.append(t)
-            task_url[t] = u
 
+        # ---- Fair coverage-first with early retries (hybrid scheduler) ----
+        # Goal: maximize UNIQUE urls tested within budget. We avoid spending early time on retries
+        # when there are still many URLs that haven't had attempt #1 yet, but we still allow
+        # retries to happen before the global wall if time permits.
+        from collections import defaultdict, deque
+
+        attempts = defaultdict(int)   # url -> attempt count
+        last_map: Dict[str, Tuple[str, bool, int, str]] = {}
+        final_map: Dict[str, Tuple[str, bool, int, str]] = {}
+
+        primary = deque(list(urls))
+        retryq  = deque()
+
+        q_lock = asyncio.Lock()
+
+        async def _pop_next() -> Optional[str]:
+            async with q_lock:
+                if primary:
+                    return primary.popleft()
+                if retryq:
+                    return retryq.popleft()
+                return None
+
+        async def _push_retry(u: str, *, front: bool = False) -> None:
+            async with q_lock:
+                if front:
+                    retryq.appendleft(u)
+                else:
+                    retryq.append(u)
+
+        async def worker() -> None:
+            while True:
+                # Global wall check (small margin)
+                if float(deadline - time.monotonic()) <= 0.35:
+                    return
+                u = await _pop_next()
+                if not u:
+                    return
+                if u in final_map:
+                    continue
+
+                attempts[u] += 1
+                attempt_no = int(attempts[u])
+
+                this_timeout = float(attempt1_s) if attempt_no == 1 else float(attempt2_s)
+                res = await _probe_once(
+                    session,
+                    u,
+                    sem,
+                    attempt_no=attempt_no,
+                    total_timeout_s=float(this_timeout),
+                    stub_len=int(stub_len),
+                    range_end=int(range_end or stub_len),
+                    max_bytes=int(max_bytes),
+                    guard=bool(guard),
+                    deadline=float(deadline),
+                )
+
+                last_map[u] = res
+                rs = str(res[3])
+
+                # Terminal outcomes
+                if rs in ("REAL", "STUB", "SHORT") or rs.upper().startswith("BUDGET") or attempt_no >= int(eff_retries):
+                    final_map[u] = res
+                    continue
+
+                # Retry policy:
+                # - Retry only FAIL_* outcomes.
+                # - If there are still primary URLs left, enqueue retry to the back (coverage-first).
+                # - If primary is empty, allow immediate retry (front) so we can finish within budget.
+                if rs.startswith("FAIL_") and attempt_no < int(eff_retries):
+                    # If we are very close to the wall, don't schedule a retry that can't finish.
+                    rem = float(deadline - time.monotonic())
+                    if rem <= max(0.75, float(retry_sleep_s) + 0.50):
+                        final_map[u] = res
+                        continue
+
+                    async with q_lock:
+                        has_primary = bool(primary)
+                    await _push_retry(u, front=(not has_primary))
+                    if retry_sleep_s > 0:
+                        await asyncio.sleep(float(retry_sleep_s))
+                    continue
+
+                final_map[u] = res
+
+        # Run a fixed worker pool.
+        workers = [asyncio.create_task(worker()) for _ in range(int(conc_eff))]
         _t0 = time.monotonic()
-        done, pending = await asyncio.wait(tasks, timeout=float(budget_s))
+        donew, pendingw = await asyncio.wait(workers, timeout=float(budget_s))
         _elapsed = float(time.monotonic() - _t0)
-
-        for t in done:
-            u = task_url.get(t, "")
-            try:
-                res = t.result()
-                if res:
-                    results.append(res)
-            except Exception as e:
-                if u:
-                    results.append((u, False, 0, f"FAIL_{type(e).__name__}"))
-
-        # Cancel pending at budget wall; record BUDGET for them.
-        for t in pending:
+        for t in pendingw:
             t.cancel()
-        if pending:
-            _ = await asyncio.gather(*pending, return_exceptions=True)
-            for t in pending:
-                u = task_url.get(t, "")
-                if u:
-                    results.append((u, False, 0, "BUDGET"))
+        if pendingw:
+            _ = await asyncio.gather(*pendingw, return_exceptions=True)
+
+        # Build ordered results for all urls. Anything not finalized is BUDGET unless we have a last attempt.
+        for u in urls:
+            if u in final_map:
+                results.append(final_map[u])
+            elif u in last_map:
+                results.append(last_map[u])
+            else:
+                results.append((u, False, 0, "BUDGET"))
 
         # Emit authoritative partial summary
         try:
@@ -1946,15 +2022,11 @@ async def _usenet_range_probe_is_real_async(
         try:
             logger.info(_msg)
         except Exception:
-            pass
-        try:
-            logging.getLogger("gunicorn.error").info(_msg)
-        except Exception:
-            pass
-        try:
-            sys.stdout.write(_msg + "\n"); sys.stdout.flush()
-        except Exception:
-            pass
+            try:
+                print(_msg)
+            except Exception:
+                pass
+
 
     return results
 
@@ -2187,11 +2259,13 @@ def _apply_usenet_playability_probe(
             try:
                 _samp=[]
                 for (_u,_ok,_sz,_rs) in (batch_res or [])[:5]:
+                    _disp_sz = "-" if str(_rs).upper().startswith("BUDGET") and int((_sz or 0)) == 0 else str(_sz)
                     try:
-                        _p=urlparse(_u)
-                        _samp.append(f"{_p.netloc} {_rs} {_sz}")
+                        _p = urlparse(_u)
+                        _host = _p.netloc or "(bad_url)"
+                        _samp.append(f"{_host} {_rs} {_disp_sz}")
                     except Exception:
-                        _samp.append(f"(bad_url) {_rs} {_sz}")
+                        _samp.append(f"(bad_url) {_rs} {_disp_sz}")
                 if _samp:
                     logger.info("USENET_PROBE_SAMPLE rid=%s sample=%s", _rid(), _samp)
             except Exception:
@@ -2205,22 +2279,9 @@ def _apply_usenet_playability_probe(
                 if _budget_missing:
                     _rc["BUDGET"] += _budget_missing
 
-                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v17 reasons={dict(_rc.most_common(8))}'
+                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v19 reasons={dict(_rc.most_common(8))}'
                 logger.info(_reasons_msg)
-                try:
-                    logging.getLogger("gunicorn.error").info(_reasons_msg)
-                except Exception:
-                    pass
-                try:
-                    sys.stdout.write(_reasons_msg + "\n")
-                    sys.stdout.flush()
-                except Exception:
-                    pass
-                try:
-                    sys.stderr.write(_reasons_msg + "\n")
-                    sys.stderr.flush()
-                except Exception:
-                    pass
+                # Avoid duplicate lines in Render logs: logger output is already captured.
             except Exception as e:
                 try:
                     logger.warning("USENET_PROBE_REASONS_ERR rid=%s err=%s", _rid(), type(e).__name__)
