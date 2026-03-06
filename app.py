@@ -1721,22 +1721,30 @@ async def _usenet_range_probe_is_real_async(
         _a1 = float(os.getenv("USENET_PROBE_ATTEMPT1_TIMEOUT_S", "0") or 0.0)
     except Exception:
         _a1 = 0.0
+    # Admission gate for starting another probe. Keep this separate from the HTTP
+    # request timeout so the scheduler can continue filling the 12s global window
+    # while each launched request still gets a standalone-like chance to prove REAL.
     first_timeout = float(_a1) if (_a1 and _a1 > 0) else float(timeout_s)
-    first_timeout = max(0.5, min(float(timeout_s), float(first_timeout)))
+    first_timeout = max(0.5, float(first_timeout))
     try:
         retry_sleep_s = float(os.getenv("USENET_PROBE_RETRY_SLEEP_S", "0.30") or 0.30)
     except Exception:
         retry_sleep_s = 0.30
     try:
-        topk_long = int(os.getenv("USENET_PROBE_TOPK_LONG", "12") or 12)
+        http_total_s = float(os.getenv("USENET_PROBE_HTTP_TOTAL_S", "10.0") or 10.0)
     except Exception:
-        topk_long = 12
+        http_total_s = 10.0
     try:
-        topk_timeout = float(os.getenv("USENET_PROBE_TOPK_TIMEOUT_S", str(first_timeout)) or first_timeout)
+        http_connect_s = float(os.getenv("USENET_PROBE_CONNECT_TIMEOUT_S", "6.0") or 6.0)
     except Exception:
-        topk_timeout = float(first_timeout)
-    topk_long = max(0, int(topk_long))
-    topk_timeout = max(float(first_timeout), float(topk_timeout))
+        http_connect_s = 6.0
+    try:
+        http_sock_read_s = float(os.getenv("USENET_PROBE_SOCK_READ_TIMEOUT_S", str(http_total_s)) or http_total_s)
+    except Exception:
+        http_sock_read_s = float(http_total_s)
+    http_total_s = max(0.5, float(http_total_s))
+    http_connect_s = max(0.1, float(http_connect_s))
+    http_sock_read_s = max(0.1, float(http_sock_read_s))
 
     _auth = None
     try:
@@ -1753,8 +1761,8 @@ async def _usenet_range_probe_is_real_async(
         _lph_env = 4
     eff_lph = max(1, min(int(concurrency), int(len(urls) or 1), int(_lph_env or 4)))
     try:
-        logger.info("USENET_PROBE_CONN rid=%s conc=%s lph=%s budget_s=%.2f timeout_s=%.2f retries=%s topk_long=%s topk_timeout=%.2f",
-                    _rid(), int(concurrency), int(eff_lph), float(budget_s), float(timeout_s), int(retries), int(topk_long), float(topk_timeout))
+        logger.info("USENET_PROBE_CONN rid=%s conc=%s lph=%s budget_s=%.2f gate_s=%.2f timeout_s=%.2f http_total_s=%.2f connect_s=%.2f sock_read_s=%.2f retries=%s",
+                    _rid(), int(concurrency), int(eff_lph), float(budget_s), float(first_timeout), float(timeout_s), float(http_total_s), float(http_connect_s), float(http_sock_read_s), int(retries))
     except Exception:
         pass
 
@@ -1774,13 +1782,10 @@ async def _usenet_range_probe_is_real_async(
         pending: Set[asyncio.Task] = set()
         task_meta: Dict[asyncio.Task, str] = {}
         next_idx = 0
+        min_start_s = float(attempt_timeout) + 0.12
 
         def _can_start() -> bool:
-            # Admission must stay based on the normal cheap first-pass timeout. Do NOT let
-            # the longer top-k timeout become a barrier that prevents later candidates from
-            # ever starting (that was the v19 regression back to 8 tested / 32 budget).
-            need = float(attempt_timeout) + 0.12
-            return float(deadline - time.monotonic()) >= float(need)
+            return float(deadline - time.monotonic()) >= float(min_start_s)
 
         def _launch_one() -> bool:
             nonlocal next_idx
@@ -1789,26 +1794,20 @@ async def _usenet_range_probe_is_real_async(
             if not _can_start():
                 return False
             u = todo_urls[next_idx]
-            # Longer timeout is a property of a launched task, not an admission gate.
-            # For the first handful of original-order candidates, use the longer timeout
-            # only when there is enough remaining budget for it; otherwise fall back to
-            # the normal attempt timeout so we keep touching later candidates.
-            remaining = float(deadline - time.monotonic())
-            this_timeout = float(attempt_timeout)
-            if int(attempt_no) == 1 and int(next_idx) < int(topk_long):
-                if remaining >= float(topk_timeout) + 0.12:
-                    this_timeout = float(topk_timeout)
             next_idx += 1
             t = asyncio.create_task(
                 _probe_single(
                     session,
                     u,
                     attempt_no=int(attempt_no),
-                    timeout_s=float(this_timeout),
+                    timeout_s=float(attempt_timeout),
                     stub_len=int(stub_len),
                     range_end=int(range_end or stub_len),
                     stub_fps=stub_fps,
                     deadline=deadline,
+                    http_total_s=float(http_total_s),
+                    connect_timeout_s=float(http_connect_s),
+                    sock_read_timeout_s=float(http_sock_read_s),
                 )
             )
             pending.add(t)
@@ -1953,14 +1952,23 @@ async def _probe_single(
     range_end: int,
     stub_fps: Set[str],
     deadline: float,
+    http_total_s: float,
+    connect_timeout_s: float,
+    sock_read_timeout_s: float,
 ) -> Tuple[str, bool, int, str]:
     remaining = float(deadline - time.monotonic())
     if remaining < float(timeout_s) + 0.12:
         return (url, False, 0, "BUDGET_PRE")
 
     headers = {"Range": f"bytes=0-{int(range_end)}"}
-    sock_connect_s = min(6.0, float(timeout_s))
-    timeout = aiohttp.ClientTimeout(total=float(timeout_s), connect=sock_connect_s, sock_read=float(timeout_s))
+    # Standalone-aligned HTTP timeouts: launched probes get a real chance to prove
+    # themselves (up to ~10s like the standalone script), but never beyond the
+    # global round deadline. The admission gate above still decides whether a new
+    # probe may start.
+    req_total_s = min(float(http_total_s), max(0.25, float(remaining) - 0.05))
+    sock_connect_s = min(float(connect_timeout_s), float(req_total_s))
+    sock_read_s = min(float(sock_read_timeout_s), float(req_total_s))
+    timeout = aiohttp.ClientTimeout(total=float(req_total_s), connect=sock_connect_s, sock_read=float(sock_read_s))
     try:
         async with session.get(url, headers=headers, allow_redirects=True, timeout=timeout) as resp:
             if _probe_is_placeholder_url(str(resp.url)) or _probe_history_has_placeholder(resp):
@@ -2191,9 +2199,9 @@ def _apply_usenet_playability_probe(
                 urls.append(u)
                 url_to_idx[u] = idx
 
-            # Preserve original candidate order. The standalone probe audits the first 40 in
-            # provider order, and under the wrapper's hard 12s budget that top-of-list order
-            # matters more than URL-length heuristics.
+            # Preserve provider/original order. The standalone probe audits the first
+            # 40 in original order, and the early candidates are the strongest REALs
+            # for this source/title combination.
             # Debug visibility: show what we're actually probing (obfuscated).
             if USENET_PROBE_LOG_URLS:
                 try:
