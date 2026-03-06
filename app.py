@@ -1584,6 +1584,106 @@ def sniff_magic(data: bytes) -> str:
 
 
 
+
+_CR_RE_USENET_PROBE = re.compile(r"^\s*bytes\s+\d+\s*-\s*\d+\s*/\s*([0-9*]+)\s*$", re.IGNORECASE)
+_PLACEHOLDER_SUBSTRINGS_USENET_PROBE = ("/static/500.mp4", "static/500.mp4")
+_MIN_TOTAL_BYTES_TO_BE_REAL_USENET_PROBE = 50_000_000
+_READ_BYTES_USENET_PROBE = 4096
+
+def _probe_is_placeholder_url(u: str) -> bool:
+    lu = (u or "").lower()
+    return any(p in lu for p in _PLACEHOLDER_SUBSTRINGS_USENET_PROBE)
+
+
+def _probe_parse_total_from_content_range(cr: Optional[str]) -> Optional[int]:
+    if not cr:
+        return None
+    m = _CR_RE_USENET_PROBE.match(cr)
+    if not m:
+        return None
+    total_s = m.group(1)
+    if total_s == "*" or not total_s.isdigit():
+        return None
+    try:
+        return int(total_s)
+    except Exception:
+        return None
+
+
+def _probe_sha1_8(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()[:8]
+
+
+def _probe_sniff_kind(chunk: bytes) -> str:
+    if not chunk:
+        return "EMPTY"
+    h = chunk[:16]
+    if h.startswith(b"Rar!\x1a\x07"):
+        return "ARCHIVE_RAR"
+    if h.startswith(b"7z\xbc\xaf\x27\x1c"):
+        return "ARCHIVE_7Z"
+    if h.startswith(b"PK\x03\x04") or h.startswith(b"PK\x05\x06") or h.startswith(b"PK\x07\x08"):
+        return "ARCHIVE_ZIP"
+    if h.startswith(b"\x1f\x8b"):
+        return "GZIP"
+    if h.startswith(b"\x1a\x45\xdf\xa3"):
+        return "VIDEO_MKV"
+    if len(chunk) >= 12 and chunk[0:4] == b"RIFF" and chunk[8:12] == b"AVI ":
+        return "VIDEO_AVI"
+    if h[:1] == b"\x47":
+        return "VIDEO_TS_MAYBE"
+    if len(chunk) >= 12 and chunk[4:8] == b"ftyp":
+        return "VIDEO_MP4"
+    s = chunk[:256].lstrip()
+    sl = s.lower()
+    if sl.startswith(b"{") or sl.startswith(b"["):
+        return "TEXT_JSON"
+    if sl.startswith(b"<!doctype") or sl.startswith(b"<html") or b"<html" in sl:
+        return "TEXT_HTML"
+    return "UNKNOWN"
+
+
+def _probe_is_video_kind(k: str) -> bool:
+    return k in ("VIDEO_MKV", "VIDEO_MP4", "VIDEO_AVI", "VIDEO_TS_MAYBE")
+
+
+async def _probe_read_exact_or_eof(resp: aiohttp.ClientResponse, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = await resp.content.read(n - len(buf))
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _probe_history_has_placeholder(resp: aiohttp.ClientResponse) -> bool:
+    for h in getattr(resp, "history", []) or []:
+        try:
+            if _probe_is_placeholder_url(str(h.url)):
+                return True
+            loc = h.headers.get("Location")
+            if loc and _probe_is_placeholder_url(str(h.url.join(loc))):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+async def _probe_preload_stub_fp(session: aiohttp.ClientSession, sample_url: str, range_end: int) -> Optional[str]:
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(sample_url or "")
+        if not p.scheme or not p.netloc:
+            return None
+        url = f"{p.scheme}://{p.netloc}/static/500.mp4"
+        headers = {"Range": f"bytes=0-{int(range_end)}"}
+        timeout = aiohttp.ClientTimeout(total=7.0, connect=3.5, sock_read=5.0)
+        async with session.get(url, headers=headers, allow_redirects=True, timeout=timeout) as resp:
+            b = await _probe_read_exact_or_eof(resp, _READ_BYTES_USENET_PROBE)
+            return _probe_sha1_8(b) if b else None
+    except Exception:
+        return None
 async def _usenet_range_probe_is_real_async(
     urls: List[str],
     concurrency: int = 30,
@@ -1593,20 +1693,31 @@ async def _usenet_range_probe_is_real_async(
     range_end: Optional[int] = None,
     max_bytes: int = 16384,
     guard: bool = True,
-    budget_s: float = 8.5,  # Default from env; pass actual from os.environ
+    budget_s: float = 8.5,
 ) -> List[Tuple[str, bool, int, str]]:
     """
-    Asynchronously probe a list of URLs to determine if they are real or stubs.
-    Returns a list of (url, is_real, size, reason) for each URL.
-
-    Fairness rule:
-    - Every URL gets at most one attempt per round.
-    - We do not let early URLs monopolize the semaphore with in-task retries.
-    - If retries > 1, later rounds only retry TIMEOUT/ERROR results after the
-      first-pass sweep has had a chance to touch the full candidate set.
+    Budget-aware usenet probe.
+    Semantics preserved for wrapper accounting:
+    - REAL / STUB / TIMEOUT / ERROR_* are TESTED
+    - BUDGET_* means UNTESTED (never started because not enough wall-clock remained)
+    Scheduling rule:
+    - give every URL one first-pass chance before retries
+    - only start an attempt if there is enough budget left for a meaningful timeout window
     """
-    results: List[Tuple[str, bool, int, str]] = []
-    sem = asyncio.Semaphore(concurrency)
+    urls = list(urls or [])
+    if not urls:
+        return []
+
+    try:
+        _a1 = float(os.getenv("USENET_PROBE_ATTEMPT1_TIMEOUT_S", "0") or 0.0)
+    except Exception:
+        _a1 = 0.0
+    first_timeout = float(_a1) if (_a1 and _a1 > 0) else float(timeout_s)
+    first_timeout = max(0.5, min(float(timeout_s), float(first_timeout)))
+    try:
+        retry_sleep_s = float(os.getenv("USENET_PROBE_RETRY_SLEEP_S", "0.30") or 0.30)
+    except Exception:
+        retry_sleep_s = 0.30
 
     _auth = None
     try:
@@ -1623,10 +1734,8 @@ async def _usenet_range_probe_is_real_async(
         _lph_env = 4
     eff_lph = max(1, min(int(concurrency), int(len(urls) or 1), int(_lph_env or 4)))
     try:
-        logger.info(
-            "USENET_PROBE_CONN rid=%s conc=%s lph=%s budget_s=%.2f timeout_s=%.2f retries=%s",
-            _rid(), int(concurrency), int(eff_lph), float(budget_s), float(timeout_s), int(retries)
-        )
+        logger.info("USENET_PROBE_CONN rid=%s conc=%s lph=%s budget_s=%.2f timeout_s=%.2f retries=%s",
+                    _rid(), int(concurrency), int(eff_lph), float(budget_s), float(timeout_s), int(retries))
     except Exception:
         pass
 
@@ -1637,294 +1746,228 @@ async def _usenet_range_probe_is_real_async(
         keepalive_timeout=30,
     )
 
-    # Whole-batch deadline shared across rounds.
-    _deadline = time.monotonic() + float(budget_s)
-    # Final authoritative result by URL.
-    final_by_url: Dict[str, Tuple[str, bool, int, str]] = {}
-    # Start with all URLs in the first-pass sweep.
-    remaining_urls: List[str] = list(urls)
-    total_done = 0
-    total_pending = 0
+    deadline = time.monotonic() + float(budget_s)
+    url_results: Dict[str, Tuple[str, bool, int, str]] = {}
 
-    def _is_retryable(_res: Tuple[str, bool, int, str]) -> bool:
-        _u, _ok, _sz, _rs = _res
-        _r = str(_rs or "").upper().strip()
-        if _ok or _r == "REAL":
-            return False
-        if _r in ("STUB", "STUB_LEN", "SHORT") or _r.startswith("SHORT_"):
-            return False
-        if _r.startswith("BUDGET"):
-            return False
-        return ("TIMEOUT" in _r) or _r.startswith("ERROR_") or _r.startswith("FAIL_")
+    async def _run_round(session: aiohttp.ClientSession, todo_urls: List[str], attempt_no: int, attempt_timeout: float, stub_fps: Set[str]) -> List[str]:
+        if not todo_urls:
+            return []
+        pending: Set[asyncio.Task] = set()
+        task_meta: Dict[asyncio.Task, str] = {}
+        next_idx = 0
+        min_start_s = float(attempt_timeout) + 0.12
 
-    async with aiohttp.ClientSession(auth=_auth, connector=connector) as session:
-        rounds = max(1, int(retries or 1))
-        for round_no in range(1, rounds + 1):
-            # Only retry URLs that still need another attempt.
-            if not remaining_urls:
-                break
-            _remain_budget = float(_deadline - time.monotonic())
-            if _remain_budget <= 0.15:
-                break
+        def _can_start() -> bool:
+            return float(deadline - time.monotonic()) >= float(min_start_s)
 
-            tasks: List[asyncio.Task] = []
-            task_url: Dict[asyncio.Task, str] = {}
-
-            for url in remaining_urls:
-                t = asyncio.create_task(
-                    _probe_single(
-                        session,
-                        url,
-                        sem,
-                        1,  # one attempt per round; fairness comes from round scheduling
-                        timeout_s,
-                        stub_len,
-                        range_end or stub_len,
-                        max_bytes,
-                        guard,
-                        deadline=_deadline,
-                    )
+        def _launch_one() -> bool:
+            nonlocal next_idx
+            if next_idx >= len(todo_urls):
+                return False
+            if not _can_start():
+                return False
+            u = todo_urls[next_idx]
+            next_idx += 1
+            t = asyncio.create_task(
+                _probe_single(
+                    session,
+                    u,
+                    timeout_s=float(attempt_timeout),
+                    stub_len=int(stub_len),
+                    range_end=int(range_end or stub_len),
+                    stub_fps=stub_fps,
+                    deadline=deadline,
                 )
-                tasks.append(t)
-                task_url[t] = url
+            )
+            pending.add(t)
+            task_meta[t] = u
+            return True
 
-            _t0 = time.monotonic()
-            done, pending = await asyncio.wait(tasks, timeout=max(0.0, _deadline - time.monotonic()))
-            _elapsed = time.monotonic() - _t0
-            total_done += int(len(done))
-            total_pending += int(len(pending))
+        while len(pending) < int(concurrency) and _launch_one():
+            pass
 
-            round_results: List[Tuple[str, bool, int, str]] = []
-
+        while pending:
+            remaining = float(deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            done, pending = await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                break
             for t in done:
-                u = task_url.get(t, "")
+                u = task_meta.get(t, "")
                 try:
                     res = t.result()
-                    if isinstance(res, tuple) and len(res) == 4:
-                        round_results.append(res)
-                    elif u:
-                        round_results.append((u, False, 0, "ERROR_EMPTY_RESULT"))
+                except asyncio.CancelledError:
+                    res = (u, False, 0, "TIMEOUT")
                 except Exception as e:
-                    logger.warning("PROBE_EXC url=%s err=%s", u, type(e).__name__)
-                    if u:
-                        round_results.append((u, False, 0, f"FAIL_{type(e).__name__}"))
+                    res = (u, False, 0, f"ERROR_{type(e).__name__}")
+                if res and u:
+                    url_results[u] = res
+                while len(pending) < int(concurrency) and _launch_one():
+                    pass
 
-            pending_results = []
-            for t in pending:
-                t.cancel()
-            if pending:
-                pending_results = await asyncio.gather(*pending, return_exceptions=True)
-
-            for t, _pr in zip(pending, pending_results):
-                u = task_url.get(t, "")
-                if isinstance(_pr, tuple) and len(_pr) == 4:
-                    round_results.append(_pr)
-                elif u:
-                    round_results.append((u, False, 0, "BUDGET_PENDING"))
-
-            # Decide who is final now vs who is eligible for another round.
-            next_remaining: List[str] = []
-            for res in round_results:
-                u = res[0]
-                if round_no < rounds and _is_retryable(res):
-                    # Only retry if there is still meaningful headroom left after this round.
-                    _budget_left = float(_deadline - time.monotonic())
-                    try:
-                        _retry_sleep = float(os.getenv("USENET_PROBE_RETRY_SLEEP_S", "0.3") or 0.3)
-                    except Exception:
-                        _retry_sleep = 0.3
-                    if _budget_left > max(0.75, float(timeout_s) + float(_retry_sleep) + 0.15):
-                        next_remaining.append(u)
-                        continue
-                final_by_url[u] = res
-
-            # Any URL in this round with no emitted result is still untested at the wall.
-            for u in remaining_urls:
-                if u not in final_by_url and u not in next_remaining:
-                    final_by_url[u] = (u, False, 0, "BUDGET_PENDING")
-
-            remaining_urls = next_remaining
-
-            # Tiny spacing before a retry round, but never beyond the batch wall.
-            if remaining_urls and round_no < rounds:
+        if pending:
+            for t in list(pending):
+                u = task_meta.get(t, "")
                 try:
-                    _retry_sleep = float(os.getenv("USENET_PROBE_RETRY_SLEEP_S", "0.3") or 0.3)
+                    t.cancel()
                 except Exception:
-                    _retry_sleep = 0.3
-                _sleep_for = min(max(0.0, _retry_sleep), max(0.0, _deadline - time.monotonic() - 0.05))
-                if _sleep_for > 0:
-                    await asyncio.sleep(_sleep_for)
+                    pass
+                if u and u not in url_results:
+                    url_results[u] = (u, False, 0, "TIMEOUT")
+            _ = await asyncio.gather(*pending, return_exceptions=True)
 
-        # Build ordered results list matching the input URL order.
-        for u in urls:
-            results.append(final_by_url.get(u, (u, False, 0, "BUDGET_PENDING")))
+        return todo_urls[next_idx:]
 
+    async with aiohttp.ClientSession(auth=_auth, connector=connector) as session:
+        stub_fps: Set[str] = set()
         try:
-            _total = int(len(urls))
-            _real = _stub = _timeout = _error = _untested = 0
-            for (_u, _ok, _sz, _rs) in (results or []):
-                _r = str(_rs or "").upper().strip()
-                if _ok or _r == "REAL":
-                    _real += 1
-                elif _r in ("STUB", "STUB_LEN", "SHORT") or _r.startswith("SHORT_"):
-                    _stub += 1
-                elif "TIMEOUT" in _r:
-                    _timeout += 1
-                elif _r.startswith("BUDGET"):
-                    _untested += 1
-                else:
-                    _error += 1
-            _tested = int(_real + _stub + _timeout + _error)
-            _elapsed_total = float(min(float(budget_s), max(0.0, float(budget_s) - max(0.0, _deadline - time.monotonic()))))
-            _msg = (
-                f"PROBE_PARTIAL: total={_total} tested={_tested} real={_real} stub={_stub} "
-                f"timeout={_timeout} error={_error} untested={_untested} "
-                f"done={int(total_done)} pending={int(total_pending)} elapsed_s={_elapsed_total:.2f}"
-            )
+            _stub_fp = await _probe_preload_stub_fp(session, urls[0], int(range_end or stub_len))
+            if _stub_fp:
+                stub_fps.add(_stub_fp)
         except Exception:
-            _msg = f"PROBE_PARTIAL: total={int(len(urls))} done={int(total_done)} pending={int(total_pending)} elapsed_s={float(budget_s):.2f}"
+            pass
 
-        try:
-            logger.info(_msg)
-        except Exception:
-            pass
-        try:
-            logging.getLogger("gunicorn.error").info(_msg)
-        except Exception:
-            pass
-        try:
-            sys.stdout.write(_msg + "\n"); sys.stdout.flush()
-        except Exception:
-            pass
-        try:
-            sys.stderr.write(_msg + "\n"); sys.stderr.flush()
-        except Exception:
-            pass
+        leftovers = await _run_round(session, urls, attempt_no=1, attempt_timeout=first_timeout, stub_fps=stub_fps)
+
+        retryable = []
+        if int(retries or 1) > 1:
+            for u in urls:
+                r = url_results.get(u)
+                if not r:
+                    continue
+                _reason = str(r[3] or "").upper().strip()
+                if ("TIMEOUT" in _reason) or _reason.startswith("ERROR"):
+                    retryable.append(u)
+            for attempt_no in range(2, int(retries or 1) + 1):
+                remaining = float(deadline - time.monotonic())
+                if remaining < float(timeout_s) + float(retry_sleep_s) + 0.12:
+                    break
+                if not retryable:
+                    break
+                await asyncio.sleep(min(float(retry_sleep_s), max(0.0, float(deadline - time.monotonic()) - float(timeout_s) - 0.05)))
+                _ = await _run_round(session, retryable, attempt_no=attempt_no, attempt_timeout=float(timeout_s), stub_fps=stub_fps)
+                retryable = []
+                if attempt_no < int(retries or 1):
+                    for u in urls:
+                        r = url_results.get(u)
+                        if not r:
+                            continue
+                        _reason = str(r[3] or "").upper().strip()
+                        if ("TIMEOUT" in _reason) or _reason.startswith("ERROR"):
+                            retryable.append(u)
+
+    for u in leftovers:
+        if u not in url_results:
+            url_results[u] = (u, False, 0, "BUDGET_PENDING")
+    for u in urls:
+        if u not in url_results:
+            url_results[u] = (u, False, 0, "BUDGET_MISSING")
+
+    results = [url_results[u] for u in urls if u in url_results]
+
+    try:
+        _total = int(len(urls))
+        _real = _stub = _timeout = _error = _untested = 0
+        for (_u, _ok, _sz, _rs) in (results or []):
+            _r = str(_rs or "").upper().strip()
+            if _ok or _r == "REAL":
+                _real += 1
+            elif _r in ("STUB", "STUB_LEN", "SHORT") or _r.startswith("SHORT_") or _r.startswith("STUB_"):
+                _stub += 1
+            elif "TIMEOUT" in _r:
+                _timeout += 1
+            elif _r.startswith("BUDGET"):
+                _untested += 1
+            else:
+                _error += 1
+        _tested = int(_real + _stub + _timeout + _error)
+        _done = int(_tested)
+        _pending = int(_untested)
+        _elapsed = float(min(float(budget_s), max(0.0, float(budget_s) - max(0.0, deadline - time.monotonic()))))
+        _msg = (
+            f"PROBE_PARTIAL: total={_total} tested={_tested} real={_real} stub={_stub} "
+            f"timeout={_timeout} error={_error} untested={_untested} "
+            f"done={_done} pending={_pending} elapsed_s={_elapsed:.2f}"
+        )
+    except Exception:
+        _msg = f"PROBE_PARTIAL: total={int(len(urls))} elapsed_s={float(budget_s):.2f}"
+    try:
+        logger.info(_msg)
+    except Exception:
+        pass
+    try:
+        logging.getLogger("gunicorn.error").info(_msg)
+    except Exception:
+        pass
+    try:
+        sys.stdout.write(_msg + "\n"); sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        sys.stderr.write(_msg + "\n"); sys.stderr.flush()
+    except Exception:
+        pass
 
     return results
 
 async def _probe_single(
     session: aiohttp.ClientSession,
     url: str,
-    sem: asyncio.Semaphore,
-    retries: int,
+    *,
     timeout_s: float,
     stub_len: int,
     range_end: int,
-    max_bytes: int,
-    guard: bool,
-    *,
+    stub_fps: Set[str],
     deadline: float,
 ) -> Tuple[str, bool, int, str]:
-    # Intended semantics:
-    # - TESTED means an actual HTTP GET started.
-    # - TESTED outcomes are only: REAL / STUB / TIMEOUT / ERROR.
-    # - BUDGET means UNTESTED (no HTTP GET started before the batch wall).
+    remaining = float(deadline - time.monotonic())
+    if remaining < float(timeout_s) + 0.12:
+        return (url, False, 0, "BUDGET_PRE")
 
+    headers = {"Range": f"bytes=0-{int(range_end)}"}
+    sock_connect_s = min(6.0, float(timeout_s))
+    timeout = aiohttp.ClientTimeout(total=float(timeout_s), connect=sock_connect_s, sock_read=float(timeout_s))
     try:
-        _a1 = float(os.getenv("USENET_PROBE_ATTEMPT1_TIMEOUT_S", "0") or 0.0)
-    except Exception:
-        _a1 = 0.0
-    try:
-        _retry_sleep = float(os.getenv("USENET_PROBE_RETRY_SLEEP_S", "0.3") or 0.3)
-    except Exception:
-        _retry_sleep = 0.3
+        async with session.get(url, headers=headers, allow_redirects=True, timeout=timeout) as resp:
+            if _probe_is_placeholder_url(str(resp.url)) or _probe_history_has_placeholder(resp):
+                return (url, False, 0, "STUB_PLACEHOLDER")
 
-    ever_started = False
-    for attempt in range(1, retries + 1):
-        _started = False
-        _acquired = False
-        try:
-            remaining = float(deadline - time.monotonic())
-            if remaining <= 0.35:
-                return (url, False, 0, "BUDGET_PRE")
+            total_bytes = _probe_parse_total_from_content_range(resp.headers.get("Content-Range"))
+            b = await _probe_read_exact_or_eof(resp, _READ_BYTES_USENET_PROBE)
+            size = len(b)
+            fp = _probe_sha1_8(b) if b else None
+            magic = _probe_sniff_kind(b)
 
-            this_total = float(timeout_s)
-            if attempt == 1 and _a1 and _a1 > 0:
-                this_total = max(0.5, min(float(timeout_s), float(_a1)))
+            if fp and fp in stub_fps:
+                return (url, False, size, "STUB_FP")
 
-            this_total = min(this_total, max(0.10, remaining - 0.15))
-            if this_total <= 0.10:
-                return (url, False, 0, "BUDGET_PRE")
-
-            sock_connect_s = min(2.0, this_total) if attempt > 1 else min(1.5, this_total)
-            headers = {"Range": f"bytes=0-{range_end}"}
-
-            await sem.acquire()
-            _acquired = True
-            try:
-                # Once we have a semaphore slot, preserve the historical semantics: started probes
-                # should resolve as REAL / STUB / SHORT / TIMEOUT / ERROR, not be re-labeled as budget.
-                remaining2 = float(deadline - time.monotonic())
-                this_total2 = min(float(this_total), max(0.15, remaining2 - 0.02))
-
-                async def _net_and_read() -> Tuple[str, bool, int, str]:
-                    nonlocal _started, ever_started
-                    _started = True
-                    ever_started = True
-                    async with session.get(
-                        url,
-                        headers=headers,
-                        allow_redirects=True,
-                        timeout=aiohttp.ClientTimeout(total=this_total2, sock_connect=sock_connect_s, sock_read=this_total2),
-                    ) as resp:
-                        want_need = int(stub_len + 1)
-                        if guard and int(max_bytes) < want_need:
-                            return (url, False, int(max_bytes), "ERROR_MISCONFIG_MAX_BYTES")
-
-                        cap = int(max_bytes) + 1
-                        buf = bytearray()
-                        async for chunk in resp.content.iter_chunked(8192):
-                            if not chunk:
-                                break
-                            remaining_cap = cap - len(buf)
-                            if remaining_cap <= 0:
-                                break
-                            buf.extend(chunk[:remaining_cap])
-                            if len(buf) >= want_need:
-                                break
-                        size = len(buf)
-
-                        if guard and size > int(max_bytes):
-                            return (url, False, size, "ERROR_OVERSIZE")
-
-                        if size > stub_len:
-                            return (url, True, size, "REAL")
-                        if size == stub_len:
-                            return (url, False, size, "STUB")
-                        return (url, False, size, "SHORT")
-
-                return await _net_and_read()
-
-            finally:
-                if _acquired:
+            if total_bytes is not None and total_bytes < _MIN_TOTAL_BYTES_TO_BE_REAL_USENET_PROBE:
+                if fp:
                     try:
-                        sem.release()
+                        stub_fps.add(fp)
                     except Exception:
                         pass
+                return (url, False, int(total_bytes or size), "STUB_TINY")
 
-        except asyncio.TimeoutError:
-            if attempt == retries:
-                return (url, False, 0, "TIMEOUT")
-            try:
-                _rem_retry = float(deadline - time.monotonic())
-            except Exception:
-                _rem_retry = 0.0
-            # Once a real HTTP attempt has already started, do not let a late retry
-            # consume the batch wall and starve the remaining candidates. If there is
-            # not enough headroom for a meaningful retry, finalize as TIMEOUT now.
-            if ever_started and _rem_retry <= max(1.0, float(timeout_s) + float(_retry_sleep) + 0.25):
-                return (url, False, 0, "TIMEOUT")
-            await asyncio.sleep(max(0.0, float(_retry_sleep)))
-        except asyncio.CancelledError:
-            if _started or ever_started:
-                return (url, False, 0, "TIMEOUT")
-            return (url, False, 0, "BUDGET_CANCELLED")
-        except Exception as e:
-            if attempt == retries:
-                return (url, False, 0, f"ERROR_{type(e).__name__}")
-            await asyncio.sleep(max(0.0, float(_retry_sleep)))
-    return (url, False, 0, "ERROR_MAX_RETRIES")
+            if resp.status not in (200, 206):
+                return (url, False, int(total_bytes or size), f"ERROR_HTTP_{int(resp.status)}")
+
+            if not _probe_is_video_kind(magic):
+                return (url, False, int(total_bytes or size), f"STUB_{magic}")
+
+            if total_bytes is not None and total_bytes >= _MIN_TOTAL_BYTES_TO_BE_REAL_USENET_PROBE:
+                return (url, True, int(total_bytes), "REAL")
+
+            # Conservative fallback: valid video header but no reliable total size.
+            # Treat as SHORT so the wrapper counts it as tested-but-not-real, not budget.
+            return (url, False, int(total_bytes or size), "SHORT_NOCR")
+
+    except asyncio.TimeoutError:
+        return (url, False, 0, "TIMEOUT")
+    except Exception as e:
+        return (url, False, 0, f"ERROR_{type(e).__name__}")
+
 def _apply_usenet_playability_probe(
     pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
     *,
@@ -2085,9 +2128,7 @@ def _apply_usenet_playability_probe(
                 urls.append(u)
                 url_to_idx[u] = idx
 
-            # Probe shorter URLs first (intentional heuristic from the working probe
-            # flow; keeps the first waves more deterministic under the 12s budget and
-            # matches the historical manual-probe ordering).
+            # Probe shorter URLs first (more deterministic + matches the manual probe script).
             try:
                 urls.sort(key=len)
             except Exception:
@@ -2115,15 +2156,11 @@ def _apply_usenet_playability_probe(
                     _probe_urls_log("USENET_PROBE_URLS rid=%s hosts=%s sample=%s", _rid(), _host_top, _sample)
                 except Exception:
                     pass
-            # Preserve operator-configured probe behavior exactly; do not auto-tune retries/concurrency.
-            eff_conc = int(conc)
-            eff_retries = int(retries or 1)
-
             async def _main() -> List[Tuple[str, bool, int, str]]:
                 return await _usenet_range_probe_is_real_async(
                     urls,
-                    concurrency=int(eff_conc),
-                    retries=int(eff_retries),
+                    concurrency=int(conc),
+                    retries=int(retries or 1),
                     timeout_s=float(timeout_s),
                     stub_len=int(stub_len),
                     range_end=int(range_end) if range_end is not None else None,
@@ -2136,7 +2173,6 @@ def _apply_usenet_playability_probe(
             url_to_res = {u: (bool(ok), int(size or 0), str(reason)) for (u, ok, size, reason) in (batch_res or [])}
             # Small sample of outcomes (first 5) for debugging host/status issues
             try:
-                from urllib.parse import urlparse
                 _samp=[]
                 for (_u,_ok,_sz,_rs) in (batch_res or [])[:5]:
                     try:
