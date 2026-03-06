@@ -1772,6 +1772,7 @@ async def _usenet_range_probe_is_real_async(
                 _probe_single(
                     session,
                     u,
+                    attempt_no=int(attempt_no),
                     timeout_s=float(attempt_timeout),
                     stub_len=int(stub_len),
                     range_end=int(range_end or stub_len),
@@ -1915,6 +1916,7 @@ async def _probe_single(
     session: aiohttp.ClientSession,
     url: str,
     *,
+    attempt_no: int,
     timeout_s: float,
     stub_len: int,
     range_end: int,
@@ -1933,14 +1935,21 @@ async def _probe_single(
             if _probe_is_placeholder_url(str(resp.url)) or _probe_history_has_placeholder(resp):
                 return (url, False, 0, "STUB_PLACEHOLDER")
 
+            if resp.status not in (200, 206):
+                return (url, False, 0, f"ERROR_HTTP_{int(resp.status)}")
+
             total_bytes = _probe_parse_total_from_content_range(resp.headers.get("Content-Range"))
-            b = await _probe_read_exact_or_eof(resp, _READ_BYTES_USENET_PROBE)
+            # App.py budgeted probe must stay cheap on first pass. The standalone script
+            # proves REAL/STUB using just 4KB + Content-Range; reading >stub_len here
+            # caused healthy links to time out before classification.
+            read_n = int(_READ_BYTES_USENET_PROBE)
+            b = await _probe_read_exact_or_eof(resp, read_n)
             size = len(b)
             fp = _probe_sha1_8(b) if b else None
             magic = _probe_sniff_kind(b)
 
             if fp and fp in stub_fps:
-                return (url, False, size, "STUB_FP")
+                return (url, False, int(total_bytes or size), "STUB_FP")
 
             if total_bytes is not None and total_bytes < _MIN_TOTAL_BYTES_TO_BE_REAL_USENET_PROBE:
                 if fp:
@@ -1950,18 +1959,26 @@ async def _probe_single(
                         pass
                 return (url, False, int(total_bytes or size), "STUB_TINY")
 
-            if resp.status not in (200, 206):
-                return (url, False, int(total_bytes or size), f"ERROR_HTTP_{int(resp.status)}")
-
-            if not _probe_is_video_kind(magic):
+            if b and not _probe_is_video_kind(magic):
                 return (url, False, int(total_bytes or size), f"STUB_{magic}")
 
-            if total_bytes is not None and total_bytes >= _MIN_TOTAL_BYTES_TO_BE_REAL_USENET_PROBE:
+            # Fast REAL proof for app.py: standalone-style logic first.
+            if total_bytes is not None and total_bytes >= _MIN_TOTAL_BYTES_TO_BE_REAL_USENET_PROBE and _probe_is_video_kind(magic):
                 return (url, True, int(total_bytes), "REAL")
 
-            # Conservative fallback: valid video header but no reliable total size.
-            # Treat as SHORT so the wrapper counts it as tested-but-not-real, not budget.
-            return (url, False, int(total_bytes or size), "SHORT_NOCR")
+            # Retry-only fallback: when headers are weak on attempt 1, allow a second pass
+            # to read slightly deeper and prove past the stub length if budget remains.
+            if int(attempt_no) > 1 and _probe_is_video_kind(magic):
+                need_more = int(stub_len) + 1 - size
+                if need_more > 0:
+                    extra = await _probe_read_exact_or_eof(resp, need_more)
+                    size += len(extra)
+                if size > int(stub_len):
+                    return (url, True, int(total_bytes or size), "REAL")
+                if size == int(stub_len):
+                    return (url, False, int(total_bytes or size), "STUB_LEN")
+
+            return (url, False, int(total_bytes or size), "SHORT")
 
     except asyncio.TimeoutError:
         return (url, False, 0, "TIMEOUT")
@@ -2173,6 +2190,7 @@ def _apply_usenet_playability_probe(
             url_to_res = {u: (bool(ok), int(size or 0), str(reason)) for (u, ok, size, reason) in (batch_res or [])}
             # Small sample of outcomes (first 5) for debugging host/status issues
             try:
+                from urllib.parse import urlparse
                 _samp=[]
                 for (_u,_ok,_sz,_rs) in (batch_res or [])[:5]:
                     try:
@@ -7396,7 +7414,7 @@ def _compact_fetch_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(meta, dict):
         return {}
     # Only keep the safe/compact keys
-    keep = ('tag', 'src', 'ok', 'status', 'bytes', 'count', 'ms', 'last_fetch_ms', 'ms_provider', 'wait_ms', 'late_grace_ms', 'http_ms', 'read_ms', 'json_ms', 'post_ms', 'req_epoch_ms', 'conn_ms', 'tls_ms', 'pre_net_ms', 'svrwait_ms', 'soft_timeout_ms', 'err', 'probe_early', 'probe_ms', 'probe_scanned', 'probe_real', 'probe_stub', 'probe_err', 'probe_budget', 'probe_join_ms', 'probe_early_err')
+    keep = ('tag', 'src', 'ok', 'status', 'bytes', 'count', 'ms', 'last_fetch_ms', 'ms_provider', 'wait_ms', 'late_grace_ms', 'http_ms', 'read_ms', 'json_ms', 'post_ms', 'req_epoch_ms', 'conn_ms', 'tls_ms', 'pre_net_ms', 'svrwait_ms', 'soft_timeout_ms', 'err', 'probe_early', 'probe_ms', 'probe_scanned', 'probe_tested', 'probe_real', 'probe_stub', 'probe_timeout', 'probe_err', 'probe_budget', 'probe_join_ms', 'probe_early_err')
     return {k: meta.get(k) for k in keep if k in meta and meta.get(k) not in (None, "", {})}
 
 # Diversify top M while preserving quality: pick from a larger pool, bucketed by resolution, then mix providers/suppliers.
@@ -10944,11 +10962,18 @@ def stream(type_: str, id_: str):
                 try:
                     _p2 = stats.fetch_p2 or {}
                     if any(k in _p2 for k in ("probe_scanned","probe_tested","probe_real","probe_stub","probe_timeout","probe_err","probe_budget","probe_ms","probe_join_ms")):
+                        _probe_real = int((_p2.get("probe_real") or 0))
+                        _probe_stub = int((_p2.get("probe_stub") or 0))
+                        _probe_timeout = int((_p2.get("probe_timeout") or 0))
+                        _probe_err = int((_p2.get("probe_err") or 0))
+                        _probe_tested = _p2.get("probe_tested")
+                        if _probe_tested in (None, ""):
+                            _probe_tested = int(_probe_real + _probe_stub + _probe_timeout + _probe_err)
                         logger.info(
                             "USENET_PROBE_SUMMARY rid=%s mark=%s scanned=%s tested=%s real=%s stub=%s timeout=%s err=%s budget=%s probe_ms=%s join_ms=%s",
                             _rid(), _mark(),
-                            _p2.get("probe_scanned"), _p2.get("probe_tested"), _p2.get("probe_real"), _p2.get("probe_stub"),
-                            _p2.get("probe_timeout"), _p2.get("probe_err"), _p2.get("probe_budget"), _p2.get("probe_ms"), _p2.get("probe_join_ms"),
+                            _p2.get("probe_scanned"), int(_probe_tested), _probe_real, _probe_stub,
+                            _probe_timeout, _probe_err, int((_p2.get("probe_budget") or 0)), _p2.get("probe_ms"), _p2.get("probe_join_ms"),
                         )
                 except Exception:
                     pass
