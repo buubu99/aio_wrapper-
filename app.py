@@ -1671,25 +1671,42 @@ async def _usenet_range_probe_is_real_async(
             for t in pending:
                 u = task_url.get(t, "")
                 if u:
-                    results.append((u, False, 0, "BUDGET"))
+                    results.append((u, False, 0, "BUDGET_PENDING"))
         except Exception:
             pass
 
-        # Emit a single authoritative line that is internally consistent:
-        # - done/pending are asyncio task states at the wall
-        # - tested/budget are semantic outcomes (budget includes early BUDGET returns + pending-at-wall)
+        # Emit a single authoritative line that separates wall-state from semantic outcomes.
+        # - wall_done / pending_at_wall are asyncio task states at the overall budget wall
+        # - *_done counters are semantic outcomes for tasks that completed before the wall
+        # - budget_pending are tasks still pending at the wall and force-marked after cancellation
         try:
+            from collections import Counter as _Counter
             _total = int(len(tasks))
-            _done = int(len(done))
+            _wall_done = int(len(done))
             _pending = int(len(pending))
-            _budget = 0
-            for (_u, _ok, _sz, _rs) in (results or []):
-                if str(_rs).upper().startswith("BUDGET"):
-                    _budget += 1
-            _tested = max(0, _total - int(_budget))
-            _msg = f"PROBE_PARTIAL: done={_done}/{_total} in {float(min(_elapsed, float(budget_s))):.2f} s (tested={_tested} budget={int(_budget)} pending={_pending})"
+            _rc = _Counter(str(_rs).upper() for (_u, _ok, _sz, _rs) in (results or []))
+            _real = int(_rc.get("REAL", 0))
+            _stub = int(_rc.get("STUB", 0) + _rc.get("SHORT", 0) + sum(v for k, v in _rc.items() if str(k).startswith("SHORT_")))
+            _timeout = int(_rc.get("FAIL_TIMEOUTERROR", 0))
+            _budget_early = int(_rc.get("BUDGET_EARLY", 0))
+            _budget_pending = int(_rc.get("BUDGET_PENDING", 0))
+            _err = 0
+            _other = 0
+            for _k, _v in _rc.items():
+                _ku = str(_k).upper()
+                if _ku in ("REAL", "STUB", "SHORT", "FAIL_TIMEOUTERROR", "BUDGET_EARLY", "BUDGET_PENDING") or _ku.startswith("SHORT_"):
+                    continue
+                if _ku.startswith("FAIL_") or _ku in ("ERR", "ERROR", "MISCONFIG_MAX_BYTES", "OVERSIZE", "MAX_RETRIES"):
+                    _err += int(_v)
+                else:
+                    _other += int(_v)
+            _msg = (
+                f"PROBE_PARTIAL: wall_done={_wall_done}/{_total} in {float(min(_elapsed, float(budget_s))):.2f} s "
+                f"(done_real={_real} done_stub={_stub} done_timeout={_timeout} done_err={_err} "
+                f"done_budget_early={_budget_early} pending_at_wall={_pending} budget_pending={_budget_pending} other={_other})"
+            )
         except Exception:
-            _msg = f"PROBE_PARTIAL: done={int(len(done))}/{int(len(tasks))} in {float(min(_elapsed, float(budget_s))):.2f} s"
+            _msg = f"PROBE_PARTIAL: wall_done={int(len(done))}/{int(len(tasks))} in {float(min(_elapsed, float(budget_s))):.2f} s pending_at_wall={int(len(pending))}"
         try:
             logger.info(_msg)
         except Exception:
@@ -1738,7 +1755,7 @@ async def _probe_single(
             # Remaining global budget for this task.
             remaining = float(deadline - time.monotonic())
             if remaining <= 0.35:
-                return (url, False, 0, "BUDGET")
+                return (url, False, 0, "BUDGET_EARLY")
 
             # Attempt timeout base (attempt #1 can be shorter if configured).
             this_total = float(timeout_s)
@@ -1748,7 +1765,7 @@ async def _probe_single(
             # Clamp attempt timeout to remaining budget (leave margin).
             this_total = min(this_total, max(0.10, remaining - 0.15))
             if this_total <= 0.10:
-                return (url, False, 0, "BUDGET")
+                return (url, False, 0, "BUDGET_EARLY")
 
             # Keep connect phase snappy.
             sock_connect_s = min(2.0, this_total) if attempt > 1 else min(1.5, this_total)
@@ -1761,17 +1778,17 @@ async def _probe_single(
                 # Recompute remaining after waiting for a slot.
                 remaining2 = float(deadline - time.monotonic())
                 if remaining2 <= 0.35:
-                    return (url, False, 0, "BUDGET")
+                    return (url, False, 0, "BUDGET_EARLY")
 
                 # Re-clamp for the actual network section.
                 this_total2 = min(float(this_total), max(0.10, remaining2 - 0.15))
                 if this_total2 <= 0.10:
-                    return (url, False, 0, "BUDGET")
+                    return (url, False, 0, "BUDGET_EARLY")
 
                 # Hard guard timeout for the network+read section, also clamped to the global deadline.
                 guard_timeout = min(float(this_total2 + 0.25), max(0.05, float(deadline - time.monotonic() - 0.05)))
                 if guard_timeout <= 0.05:
-                    return (url, False, 0, "BUDGET")
+                    return (url, False, 0, "BUDGET_EARLY")
 
                 async def _net_and_read() -> Tuple[str, bool, int, str]:
                     async with session.get(
@@ -1819,7 +1836,7 @@ async def _probe_single(
                 return (url, False, 0, "FAIL_TimeoutError")
             await asyncio.sleep(0.3)
         except asyncio.CancelledError:
-            return (url, False, 0, "BUDGET")
+            return (url, False, 0, "BUDGET_PENDING")
         except Exception as e:
             if attempt == retries:
                 return (url, False, 0, f"FAIL_{type(e).__name__}")
@@ -2065,7 +2082,7 @@ def _apply_usenet_playability_probe(
                 # Defensive: if batch_res is missing entries, count them as BUDGET (not ERR).
                 _budget_missing = max(0, len(urls) - len(batch_res or []))
                 if _budget_missing:
-                    _rc["BUDGET"] += _budget_missing
+                    _rc["BUDGET_PENDING"] += _budget_missing
 
                 _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v16 reasons={dict(_rc.most_common(8))}'
                 logger.info(_reasons_msg)
@@ -2093,7 +2110,7 @@ def _apply_usenet_playability_probe(
                 r = url_to_res.get(u)
                 if r is None:
                     # Budget wall reached before this URL completed; mark explicitly.
-                    probe_results.append((idx, False, 'BUDGET', 0))
+                    probe_results.append((idx, False, 'BUDGET_PENDING', 0))
                     continue
                 ok, nbytes, reason = r
                 probe_results.append((idx, bool(ok), str(reason), int(nbytes or 0)))
@@ -2109,17 +2126,17 @@ def _apply_usenet_playability_probe(
             s, m = pairs[i]
             if isinstance(m, dict):
                 m['usenet_probe'] = 'BUDGET'
-                m['usenet_probe_reason'] = 'BUDGET'
+                m['usenet_probe_reason'] = 'BUDGET_PENDING'
                 m['usenet_probe_bytes'] = 0
             continue
         ok, reason, nbytes = idx_to_res[i]
         s, m = pairs[i]
         if not isinstance(m, dict):
             continue
-        if str(reason) == 'BUDGET':
+        if str(reason).upper().startswith('BUDGET'):
             budget_idx.append(i)
             m['usenet_probe'] = 'BUDGET'
-            m['usenet_probe_reason'] = 'BUDGET'
+            m['usenet_probe_reason'] = str(reason)
             m['usenet_probe_bytes'] = int(nbytes or 0)
             continue
         if ok:
