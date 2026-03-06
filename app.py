@@ -1727,6 +1727,16 @@ async def _usenet_range_probe_is_real_async(
         retry_sleep_s = float(os.getenv("USENET_PROBE_RETRY_SLEEP_S", "0.30") or 0.30)
     except Exception:
         retry_sleep_s = 0.30
+    try:
+        topk_long = int(os.getenv("USENET_PROBE_TOPK_LONG", "12") or 12)
+    except Exception:
+        topk_long = 12
+    try:
+        topk_timeout = float(os.getenv("USENET_PROBE_TOPK_TIMEOUT_S", str(first_timeout)) or first_timeout)
+    except Exception:
+        topk_timeout = float(first_timeout)
+    topk_long = max(0, int(topk_long))
+    topk_timeout = max(float(first_timeout), float(topk_timeout))
 
     _auth = None
     try:
@@ -1743,8 +1753,8 @@ async def _usenet_range_probe_is_real_async(
         _lph_env = 4
     eff_lph = max(1, min(int(concurrency), int(len(urls) or 1), int(_lph_env or 4)))
     try:
-        logger.info("USENET_PROBE_CONN rid=%s conc=%s lph=%s budget_s=%.2f timeout_s=%.2f retries=%s",
-                    _rid(), int(concurrency), int(eff_lph), float(budget_s), float(timeout_s), int(retries))
+        logger.info("USENET_PROBE_CONN rid=%s conc=%s lph=%s budget_s=%.2f timeout_s=%.2f retries=%s topk_long=%s topk_timeout=%.2f",
+                    _rid(), int(concurrency), int(eff_lph), float(budget_s), float(timeout_s), int(retries), int(topk_long), float(topk_timeout))
     except Exception:
         pass
 
@@ -1764,25 +1774,34 @@ async def _usenet_range_probe_is_real_async(
         pending: Set[asyncio.Task] = set()
         task_meta: Dict[asyncio.Task, str] = {}
         next_idx = 0
-        min_start_s = float(attempt_timeout) + 0.12
 
-        def _can_start() -> bool:
-            return float(deadline - time.monotonic()) >= float(min_start_s)
+        def _timeout_for_index(idx: int) -> float:
+            # In the wrapper's 12s budget, the first handful of top-ranked URLs deserve
+            # a longer first-pass window because the standalone probe shows many true REALs
+            # arrive at ~5-6.5s. After that, fall back to the normal cheaper timeout.
+            if int(attempt_no) == 1 and int(idx) < int(topk_long):
+                return float(topk_timeout)
+            return float(attempt_timeout)
+
+        def _can_start(idx: int) -> bool:
+            need = float(_timeout_for_index(idx)) + 0.12
+            return float(deadline - time.monotonic()) >= float(need)
 
         def _launch_one() -> bool:
             nonlocal next_idx
             if next_idx >= len(todo_urls):
                 return False
-            if not _can_start():
+            if not _can_start(next_idx):
                 return False
             u = todo_urls[next_idx]
+            this_timeout = float(_timeout_for_index(next_idx))
             next_idx += 1
             t = asyncio.create_task(
                 _probe_single(
                     session,
                     u,
                     attempt_no=int(attempt_no),
-                    timeout_s=float(attempt_timeout),
+                    timeout_s=float(this_timeout),
                     stub_len=int(stub_len),
                     range_end=int(range_end or stub_len),
                     stub_fps=stub_fps,
@@ -2169,11 +2188,9 @@ def _apply_usenet_playability_probe(
                 urls.append(u)
                 url_to_idx[u] = idx
 
-            # Probe shorter URLs first (more deterministic + matches the manual probe script).
-            try:
-                urls.sort(key=len)
-            except Exception:
-                pass
+            # Preserve original candidate order. The standalone probe audits the first 40 in
+            # provider order, and under the wrapper's hard 12s budget that top-of-list order
+            # matters more than URL-length heuristics.
             # Debug visibility: show what we're actually probing (obfuscated).
             if USENET_PROBE_LOG_URLS:
                 try:
