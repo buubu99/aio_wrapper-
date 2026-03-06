@@ -1647,14 +1647,23 @@ def _probe_is_video_kind(k: str) -> bool:
     return k in ("VIDEO_MKV", "VIDEO_MP4", "VIDEO_AVI", "VIDEO_TS_MAYBE")
 
 
-async def _probe_read_exact_or_eof(resp: aiohttp.ClientResponse, n: int) -> bytes:
+async def _probe_read_exact_or_eof(resp: aiohttp.ClientResponse, n: int) -> Tuple[bytes, bool]:
+    """Read up to n bytes, preserving partial data if a read timeout fires.
+
+    Returns (data, timed_out_during_read).
+    """
     buf = bytearray()
+    timed_out = False
     while len(buf) < n:
-        chunk = await resp.content.read(n - len(buf))
+        try:
+            chunk = await resp.content.read(n - len(buf))
+        except asyncio.TimeoutError:
+            timed_out = True
+            break
         if not chunk:
             break
         buf.extend(chunk)
-    return bytes(buf)
+    return bytes(buf), bool(timed_out)
 
 
 def _probe_history_has_placeholder(resp: aiohttp.ClientResponse) -> bool:
@@ -1680,7 +1689,7 @@ async def _probe_preload_stub_fp(session: aiohttp.ClientSession, sample_url: str
         headers = {"Range": f"bytes=0-{int(range_end)}"}
         timeout = aiohttp.ClientTimeout(total=7.0, connect=3.5, sock_read=5.0)
         async with session.get(url, headers=headers, allow_redirects=True, timeout=timeout) as resp:
-            b = await _probe_read_exact_or_eof(resp, _READ_BYTES_USENET_PROBE)
+            b, _to = await _probe_read_exact_or_eof(resp, _READ_BYTES_USENET_PROBE)
             return _probe_sha1_8(b) if b else None
     except Exception:
         return None
@@ -1943,7 +1952,7 @@ async def _probe_single(
             # proves REAL/STUB using just 4KB + Content-Range; reading >stub_len here
             # caused healthy links to time out before classification.
             read_n = int(_READ_BYTES_USENET_PROBE)
-            b = await _probe_read_exact_or_eof(resp, read_n)
+            b, read_timed_out = await _probe_read_exact_or_eof(resp, read_n)
             size = len(b)
             fp = _probe_sha1_8(b) if b else None
             magic = _probe_sniff_kind(b)
@@ -1966,13 +1975,28 @@ async def _probe_single(
             if total_bytes is not None and total_bytes >= _MIN_TOTAL_BYTES_TO_BE_REAL_USENET_PROBE and _probe_is_video_kind(magic):
                 return (url, True, int(total_bytes), "REAL")
 
+            # If the read timed out but we already got useful bytes, classify from the
+            # partial evidence instead of discarding the attempt as a blind TIMEOUT.
+            if read_timed_out:
+                if fp and fp in stub_fps:
+                    return (url, False, int(total_bytes or size), "STUB_FP_TIMEOUT")
+                if total_bytes is not None and total_bytes < _MIN_TOTAL_BYTES_TO_BE_REAL_USENET_PROBE:
+                    return (url, False, int(total_bytes or size), "STUB_TINY_TIMEOUT")
+                if b and _probe_is_video_kind(magic) and total_bytes is not None and total_bytes >= _MIN_TOTAL_BYTES_TO_BE_REAL_USENET_PROBE:
+                    return (url, True, int(total_bytes), "REAL_TIMEOUT_PARTIAL")
+                if b and not _probe_is_video_kind(magic):
+                    return (url, False, int(total_bytes or size), f"STUB_{magic}_TIMEOUT")
+                return (url, False, int(total_bytes or size), "TIMEOUT")
+
             # Retry-only fallback: when headers are weak on attempt 1, allow a second pass
             # to read slightly deeper and prove past the stub length if budget remains.
             if int(attempt_no) > 1 and _probe_is_video_kind(magic):
                 need_more = int(stub_len) + 1 - size
                 if need_more > 0:
-                    extra = await _probe_read_exact_or_eof(resp, need_more)
+                    extra, extra_timed_out = await _probe_read_exact_or_eof(resp, need_more)
                     size += len(extra)
+                    if extra_timed_out and total_bytes is not None and total_bytes >= _MIN_TOTAL_BYTES_TO_BE_REAL_USENET_PROBE and size > 0:
+                        return (url, True, int(total_bytes), "REAL_TIMEOUT_PARTIAL")
                 if size > int(stub_len):
                     return (url, True, int(total_bytes or size), "REAL")
                 if size == int(stub_len):
@@ -6575,7 +6599,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                     up = str((_m or {}).get("usenet_probe") or "").upper().strip()
                 except Exception:
                     up = ""
-                if up in ("REAL", "STUB", "ERR", "BUDGET"):
+                if up in ("REAL", "STUB", "TIMEOUT", "ERR", "BUDGET"):
                     _s["_wrap_usenet_probe"] = up
                     try:
                         if up == "REAL" and bool((_m or {}).get("ready")):
