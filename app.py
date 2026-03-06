@@ -2281,7 +2281,7 @@ def _apply_usenet_playability_probe(
                 except Exception:
                     pass
         else:
-            if _reason_u in ("STUB_LEN", "STUB", "SHORT") or _reason_u.startswith("SHORT_"):
+            if _reason_u in ("STUB_LEN", "STUB", "SHORT") or _reason_u.startswith("SHORT_") or _reason_u.startswith("STUB_"):
                 stub_idx.append(i)
                 m["usenet_probe"] = "STUB"
             elif "TIMEOUT" in _reason_u:
@@ -6545,7 +6545,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                 if isinstance(_s, dict):
                     _pairs.append((_s, {"provider": "ND"}))
             if not _pairs:
-                return _streams, {"probe_early": True, "probe_ms": 0, "probe_scanned": 0, "probe_real": 0, "probe_stub": 0, "probe_err": 0}
+                return _streams, {"probe_early": True, "probe_ms": 0, "probe_scanned": 0, "probe_tested": 0, "probe_real": 0, "probe_stub": 0, "probe_timeout": 0, "probe_err": 0, "probe_budget": 0}
 
             _pairs2 = _apply_usenet_playability_probe(
                 _pairs,
@@ -6618,9 +6618,21 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                 out = out_all
 
             ms = int((time.monotonic() - t0p) * 1000)
-            return out, {"probe_early": True, "probe_ms": ms, "probe_scanned": int(scanned), "probe_real": int(real), "probe_stub": int(stub), "probe_err": int(err), "probe_budget": int(budget)}
+            timeout = 0
+            tested = 0
+            for _s in out_all:
+                try:
+                    _up = str((_s.get("_wrap_usenet_probe") or "")).upper().strip()
+                except Exception:
+                    _up = ""
+                if _up == "TIMEOUT":
+                    timeout += 1
+                elif _up in ("REAL", "STUB", "ERR"):
+                    pass
+            tested = int(real + stub + err + timeout)
+            return out, {"probe_early": True, "probe_ms": ms, "probe_scanned": int(scanned), "probe_tested": int(tested), "probe_real": int(real), "probe_stub": int(stub), "probe_timeout": int(timeout), "probe_err": int(err), "probe_budget": int(budget)}
         except Exception as _e:
-            return _streams, {"probe_early": True, "probe_early_err": f"error:{type(_e).__name__}"}
+            return _streams, {"probe_early": True, "probe_early_err": f"error:{type(_e).__name__}", "probe_scanned": 0, "probe_tested": 0, "probe_real": 0, "probe_stub": 0, "probe_timeout": 0, "probe_err": 1, "probe_budget": 0, "probe_ms": 0}
         finally:
             try:
                 if _prev_rid is None:
