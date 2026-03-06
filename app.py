@@ -1747,6 +1747,10 @@ async def _probe_single(
         _a1 = float(os.getenv("USENET_PROBE_ATTEMPT1_TIMEOUT_S", "0") or 0.0)
     except Exception:
         _a1 = 0.0
+    try:
+        _retry_sleep = float(os.getenv("USENET_PROBE_RETRY_SLEEP_S", "0.3") or 0.3)
+    except Exception:
+        _retry_sleep = 0.3
 
     for attempt in range(1, retries + 1):
         _started = False
@@ -1819,7 +1823,7 @@ async def _probe_single(
         except asyncio.TimeoutError:
             if attempt == retries:
                 return (url, False, 0, "TIMEOUT")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(max(0.0, float(_retry_sleep)))
         except asyncio.CancelledError:
             if _started:
                 return (url, False, 0, "TIMEOUT")
@@ -1827,7 +1831,7 @@ async def _probe_single(
         except Exception as e:
             if attempt == retries:
                 return (url, False, 0, f"ERROR_{type(e).__name__}")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(max(0.0, float(_retry_sleep)))
     return (url, False, 0, "ERROR_MAX_RETRIES")
 def _apply_usenet_playability_probe(
     pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
@@ -2038,6 +2042,7 @@ def _apply_usenet_playability_probe(
             url_to_res = {u: (bool(ok), int(size or 0), str(reason)) for (u, ok, size, reason) in (batch_res or [])}
             # Small sample of outcomes (first 5) for debugging host/status issues
             try:
+                from urllib.parse import urlparse
                 _samp=[]
                 for (_u,_ok,_sz,_rs) in (batch_res or [])[:5]:
                     try:
