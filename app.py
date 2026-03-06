@@ -1775,26 +1775,29 @@ async def _usenet_range_probe_is_real_async(
         task_meta: Dict[asyncio.Task, str] = {}
         next_idx = 0
 
-        def _timeout_for_index(idx: int) -> float:
-            # In the wrapper's 12s budget, the first handful of top-ranked URLs deserve
-            # a longer first-pass window because the standalone probe shows many true REALs
-            # arrive at ~5-6.5s. After that, fall back to the normal cheaper timeout.
-            if int(attempt_no) == 1 and int(idx) < int(topk_long):
-                return float(topk_timeout)
-            return float(attempt_timeout)
-
-        def _can_start(idx: int) -> bool:
-            need = float(_timeout_for_index(idx)) + 0.12
+        def _can_start() -> bool:
+            # Admission must stay based on the normal cheap first-pass timeout. Do NOT let
+            # the longer top-k timeout become a barrier that prevents later candidates from
+            # ever starting (that was the v19 regression back to 8 tested / 32 budget).
+            need = float(attempt_timeout) + 0.12
             return float(deadline - time.monotonic()) >= float(need)
 
         def _launch_one() -> bool:
             nonlocal next_idx
             if next_idx >= len(todo_urls):
                 return False
-            if not _can_start(next_idx):
+            if not _can_start():
                 return False
             u = todo_urls[next_idx]
-            this_timeout = float(_timeout_for_index(next_idx))
+            # Longer timeout is a property of a launched task, not an admission gate.
+            # For the first handful of original-order candidates, use the longer timeout
+            # only when there is enough remaining budget for it; otherwise fall back to
+            # the normal attempt timeout so we keep touching later candidates.
+            remaining = float(deadline - time.monotonic())
+            this_timeout = float(attempt_timeout)
+            if int(attempt_no) == 1 and int(next_idx) < int(topk_long):
+                if remaining >= float(topk_timeout) + 0.12:
+                    this_timeout = float(topk_timeout)
             next_idx += 1
             t = asyncio.create_task(
                 _probe_single(
