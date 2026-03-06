@@ -1659,10 +1659,9 @@ async def _usenet_range_probe_is_real_async(
                 if u:
                     results.append((u, False, 0, f"FAIL_{type(e).__name__}"))
 
-        # Cancel pending to enforce budget, but HARVEST any final tuple they return.
-        # This is important because an in-flight probe may convert the cancellation into
-        # a meaningful terminal result such as TIMEOUT. Only tasks that still produce no
-        # final tuple are counted as BUDGET_PENDING (untested / unfinished at the wall).
+        # Cancel pending at the batch wall, but preserve terminal results from tasks that had
+        # already started probing. _probe_single() converts started-task cancellation into TIMEOUT;
+        # only tasks that never produced a terminal tuple remain BUDGET_PENDING.
         _pending_results = []
         for t in pending:
             t.cancel()
@@ -1670,10 +1669,10 @@ async def _usenet_range_probe_is_real_async(
             _pending_results = await asyncio.gather(*pending, return_exceptions=True)
 
         try:
-            for t, pres in zip(list(pending), list(_pending_results or [])):
+            for t, _pr in zip(pending, _pending_results):
                 u = task_url.get(t, "")
-                if isinstance(pres, tuple) and len(pres) == 4:
-                    results.append(pres)
+                if isinstance(_pr, tuple) and len(_pr) == 4:
+                    results.append(_pr)
                 elif u:
                     results.append((u, False, 0, "BUDGET_PENDING"))
         except Exception:
@@ -1748,76 +1747,68 @@ async def _probe_single(
         _a1 = float(os.getenv("USENET_PROBE_ATTEMPT1_TIMEOUT_S", "0") or 0.0)
     except Exception:
         _a1 = 0.0
-    try:
-        _retry_sleep = float(os.getenv("USENET_PROBE_RETRY_SLEEP_S", "0.30") or 0.30)
-    except Exception:
-        _retry_sleep = 0.30
 
-    max_attempts = max(1, int(retries or 1))
-
-    for attempt in range(1, max_attempts + 1):
+    for attempt in range(1, retries + 1):
         _started = False
         try:
             remaining = float(deadline - time.monotonic())
             if remaining <= 0.35:
                 return (url, False, 0, "BUDGET_PRE")
 
-            req_total = float(timeout_s)
+            this_total = float(timeout_s)
             if attempt == 1 and _a1 and _a1 > 0:
-                req_total = max(0.5, min(float(timeout_s), float(_a1)))
+                this_total = max(0.5, min(float(timeout_s), float(_a1)))
 
-            # Do NOT over-apply the global budget inside the probe. The batch wall already
-            # lives in _usenet_range_probe_is_real_async(). We only avoid starting a brand-new
-            # request when there is effectively no time left.
-            req_total = min(req_total, max(0.25, remaining - 0.05))
-            if req_total <= 0.20:
+            this_total = min(this_total, max(0.10, remaining - 0.15))
+            if this_total <= 0.10:
                 return (url, False, 0, "BUDGET_PRE")
 
-            sock_connect_s = min(2.0, req_total) if attempt > 1 else min(1.5, req_total)
+            sock_connect_s = min(2.0, this_total) if attempt > 1 else min(1.5, this_total)
             headers = {"Range": f"bytes=0-{range_end}"}
 
             await sem.acquire()
             try:
+                # Once we have a semaphore slot, preserve the historical semantics: started probes
+                # should resolve as REAL / STUB / SHORT / TIMEOUT / ERROR, not be re-labeled as budget.
                 remaining2 = float(deadline - time.monotonic())
-                if remaining2 <= 0.35:
-                    return (url, False, 0, "BUDGET_POST")
+                this_total2 = min(float(this_total), max(0.15, remaining2 - 0.02))
 
-                req_total2 = min(float(req_total), max(0.25, remaining2 - 0.05))
-                if req_total2 <= 0.20:
-                    return (url, False, 0, "BUDGET_POST")
+                async def _net_and_read() -> Tuple[str, bool, int, str]:
+                    nonlocal _started
+                    _started = True
+                    async with session.get(
+                        url,
+                        headers=headers,
+                        allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=this_total2, sock_connect=sock_connect_s, sock_read=this_total2),
+                    ) as resp:
+                        want_need = int(stub_len + 1)
+                        if guard and int(max_bytes) < want_need:
+                            return (url, False, int(max_bytes), "ERROR_MISCONFIG_MAX_BYTES")
 
-                _started = True
-                async with session.get(
-                    url,
-                    headers=headers,
-                    allow_redirects=True,
-                    timeout=aiohttp.ClientTimeout(total=req_total2, sock_connect=sock_connect_s, sock_read=req_total2),
-                ) as resp:
-                    want_need = int(stub_len + 1)
-                    if guard and int(max_bytes) < want_need:
-                        return (url, False, int(max_bytes), "ERROR_MISCONFIG_MAX_BYTES")
+                        cap = int(max_bytes) + 1
+                        buf = bytearray()
+                        async for chunk in resp.content.iter_chunked(8192):
+                            if not chunk:
+                                break
+                            remaining_cap = cap - len(buf)
+                            if remaining_cap <= 0:
+                                break
+                            buf.extend(chunk[:remaining_cap])
+                            if len(buf) >= want_need:
+                                break
+                        size = len(buf)
 
-                    cap = int(max_bytes) + 1
-                    buf = bytearray()
-                    async for chunk in resp.content.iter_chunked(8192):
-                        if not chunk:
-                            break
-                        remaining_cap = cap - len(buf)
-                        if remaining_cap <= 0:
-                            break
-                        buf.extend(chunk[:remaining_cap])
-                        if len(buf) >= want_need:
-                            break
-                    size = len(buf)
+                        if guard and size > int(max_bytes):
+                            return (url, False, size, "ERROR_OVERSIZE")
 
-                    if guard and size > int(max_bytes):
-                        return (url, False, size, "ERROR_OVERSIZE")
+                        if size > stub_len:
+                            return (url, True, size, "REAL")
+                        if size == stub_len:
+                            return (url, False, size, "STUB")
+                        return (url, False, size, "SHORT")
 
-                    if size > stub_len:
-                        return (url, True, size, "REAL")
-                    if size == stub_len:
-                        return (url, False, size, "STUB")
-                    return (url, False, size, "SHORT")
+                return await _net_and_read()
 
             finally:
                 try:
@@ -1826,17 +1817,17 @@ async def _probe_single(
                     pass
 
         except asyncio.TimeoutError:
-            if attempt == max_attempts:
+            if attempt == retries:
                 return (url, False, 0, "TIMEOUT")
-            await asyncio.sleep(_retry_sleep)
+            await asyncio.sleep(0.3)
         except asyncio.CancelledError:
             if _started:
                 return (url, False, 0, "TIMEOUT")
             return (url, False, 0, "BUDGET_CANCELLED")
         except Exception as e:
-            if attempt == max_attempts:
+            if attempt == retries:
                 return (url, False, 0, f"ERROR_{type(e).__name__}")
-            await asyncio.sleep(_retry_sleep)
+            await asyncio.sleep(0.3)
     return (url, False, 0, "ERROR_MAX_RETRIES")
 def _apply_usenet_playability_probe(
     pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]],
@@ -2026,25 +2017,9 @@ def _apply_usenet_playability_probe(
                     _probe_urls_log("USENET_PROBE_URLS rid=%s hosts=%s sample=%s", _rid(), _host_top, _sample)
                 except Exception:
                     pass
-            # Auto-tune under a hard global budget: avoid spending the whole budget on retrying timeouts.
+            # Preserve operator-configured probe behavior exactly; do not auto-tune retries/concurrency.
             eff_conc = int(conc)
             eff_retries = int(retries or 1)
-            _why = []
-            try:
-                if float(budget) <= float(timeout_s) * 2.1 and int(len(urls)) > 10 and eff_retries > 1:
-                    eff_retries = 1
-                    _why.append('clamp_retries_for_budget')
-                elif int(len(urls)) > int(max(1, eff_conc)) and float(budget) <= float(timeout_s) * 3.0 and eff_retries > 1:
-                    eff_retries = 1
-                    _why.append('clamp_retries_for_throughput')
-                # Keep user-configured concurrency; only clamp extreme values that can destabilize remote hosts.
-                if int(len(urls)) >= 80 and eff_conc > 25:
-                    eff_conc = 25
-                    _why.append('clamp_conc_extreme')
-                if _why:
-                    logger.info('USENET_PROBE_TUNE rid=%s conc=%s->%s retries=%s->%s why=%s', _rid(), int(conc), int(eff_conc), int(retries or 1), int(eff_retries), _why)
-            except Exception:
-                pass
 
             async def _main() -> List[Tuple[str, bool, int, str]]:
                 return await _usenet_range_probe_is_real_async(
@@ -2063,7 +2038,6 @@ def _apply_usenet_playability_probe(
             url_to_res = {u: (bool(ok), int(size or 0), str(reason)) for (u, ok, size, reason) in (batch_res or [])}
             # Small sample of outcomes (first 5) for debugging host/status issues
             try:
-                from urllib.parse import urlparse
                 _samp=[]
                 for (_u,_ok,_sz,_rs) in (batch_res or [])[:5]:
                     try:
