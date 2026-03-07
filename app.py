@@ -525,6 +525,8 @@ USENET_PROBE_LIMIT_PER_HOST = _safe_int(os.environ.get("USENET_PROBE_LIMIT_PER_H
 # Fixed first ranged read size for the direct usenet probe: bytes=0-(initial_bytes-1).
 # This replaces the old stub_len / range_end model.
 USENET_PROBE_INITIAL_BYTES = _safe_int(os.environ.get("USENET_PROBE_INITIAL_BYTES", "20000"), 20000)
+USENET_PROBE_DEBUG_TIMEOUTS = _parse_bool(os.environ.get("USENET_PROBE_DEBUG_TIMEOUTS", "0"), False)
+USENET_PROBE_DEBUG_TIMEOUTS_N = _safe_int(os.environ.get("USENET_PROBE_DEBUG_TIMEOUTS_N", "0"), 0)
 # Demote (and optionally drop) stubs aggressively so REAL usenet links float to the top.
 USENET_PROBE_DROP_STUBS = _parse_bool(os.environ.get("USENET_PROBE_DROP_STUBS", "1"), True)
 USENET_PROBE_MARK_READY = _parse_bool(os.environ.get("USENET_PROBE_MARK_READY", "1"), True)
@@ -1594,6 +1596,7 @@ async def _usenet_range_probe_is_real_async(
     guard: bool = True,
     budget_s: float = 8.5,
     target_real: int = 0,
+    prefer_force_close: bool = True,
 ) -> List[Tuple[str, bool, int, str]]:
     """
     Probe usenet proxy URLs and classify them using a fixed initial byte window.
@@ -1628,17 +1631,25 @@ async def _usenet_range_probe_is_real_async(
     except Exception:
         pass
 
+    _conn_mode = "force_close" if bool(prefer_force_close) else "plain"
     try:
-        connector = aiohttp.TCPConnector(
-            limit=eff_parallel,
-            limit_per_host=eff_parallel,
-            ttl_dns_cache=300,
-            force_close=True,
-            enable_cleanup_closed=True,
-        )
+        if bool(prefer_force_close):
+            connector = aiohttp.TCPConnector(
+                limit=eff_parallel,
+                limit_per_host=eff_parallel,
+                ttl_dns_cache=300,
+                force_close=True,
+                enable_cleanup_closed=True,
+            )
+        else:
+            connector = aiohttp.TCPConnector(
+                limit=eff_parallel,
+                limit_per_host=eff_parallel,
+                ttl_dns_cache=300,
+            )
     except Exception as e:
         try:
-            logger.warning("USENET_PROBE_CONN_FALLBACK rid=%s err=%s", _rid(), type(e).__name__)
+            logger.warning("USENET_PROBE_CONN_FALLBACK rid=%s mode=%s err=%s", _rid(), _conn_mode, type(e).__name__)
         except Exception:
             pass
         connector = aiohttp.TCPConnector(
@@ -1654,6 +1665,11 @@ async def _usenet_range_probe_is_real_async(
         _idx = 0
         _real_hits = 0
         _stop_target = False
+        _timeout_debug: List[Dict[str, Any]] = []
+        _timeout_debug_limit = max(0, int(USENET_PROBE_DEBUG_TIMEOUTS_N or 0))
+        if _timeout_debug_limit <= 0:
+            _timeout_debug_limit = int(len(urls))
+        _timeout_debug_enabled = bool(USENET_PROBE_DEBUG_TIMEOUTS and _timeout_debug_limit > 0)
 
         def _launch_more() -> None:
             nonlocal _idx
@@ -1670,6 +1686,8 @@ async def _usenet_range_probe_is_real_async(
                         initial_bytes=int(initial_bytes),
                         guard=bool(guard),
                         deadline=_deadline,
+                        timeout_debug=_timeout_debug if _timeout_debug_enabled else None,
+                        timeout_debug_limit=_timeout_debug_limit,
                     )
                 )
                 pending.add(t)
@@ -1743,6 +1761,30 @@ async def _usenet_range_probe_is_real_async(
         except Exception:
             _msg = f"PROBE_PARTIAL: results={int(len(results))} in {float(min(_elapsed, float(budget_s))):.2f} s"
         try:
+            if _timeout_debug_enabled and _timeout_debug:
+                from collections import Counter as _Counter
+                _tc = _Counter(str(d.get("phase") or "?") for d in (_timeout_debug or []))
+                logger.info("USENET_PROBE_TIMEOUT_PHASES rid=%s counts=%s", _rid(), dict(_tc))
+                _td = []
+                for d in (_timeout_debug or [])[:_timeout_debug_limit]:
+                    _td.append(
+                        "host={host} phase={phase} attempt={attempt} elapsed_ms={elapsed_ms} status={status} hist={history} range={range} bytes={bytes_read} final={final_host}".format(
+                            host=d.get("host", "?"),
+                            phase=d.get("phase", "?"),
+                            attempt=d.get("attempt", 0),
+                            elapsed_ms=d.get("elapsed_ms", 0),
+                            status=d.get("status", 0),
+                            history=d.get("history", 0),
+                            range=d.get("range", "?"),
+                            bytes_read=d.get("bytes_read", 0),
+                            final_host=d.get("final_host", "?"),
+                        )
+                    )
+                if _td:
+                    logger.info("USENET_PROBE_TIMEOUT_DETAIL rid=%s details=%s", _rid(), _td)
+        except Exception:
+            pass
+        try:
             logger.info(_msg)
         except Exception:
             pass
@@ -1772,6 +1814,8 @@ async def _probe_single(
     guard: bool,
     *,
     deadline: float,
+    timeout_debug: Optional[List[Dict[str, Any]]] = None,
+    timeout_debug_limit: int = 0,
 ) -> Tuple[str, bool, int, str]:
     """
     REAL/STUB classifier for direct usenet proxy links.
@@ -1801,6 +1845,26 @@ async def _probe_single(
             pass
         return None
 
+    def _record_timeout(*, phase: str, attempt: int, req_range: str, started_at: float, status: int = 0, history: int = 0, final_host: str = "", bytes_read: int = 0) -> None:
+        try:
+            if timeout_debug is None or int(timeout_debug_limit or 0) <= 0 or len(timeout_debug) >= int(timeout_debug_limit or 0):
+                return
+            from urllib.parse import urlparse
+            _host = urlparse(url).netloc or "?"
+            timeout_debug.append({
+                "host": _host,
+                "phase": str(phase or "?"),
+                "attempt": int(attempt or 0),
+                "range": str(req_range or ""),
+                "elapsed_ms": int(max(0.0, (time.monotonic() - float(started_at))) * 1000.0),
+                "status": int(status or 0),
+                "history": int(history or 0),
+                "final_host": str(final_host or ""),
+                "bytes_read": int(bytes_read or 0),
+            })
+        except Exception:
+            pass
+
     for attempt in range(1, attempts + 1):
         try:
             remaining = float(deadline - time.monotonic())
@@ -1812,6 +1876,13 @@ async def _probe_single(
                 return (url, False, 0, "BUDGET")
 
             headers = {"Range": f"bytes=0-{int(initial_bytes) - 1}"}
+            _initial_range = str(headers.get("Range") or "")
+            _phase = "initial_pre"
+            _status = 0
+            _history = 0
+            _final_host = ""
+            _bytes_read = 0
+            _started_at = time.monotonic()
 
             await sem.acquire()
             try:
@@ -1823,6 +1894,7 @@ async def _probe_single(
                 if this_total2 <= 0.10:
                     return (url, False, 0, "BUDGET")
 
+                _phase = "initial_open"
                 async with session.get(
                     url,
                     headers=headers,
@@ -1834,7 +1906,16 @@ async def _probe_single(
                         sock_read=max(1.0, this_total2),
                     ),
                 ) as resp:
+                    _status = int(getattr(resp, "status", 0) or 0)
+                    _history = int(len(getattr(resp, "history", []) or []))
+                    try:
+                        from urllib.parse import urlparse
+                        _final_host = urlparse(str(getattr(resp, "url", "") or "")).netloc or ""
+                    except Exception:
+                        _final_host = ""
+                    _phase = "initial_body"
                     data = await resp.content.read(initial_bytes)
+                    _bytes_read = int(len(data or b""))
                     total = _parse_total(resp)
                     first_len = int(len(data or b""))
 
@@ -1845,10 +1926,17 @@ async def _probe_single(
                             if remaining3 <= 0.15:
                                 return (url, False, 0, "BUDGET")
                             follow_total = min(float(timeout_s), max(0.25, remaining3 - 0.05))
+                            _follow_range = f"bytes={off}-{off + 4095}"
+                            _follow_phase = f"higher_open_{off}"
+                            _follow_status = 0
+                            _follow_history = 0
+                            _follow_final_host = ""
+                            _follow_bytes = 0
+                            _follow_started_at = time.monotonic()
                             try:
                                 async with session.get(
                                     url,
-                                    headers={"Range": f"bytes={off}-{off + 4095}"},
+                                    headers={"Range": _follow_range},
                                     allow_redirects=True,
                                     timeout=aiohttp.ClientTimeout(
                                         total=follow_total,
@@ -1857,9 +1945,19 @@ async def _probe_single(
                                         sock_read=max(1.0, follow_total),
                                     ),
                                 ) as r2:
+                                    _follow_status = int(getattr(r2, "status", 0) or 0)
+                                    _follow_history = int(len(getattr(r2, "history", []) or []))
+                                    try:
+                                        from urllib.parse import urlparse
+                                        _follow_final_host = urlparse(str(getattr(r2, "url", "") or "")).netloc or ""
+                                    except Exception:
+                                        _follow_final_host = ""
+                                    _follow_phase = f"higher_body_{off}"
                                     chunk = await r2.content.read(4096)
+                                    _follow_bytes = int(len(chunk or b""))
                                     higher_lengths.append(len(chunk or b""))
                             except asyncio.TimeoutError:
+                                _record_timeout(phase=_follow_phase, attempt=attempt, req_range=_follow_range, started_at=_follow_started_at, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes)
                                 if attempt == attempts:
                                     return (url, False, 0, "FAIL_TimeoutError")
                                 raise
@@ -1887,6 +1985,7 @@ async def _probe_single(
                     pass
 
         except asyncio.TimeoutError:
+            _record_timeout(phase=_phase, attempt=attempt, req_range=_initial_range, started_at=_started_at, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read)
             if attempt == attempts:
                 return (url, False, 0, "FAIL_TimeoutError")
             await asyncio.sleep(0.15)
@@ -2116,9 +2215,27 @@ def _apply_usenet_playability_probe(
                     guard=bool(RANGE_PROBE_GUARD),
                     budget_s=float(budget),
                     target_real=int(target),
+                    prefer_force_close=True,
                 )
 
-            batch_res = asyncio.run(_main()) if urls else []
+            async def _fallback_main() -> List[Tuple[str, bool, int, str]]:
+                return await _usenet_range_probe_is_real_async(
+                    urls,
+                    concurrency=int(eff_conc),
+                    retries=int(eff_retries),
+                    timeout_s=float(timeout_s),
+                    initial_bytes=int(initial_bytes),
+                    guard=bool(RANGE_PROBE_GUARD),
+                    budget_s=float(budget),
+                    target_real=int(target),
+                    prefer_force_close=False,
+                )
+
+            try:
+                batch_res = asyncio.run(_main()) if urls else []
+            except Exception as e1:
+                logger.warning("USENET_PROBE_BATCH_RETRY rid=%s err=%s retry=plain_connector", _rid(), type(e1).__name__)
+                batch_res = asyncio.run(_fallback_main()) if urls else []
             url_to_res = {u: (bool(ok), int(size or 0), str(reason)) for (u, ok, size, reason) in (batch_res or [])}
             # Small sample of outcomes (first 5) for debugging host/status issues
             try:
@@ -2143,7 +2260,7 @@ def _apply_usenet_playability_probe(
                 if _budget_missing:
                     _rc["BUDGET"] += _budget_missing
 
-                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v16 reasons={dict(_rc.most_common(8))}'
+                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v17 reasons={dict(_rc.most_common(8))}'
                 logger.info(_reasons_msg)
                 try:
                     logging.getLogger("gunicorn.error").info(_reasons_msg)
@@ -2174,7 +2291,7 @@ def _apply_usenet_playability_probe(
                 ok, nbytes, reason = r
                 probe_results.append((idx, bool(ok), str(reason), int(nbytes or 0)))
         except Exception as e:
-            logger.warning("USENET_PROBE aiohttp_failed=%s (no fallback)", type(e).__name__)
+            logger.warning("USENET_PROBE aiohttp_failed=%s fallback=plain_connector_failed", type(e).__name__)
             probe_results = []
 
     idx_to_res = {i: (ok, reason, nbytes) for (i, ok, reason, nbytes) in probe_results}
@@ -4007,7 +4124,7 @@ handler.setFormatter(SafeFormatter("%(asctime)s | %(levelname)s | %(rid)s | %(me
 logging.getLogger().addHandler(handler)
 logging.getLogger().setLevel(LOG_LEVEL)
 logging.getLogger().addFilter(RequestIdFilter())
-logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_initial_bytes={USENET_PROBE_INITIAL_BYTES} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N} wrap_url_backend={_WRAP_URL_BACKEND} web_concurrency_env={WEB_CONCURRENCY_ENV}")
+logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_initial_bytes={USENET_PROBE_INITIAL_BYTES} usenet_probe_debug_timeouts={USENET_PROBE_DEBUG_TIMEOUTS} usenet_probe_debug_timeouts_n={USENET_PROBE_DEBUG_TIMEOUTS_N} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N} wrap_url_backend={_WRAP_URL_BACKEND} web_concurrency_env={WEB_CONCURRENCY_ENV}")
 
 logger.info(
     "LOG_FLAGS wrap_log_token_emit=%s wrap_log_token_hit=%s wrap_log_token_full=%s wrap_log_token_sample_pct=%s sort_proof_top_n=%s usenet_probe_log_urls=%s usenet_probe_log_urls_n=%s",
