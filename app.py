@@ -1613,6 +1613,20 @@ async def _usenet_range_probe_is_real_async(
     initial_bytes = max(1024, int(initial_bytes or USENET_PROBE_INITIAL_BYTES or 20000))
     target = max(0, int(target_real or 0))
     eff_parallel = max(1, min(int(concurrency or 1), int(USENET_PROBE_LIMIT_PER_HOST or 8), int(len(urls) or 1)))
+    try:
+        from urllib.parse import urlparse as _usp_urlparse
+        _hosts = [(_usp_urlparse(str(u or '')).netloc or '') for u in (urls or []) if str(u or '').strip()]
+        _host_counts = Counter(h for h in _hosts if h)
+        _dom_host, _dom_count = ('', 0)
+        if _host_counts:
+            _dom_host, _dom_count = _host_counts.most_common(1)[0]
+        if _dom_host and int(_dom_count) >= max(6, int(0.80 * max(1, len(urls)))):
+            _old_eff_parallel = int(eff_parallel)
+            eff_parallel = max(1, min(int(eff_parallel), 6))
+            if int(eff_parallel) != int(_old_eff_parallel):
+                logger.info('USENET_PROBE_HOSTCAP rid=%s host=%s share=%s/%s eff_parallel=%s->%s', _rid(), _dom_host, int(_dom_count), int(len(urls)), int(_old_eff_parallel), int(eff_parallel))
+    except Exception:
+        pass
     sem = asyncio.Semaphore(eff_parallel)
 
     _auth = None
@@ -1798,7 +1812,7 @@ async def _usenet_range_probe_is_real_async(
                         _rid(),
                         int(d.get("idx", 0)),
                         d.get("host", "?"),
-                        int(d.get("elapsed_ms", 0)),
+                        int(d.get("elapsed_ms", d.get("ms", 0))),
                         d.get("verdict", "?"),
                         d.get("reason", ""),
                         d.get("phase", "?"),
@@ -1807,7 +1821,7 @@ async def _usenet_range_probe_is_real_async(
                         d.get("range", ""),
                         int(d.get("bytes_read", 0)),
                         int(d.get("total", 0)),
-                        d.get("final_host", ""),
+                        d.get("final_host", d.get("final", "")),
                         int(d.get("attempt", 0)),
                     )
         except Exception:
@@ -1858,6 +1872,7 @@ async def _probe_single(
     attempts = max(1, int(retries or 0) + 1)
     initial_bytes = max(1024, int(initial_bytes or USENET_PROBE_INITIAL_BYTES or 20000))
     higher_offsets = (65536, 262144)
+    soft_open_retry_left = 1
 
     def _parse_total(resp: aiohttp.ClientResponse) -> Optional[int]:
         try:
@@ -1956,8 +1971,8 @@ async def _probe_single(
                     allow_redirects=True,
                     timeout=aiohttp.ClientTimeout(
                         total=this_total2,
-                        connect=min(8.0, max(1.0, this_total2)),
-                        sock_connect=min(8.0, max(1.0, this_total2)),
+                        connect=min(2.5, max(0.75, this_total2)),
+                        sock_connect=min(2.5, max(0.75, this_total2)),
                         sock_read=max(1.0, this_total2),
                     ),
                 ) as resp:
@@ -1995,8 +2010,8 @@ async def _probe_single(
                                     allow_redirects=True,
                                     timeout=aiohttp.ClientTimeout(
                                         total=follow_total,
-                                        connect=min(8.0, max(1.0, follow_total)),
-                                        sock_connect=min(8.0, max(1.0, follow_total)),
+                                        connect=min(2.0, max(0.75, follow_total)),
+                                        sock_connect=min(2.0, max(0.75, follow_total)),
                                         sock_read=max(1.0, follow_total),
                                     ),
                                 ) as r2:
@@ -2041,6 +2056,15 @@ async def _probe_single(
 
         except asyncio.TimeoutError:
             _record_timeout(phase=_phase, attempt=attempt, req_range=_initial_range, started_at=_started_at, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read)
+            if str(_phase) == "initial_open" and int(soft_open_retry_left) > 0:
+                try:
+                    _rem_retry = float(deadline - time.monotonic())
+                except Exception:
+                    _rem_retry = 0.0
+                if _rem_retry > 1.25:
+                    soft_open_retry_left -= 1
+                    await asyncio.sleep(0.10)
+                    continue
             if attempt == attempts:
                 return _finish(ok=False, size=0, reason="FAIL_TimeoutError", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
             await asyncio.sleep(0.15)
@@ -2269,7 +2293,7 @@ def _apply_usenet_playability_probe(
                     guard=bool(RANGE_PROBE_GUARD),
                     budget_s=float(budget),
                     target_real=int(target),
-                    prefer_force_close=True,
+                    prefer_force_close=False,
                 )
 
             async def _fallback_main() -> List[Tuple[str, bool, int, str]]:
@@ -2282,13 +2306,13 @@ def _apply_usenet_playability_probe(
                     guard=bool(RANGE_PROBE_GUARD),
                     budget_s=float(budget),
                     target_real=int(target),
-                    prefer_force_close=False,
+                    prefer_force_close=True,
                 )
 
             try:
                 batch_res = asyncio.run(_main()) if urls else []
             except Exception as e1:
-                logger.warning("USENET_PROBE_BATCH_RETRY rid=%s err=%s retry=plain_connector", _rid(), type(e1).__name__)
+                logger.warning("USENET_PROBE_BATCH_RETRY rid=%s err=%s retry=force_close_connector", _rid(), type(e1).__name__)
                 batch_res = asyncio.run(_fallback_main()) if urls else []
             url_to_res = {u: (bool(ok), int(size or 0), str(reason)) for (u, ok, size, reason) in (batch_res or [])}
             # Small sample of outcomes (first 5) for debugging host/status issues
