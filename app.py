@@ -1633,6 +1633,8 @@ async def _usenet_range_probe_is_real_async(
         limit_per_host=eff_parallel,
         ttl_dns_cache=300,
         keepalive_timeout=30,
+        force_close=True,
+        enable_cleanup_closed=True,
     )
 
     async with aiohttp.ClientSession(auth=_auth, connector=connector) as session:
@@ -1817,8 +1819,9 @@ async def _probe_single(
                     allow_redirects=True,
                     timeout=aiohttp.ClientTimeout(
                         total=this_total2,
-                        sock_connect=min(1.5, this_total2),
-                        sock_read=this_total2,
+                        connect=min(8.0, max(1.0, this_total2)),
+                        sock_connect=min(8.0, max(1.0, this_total2)),
+                        sock_read=max(1.0, this_total2),
                     ),
                 ) as resp:
                     data = await resp.content.read(initial_bytes)
@@ -1839,8 +1842,9 @@ async def _probe_single(
                                     allow_redirects=True,
                                     timeout=aiohttp.ClientTimeout(
                                         total=follow_total,
-                                        sock_connect=min(1.0, follow_total),
-                                        sock_read=follow_total,
+                                        connect=min(8.0, max(1.0, follow_total)),
+                                        sock_connect=min(8.0, max(1.0, follow_total)),
+                                        sock_read=max(1.0, follow_total),
                                     ),
                                 ) as r2:
                                     chunk = await r2.content.read(4096)
@@ -2108,11 +2112,12 @@ def _apply_usenet_playability_probe(
             url_to_res = {u: (bool(ok), int(size or 0), str(reason)) for (u, ok, size, reason) in (batch_res or [])}
             # Small sample of outcomes (first 5) for debugging host/status issues
             try:
+                from urllib.parse import urlparse
                 _samp=[]
                 for (_u,_ok,_sz,_rs) in (batch_res or [])[:5]:
                     try:
                         _p=urlparse(_u)
-                        _samp.append(f"{_p.netloc} {_rs} {_sz}")
+                        _samp.append(f"{_p.netloc or '(nohost)'} {_rs} {_sz}")
                     except Exception:
                         _samp.append(f"(bad_url) {_rs} {_sz}")
                 if _samp:
