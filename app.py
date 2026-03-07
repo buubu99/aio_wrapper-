@@ -527,6 +527,7 @@ USENET_PROBE_LIMIT_PER_HOST = _safe_int(os.environ.get("USENET_PROBE_LIMIT_PER_H
 USENET_PROBE_INITIAL_BYTES = _safe_int(os.environ.get("USENET_PROBE_INITIAL_BYTES", "20000"), 20000)
 USENET_PROBE_DEBUG_TIMEOUTS = _parse_bool(os.environ.get("USENET_PROBE_DEBUG_TIMEOUTS", "0"), False)
 USENET_PROBE_DEBUG_TIMEOUTS_N = _safe_int(os.environ.get("USENET_PROBE_DEBUG_TIMEOUTS_N", "0"), 0)
+USENET_PROBE_TRACE = _parse_bool(os.environ.get("USENET_PROBE_TRACE", "0"), False)
 # Demote (and optionally drop) stubs aggressively so REAL usenet links float to the top.
 USENET_PROBE_DROP_STUBS = _parse_bool(os.environ.get("USENET_PROBE_DROP_STUBS", "1"), True)
 USENET_PROBE_MARK_READY = _parse_bool(os.environ.get("USENET_PROBE_MARK_READY", "1"), True)
@@ -1670,11 +1671,14 @@ async def _usenet_range_probe_is_real_async(
         if _timeout_debug_limit <= 0:
             _timeout_debug_limit = int(len(urls))
         _timeout_debug_enabled = bool(USENET_PROBE_DEBUG_TIMEOUTS and _timeout_debug_limit > 0)
+        _trace_debug: List[Dict[str, Any]] = []
+        _trace_debug_enabled = bool(USENET_PROBE_TRACE)
 
         def _launch_more() -> None:
             nonlocal _idx
             while _idx < len(urls) and len(pending) < eff_parallel and not (_stop_target or (target > 0 and _real_hits >= target)):
                 url = urls[_idx]
+                _probe_idx = int(_idx + 1)
                 _idx += 1
                 t = asyncio.create_task(
                     _probe_single(
@@ -1688,6 +1692,8 @@ async def _usenet_range_probe_is_real_async(
                         deadline=_deadline,
                         timeout_debug=_timeout_debug if _timeout_debug_enabled else None,
                         timeout_debug_limit=_timeout_debug_limit,
+                        trace_debug=_trace_debug if _trace_debug_enabled else None,
+                        trace_idx=_probe_idx,
                     )
                 )
                 pending.add(t)
@@ -1785,6 +1791,28 @@ async def _usenet_range_probe_is_real_async(
         except Exception:
             pass
         try:
+            if _trace_debug_enabled and _trace_debug:
+                for d in sorted(_trace_debug, key=lambda x: int(x.get("idx", 0))):
+                    logger.info(
+                        "USENET_PROBE_TRACE rid=%s idx=%s host=%s ms=%s verdict=%s reason=%s phase=%s status=%s hist=%s range=%s bytes=%s total=%s final=%s attempt=%s",
+                        _rid(),
+                        int(d.get("idx", 0)),
+                        d.get("host", "?"),
+                        int(d.get("elapsed_ms", 0)),
+                        d.get("verdict", "?"),
+                        d.get("reason", ""),
+                        d.get("phase", "?"),
+                        int(d.get("status", 0)),
+                        int(d.get("history", 0)),
+                        d.get("range", ""),
+                        int(d.get("bytes_read", 0)),
+                        int(d.get("total", 0)),
+                        d.get("final_host", ""),
+                        int(d.get("attempt", 0)),
+                    )
+        except Exception:
+            pass
+        try:
             logger.info(_msg)
         except Exception:
             pass
@@ -1816,6 +1844,8 @@ async def _probe_single(
     deadline: float,
     timeout_debug: Optional[List[Dict[str, Any]]] = None,
     timeout_debug_limit: int = 0,
+    trace_debug: Optional[List[Dict[str, Any]]] = None,
+    trace_idx: int = 0,
 ) -> Tuple[str, bool, int, str]:
     """
     REAL/STUB classifier for direct usenet proxy links.
@@ -1823,6 +1853,7 @@ async def _probe_single(
     - First ranged read uses a fixed initial byte window.
     - Tiny totals are verified by higher-offset reads.
     - Timeouts become ERR; tasks unfinished at the batch wall become BUDGET.
+    - Optional trace_debug records one final line per probed link for Render logs.
     """
     attempts = max(1, int(retries or 0) + 1)
     initial_bytes = max(1024, int(initial_bytes or USENET_PROBE_INITIAL_BYTES or 20000))
@@ -1865,34 +1896,58 @@ async def _probe_single(
         except Exception:
             pass
 
+    def _finish(*, ok: bool, size: int, reason: str, phase: str, started_at: float, req_range: str, status: int = 0, history: int = 0, final_host: str = "", bytes_read: int = 0, attempt: int = 0) -> Tuple[str, bool, int, str]:
+        try:
+            if trace_debug is not None:
+                from urllib.parse import urlparse
+                _host = urlparse(url).netloc or "?"
+                _verdict = "REAL" if ok else ("STUB" if str(reason).upper().startswith("PURE_STUB") else ("BUDGET" if str(reason).upper().startswith("BUDGET") or str(reason).upper() == "SKIP_TARGET_REAL" else "ERR"))
+                trace_debug.append({
+                    "idx": int(trace_idx or 0),
+                    "host": _host,
+                    "ms": int(max(0.0, (time.monotonic() - float(started_at))) * 1000.0),
+                    "verdict": _verdict,
+                    "reason": str(reason or ""),
+                    "phase": str(phase or "?"),
+                    "status": int(status or 0),
+                    "history": int(history or 0),
+                    "range": str(req_range or ""),
+                    "bytes": int(bytes_read or 0),
+                    "total": int(size or 0),
+                    "final": str(final_host or ""),
+                    "attempt": int(attempt or 0),
+                })
+        except Exception:
+            pass
+        return (url, bool(ok), int(size or 0), str(reason or ""))
+
     for attempt in range(1, attempts + 1):
+        _started_at = time.monotonic()
+        _phase = "attempt_pre"
+        _initial_range = f"bytes=0-{int(initial_bytes) - 1}"
+        _status = 0
+        _history = 0
+        _final_host = ""
+        _bytes_read = 0
         try:
             remaining = float(deadline - time.monotonic())
             if remaining <= 0.35:
-                return (url, False, 0, "BUDGET")
+                return _finish(ok=False, size=0, reason="BUDGET", phase="deadline_pre", started_at=_started_at, req_range=_initial_range, attempt=attempt)
 
             this_total = min(float(timeout_s), max(0.10, remaining - 0.15))
             if this_total <= 0.10:
-                return (url, False, 0, "BUDGET")
+                return _finish(ok=False, size=0, reason="BUDGET", phase="deadline_pre", started_at=_started_at, req_range=_initial_range, attempt=attempt)
 
-            headers = {"Range": f"bytes=0-{int(initial_bytes) - 1}"}
-            _initial_range = str(headers.get("Range") or "")
-            _phase = "initial_pre"
-            _status = 0
-            _history = 0
-            _final_host = ""
-            _bytes_read = 0
-            _started_at = time.monotonic()
-
+            headers = {"Range": _initial_range}
             await sem.acquire()
             try:
                 remaining2 = float(deadline - time.monotonic())
                 if remaining2 <= 0.35:
-                    return (url, False, 0, "BUDGET")
+                    return _finish(ok=False, size=0, reason="BUDGET", phase="deadline_sem", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
 
                 this_total2 = min(float(this_total), max(0.10, remaining2 - 0.15))
                 if this_total2 <= 0.10:
-                    return (url, False, 0, "BUDGET")
+                    return _finish(ok=False, size=0, reason="BUDGET", phase="deadline_sem", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
 
                 _phase = "initial_open"
                 async with session.get(
@@ -1924,7 +1979,7 @@ async def _probe_single(
                         for off in higher_offsets:
                             remaining3 = float(deadline - time.monotonic())
                             if remaining3 <= 0.15:
-                                return (url, False, 0, "BUDGET")
+                                return _finish(ok=False, size=0, reason="BUDGET", phase=f"higher_budget_{off}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
                             follow_total = min(float(timeout_s), max(0.25, remaining3 - 0.05))
                             _follow_range = f"bytes={off}-{off + 4095}"
                             _follow_phase = f"higher_open_{off}"
@@ -1955,28 +2010,28 @@ async def _probe_single(
                                     _follow_phase = f"higher_body_{off}"
                                     chunk = await r2.content.read(4096)
                                     _follow_bytes = int(len(chunk or b""))
-                                    higher_lengths.append(len(chunk or b""))
+                                    higher_lengths.append(_follow_bytes)
                             except asyncio.TimeoutError:
                                 _record_timeout(phase=_follow_phase, attempt=attempt, req_range=_follow_range, started_at=_follow_started_at, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes)
                                 if attempt == attempts:
-                                    return (url, False, 0, "FAIL_TimeoutError")
+                                    return _finish(ok=False, size=0, reason="FAIL_TimeoutError", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
                                 raise
                             except asyncio.CancelledError:
-                                return (url, False, 0, "BUDGET")
+                                return _finish(ok=False, size=0, reason="BUDGET", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
                             except Exception as e:
                                 if attempt == attempts:
-                                    return (url, False, 0, f"FAIL_{type(e).__name__}")
+                                    return _finish(ok=False, size=0, reason=f"FAIL_{type(e).__name__}", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
                                 raise
 
                         max_got = max(higher_lengths) if higher_lengths else 0
                         if max_got <= 300:
-                            return (url, False, int(total or 0), "PURE_STUB_CONFIRMED")
-                        return (url, True, int(total or max_got), "REAL_HIGHER_OFFSETS")
+                            return _finish(ok=False, size=int(total or 0), reason="PURE_STUB_CONFIRMED", phase=f"higher_body_{higher_offsets[-1]}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=max_got, attempt=attempt)
+                        return _finish(ok=True, size=int(total or max_got), reason="REAL_HIGHER_OFFSETS", phase=f"higher_body_{higher_offsets[-1]}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=max_got, attempt=attempt)
 
                     if first_len <= 0:
-                        return (url, False, 0, "FAIL_EmptyRead")
+                        return _finish(ok=False, size=0, reason="FAIL_EmptyRead", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
 
-                    return (url, True, int(total or first_len), "REAL_INITIAL")
+                    return _finish(ok=True, size=int(total or first_len), reason="REAL_INITIAL", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
 
             finally:
                 try:
@@ -1987,17 +2042,16 @@ async def _probe_single(
         except asyncio.TimeoutError:
             _record_timeout(phase=_phase, attempt=attempt, req_range=_initial_range, started_at=_started_at, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read)
             if attempt == attempts:
-                return (url, False, 0, "FAIL_TimeoutError")
+                return _finish(ok=False, size=0, reason="FAIL_TimeoutError", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
             await asyncio.sleep(0.15)
         except asyncio.CancelledError:
-            return (url, False, 0, "BUDGET")
+            return _finish(ok=False, size=0, reason="BUDGET", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
         except Exception as e:
             if attempt == attempts:
-                return (url, False, 0, f"FAIL_{type(e).__name__}")
+                return _finish(ok=False, size=0, reason=f"FAIL_{type(e).__name__}", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
             await asyncio.sleep(0.15)
 
-    return (url, False, 0, "BUDGET")
-
+    return _finish(ok=False, size=0, reason="BUDGET", phase="final_fallthrough", started_at=time.monotonic(), req_range="", attempt=attempts)
 
 def _apply_usenet_playability_probe(
 
@@ -4124,7 +4178,7 @@ handler.setFormatter(SafeFormatter("%(asctime)s | %(levelname)s | %(rid)s | %(me
 logging.getLogger().addHandler(handler)
 logging.getLogger().setLevel(LOG_LEVEL)
 logging.getLogger().addFilter(RequestIdFilter())
-logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_initial_bytes={USENET_PROBE_INITIAL_BYTES} usenet_probe_debug_timeouts={USENET_PROBE_DEBUG_TIMEOUTS} usenet_probe_debug_timeouts_n={USENET_PROBE_DEBUG_TIMEOUTS_N} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N} wrap_url_backend={_WRAP_URL_BACKEND} web_concurrency_env={WEB_CONCURRENCY_ENV}")
+logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_initial_bytes={USENET_PROBE_INITIAL_BYTES} usenet_probe_debug_timeouts={USENET_PROBE_DEBUG_TIMEOUTS} usenet_probe_debug_timeouts_n={USENET_PROBE_DEBUG_TIMEOUTS_N} usenet_probe_trace={USENET_PROBE_TRACE} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N} wrap_url_backend={_WRAP_URL_BACKEND} web_concurrency_env={WEB_CONCURRENCY_ENV}")
 
 logger.info(
     "LOG_FLAGS wrap_log_token_emit=%s wrap_log_token_hit=%s wrap_log_token_full=%s wrap_log_token_sample_pct=%s sort_proof_top_n=%s usenet_probe_log_urls=%s usenet_probe_log_urls_n=%s",
