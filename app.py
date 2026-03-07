@@ -1846,6 +1846,7 @@ async def _usenet_range_probe_is_real_async(
     return results
 
 
+
 async def _probe_single(
     session: aiohttp.ClientSession,
     url: str,
@@ -1864,10 +1865,10 @@ async def _probe_single(
     """
     REAL/STUB classifier for direct usenet proxy links.
 
-    - First ranged read uses a fixed initial byte window.
-    - Tiny totals are verified by higher-offset reads.
-    - Timeouts become ERR; tasks unfinished at the batch wall become BUDGET.
-    - Optional trace_debug records one final line per probed link for Render logs.
+    Important fix:
+    - a soft retry for INITIAL OPEN timeout must NOT consume the only attempt
+    - otherwise retries=0 can incorrectly fall through to BUDGET/final_fallthrough
+      for URLs that actually started but just needed one immediate re-open
     """
     attempts = max(1, int(retries or 0) + 1)
     initial_bytes = max(1024, int(initial_bytes or USENET_PROBE_INITIAL_BYTES or 20000))
@@ -1916,7 +1917,8 @@ async def _probe_single(
             if trace_debug is not None:
                 from urllib.parse import urlparse
                 _host = urlparse(url).netloc or "?"
-                _verdict = "REAL" if ok else ("STUB" if str(reason).upper().startswith("PURE_STUB") else ("BUDGET" if str(reason).upper().startswith("BUDGET") or str(reason).upper() == "SKIP_TARGET_REAL" else "ERR"))
+                _reason_up = str(reason or "").upper()
+                _verdict = "REAL" if ok else ("STUB" if _reason_up.startswith("PURE_STUB") else ("BUDGET" if _reason_up.startswith("BUDGET") or _reason_up == "SKIP_TARGET_REAL" else "ERR"))
                 trace_debug.append({
                     "idx": int(trace_idx or 0),
                     "host": _host,
@@ -1936,7 +1938,8 @@ async def _probe_single(
             pass
         return (url, bool(ok), int(size or 0), str(reason or ""))
 
-    for attempt in range(1, attempts + 1):
+    attempt = 1
+    while attempt <= attempts:
         _started_at = time.monotonic()
         _phase = "attempt_pre"
         _initial_range = f"bytes=0-{int(initial_bytes) - 1}"
@@ -2028,13 +2031,13 @@ async def _probe_single(
                                     higher_lengths.append(_follow_bytes)
                             except asyncio.TimeoutError:
                                 _record_timeout(phase=_follow_phase, attempt=attempt, req_range=_follow_range, started_at=_follow_started_at, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes)
-                                if attempt == attempts:
+                                if attempt >= attempts:
                                     return _finish(ok=False, size=0, reason="FAIL_TimeoutError", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
                                 raise
                             except asyncio.CancelledError:
                                 return _finish(ok=False, size=0, reason="BUDGET", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
                             except Exception as e:
-                                if attempt == attempts:
+                                if attempt >= attempts:
                                     return _finish(ok=False, size=0, reason=f"FAIL_{type(e).__name__}", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
                                 raise
 
@@ -2064,18 +2067,23 @@ async def _probe_single(
                 if _rem_retry > 1.25:
                     soft_open_retry_left -= 1
                     await asyncio.sleep(0.10)
+                    # retry the same logical attempt; do not consume the only configured attempt
                     continue
-            if attempt == attempts:
+            if attempt >= attempts:
                 return _finish(ok=False, size=0, reason="FAIL_TimeoutError", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+            attempt += 1
             await asyncio.sleep(0.15)
+            continue
         except asyncio.CancelledError:
             return _finish(ok=False, size=0, reason="BUDGET", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
         except Exception as e:
-            if attempt == attempts:
+            if attempt >= attempts:
                 return _finish(ok=False, size=0, reason=f"FAIL_{type(e).__name__}", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+            attempt += 1
             await asyncio.sleep(0.15)
+            continue
 
-    return _finish(ok=False, size=0, reason="BUDGET", phase="final_fallthrough", started_at=time.monotonic(), req_range="", attempt=attempts)
+    return _finish(ok=False, size=0, reason="FAIL_FALLTHROUGH", phase="final_fallthrough", started_at=time.monotonic(), req_range="", attempt=attempts)
 
 def _apply_usenet_playability_probe(
 
