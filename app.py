@@ -1628,14 +1628,24 @@ async def _usenet_range_probe_is_real_async(
     except Exception:
         pass
 
-    connector = aiohttp.TCPConnector(
-        limit=eff_parallel,
-        limit_per_host=eff_parallel,
-        ttl_dns_cache=300,
-        keepalive_timeout=30,
-        force_close=True,
-        enable_cleanup_closed=True,
-    )
+    try:
+        connector = aiohttp.TCPConnector(
+            limit=eff_parallel,
+            limit_per_host=eff_parallel,
+            ttl_dns_cache=300,
+            force_close=True,
+            enable_cleanup_closed=True,
+        )
+    except Exception as e:
+        try:
+            logger.warning("USENET_PROBE_CONN_FALLBACK rid=%s err=%s", _rid(), type(e).__name__)
+        except Exception:
+            pass
+        connector = aiohttp.TCPConnector(
+            limit=eff_parallel,
+            limit_per_host=eff_parallel,
+            ttl_dns_cache=300,
+        )
 
     async with aiohttp.ClientSession(auth=_auth, connector=connector) as session:
         task_url: Dict[asyncio.Task, str] = {}
