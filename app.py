@@ -1642,12 +1642,13 @@ async def _usenet_range_probe_is_real_async(
     """
     Probe usenet proxy URLs and classify them using a fixed initial byte window.
 
-    v21 app-adapted rules:
+    v22 app-adapted rules:
     - keep the configured initial body read (default 20,000 bytes)
     - use rolling scheduling so we can start far more than the active parallelism within the same global budget
     - never count unlaunched budget placeholders as "scanned/tested"
     - use interleaved launch order for the selected probe batch to avoid clustering slow links in one wave
     - use plain keepalive connector for dominant single-host proxy batches, but do not reduce active concurrency
+    - for dominant single-host batches, limit same-host initial_open pressure separately from total batch width
     - late or unfinished work becomes BUDGET_* (still BUDGET at the app-facing state level)
     """
     results: List[Tuple[str, bool, int, str]] = []
@@ -1699,10 +1700,15 @@ async def _usenet_range_probe_is_real_async(
     # Dominant single-host proxy batches usually do better with connection reuse.
     _use_force_close = bool(prefer_force_close) and (not _dominant_single_host)
     _conn_mode = "force_close" if _use_force_close else "plain_keepalive"
+    # Limit only the same-host initial_open phase; do not shrink the whole batch width.
+    _open_parallel = int(eff_parallel)
+    if _dominant_single_host:
+        _open_parallel = max(4, min(int(eff_parallel), max(5, int((int(eff_parallel) + 1) // 2))))
+    open_sem = asyncio.Semaphore(max(1, int(_open_parallel)))
     try:
         logger.info(
-            "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s initial_bytes=%s budget_s=%.2f timeout_s=%.2f retries=%s target_real=%s mode=%s order=%s dom_host=%s dom_share=%s/%s",
-            _rid(), int(concurrency or 1), int(eff_parallel), int(initial_bytes), float(budget_s), float(timeout_s), int(retries or 0), int(target),
+            "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s open_parallel=%s initial_bytes=%s budget_s=%.2f timeout_s=%.2f retries=%s target_real=%s mode=%s order=%s dom_host=%s dom_share=%s/%s",
+            _rid(), int(concurrency or 1), int(eff_parallel), int(_open_parallel), int(initial_bytes), float(budget_s), float(timeout_s), int(retries or 0), int(target),
             _conn_mode, "interleave_halves", _dom_host or "", int(_dom_count or 0), int(len(probe_urls) or 0),
         )
     except Exception:
@@ -1780,6 +1786,7 @@ async def _usenet_range_probe_is_real_async(
                         initial_bytes=int(initial_bytes),
                         guard=bool(guard),
                         deadline=_deadline,
+                        open_sem=open_sem,
                         timeout_debug=_timeout_debug if _timeout_debug_enabled else None,
                         timeout_debug_limit=_timeout_debug_limit,
                         trace_debug=_trace_debug if _trace_debug_enabled else None,
@@ -1933,6 +1940,7 @@ async def _probe_single(
     guard: bool,
     *,
     deadline: float,
+    open_sem: Optional[asyncio.Semaphore] = None,
     timeout_debug: Optional[List[Dict[str, Any]]] = None,
     timeout_debug_limit: int = 0,
     trace_debug: Optional[List[Dict[str, Any]]] = None,
@@ -1951,8 +1959,8 @@ async def _probe_single(
     initial_bytes = max(1024, int(initial_bytes or USENET_PROBE_INITIAL_BYTES or 20000))
     higher_offsets = (65536, 262144)
     higher_span = 4096
-    meaningful_launch_s = max(1.25, min(float(timeout_s or 0.0) * 0.20, 2.00))
-    deadline_tail_s = 0.15
+    meaningful_launch_s = max(1.60, min(float(timeout_s or 0.0) * 0.24, 2.40))
+    deadline_tail_s = 0.20
 
     def _parse_total(resp: aiohttp.ClientResponse) -> Optional[int]:
         try:
@@ -2064,89 +2072,124 @@ async def _probe_single(
                     return _finish(ok=False, size=0, reason="BUDGET_STARTED", phase="deadline_sem", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
 
                 _phase = "initial_open"
-                async with session.get(
-                    url,
-                    headers=headers,
-                    allow_redirects=True,
-                    timeout=aiohttp.ClientTimeout(
-                        total=this_total2,
-                        connect=min(5.5, max(1.25, this_total2 * 0.70)),
-                        sock_connect=min(5.5, max(1.25, this_total2 * 0.70)),
-                        sock_read=max(2.0, this_total2 * 0.85),
-                    ),
-                ) as resp:
-                    _status = int(getattr(resp, "status", 0) or 0)
-                    _history = int(len(getattr(resp, "history", []) or []))
-                    try:
-                        from urllib.parse import urlparse
-                        _final_host = urlparse(str(getattr(resp, "url", "") or "")).netloc or ""
-                    except Exception:
-                        _final_host = ""
-                    _phase = "initial_body"
-                    data = await resp.content.read(initial_bytes)
-                    _bytes_read = int(len(data or b""))
-                    total = _parse_total(resp)
-                    first_len = int(_bytes_read)
-                    kind = _detect_kind(data)
-                    suspicious = bool((total is not None and int(total) < 100_000) or kind == "MP4")
-
-                    if suspicious:
-                        higher_lengths: List[int] = []
-                        for off in higher_offsets:
-                            remaining3 = _remaining()
-                            if remaining3 <= 0.90:
-                                return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=f"higher_budget_{off}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
-                            follow_total = min(max(0.90, remaining3 - 0.05), float(timeout_s))
-                            _follow_range = f"bytes={off}-{off + higher_span - 1}"
-                            _follow_phase = f"higher_open_{off}"
-                            _follow_status = 0
-                            _follow_history = 0
-                            _follow_final_host = ""
-                            _follow_bytes = 0
-                            _follow_started_at = time.monotonic()
+                _open_acquired = False
+                try:
+                    if open_sem is not None:
+                        await open_sem.acquire()
+                        _open_acquired = True
+                    async with session.get(
+                        url,
+                        headers=headers,
+                        allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(
+                            total=this_total2,
+                            connect=min(5.5, max(1.25, this_total2 * 0.70)),
+                            sock_connect=min(5.5, max(1.25, this_total2 * 0.70)),
+                            sock_read=max(2.0, this_total2 * 0.85),
+                        ),
+                    ) as resp:
+                        if _open_acquired:
                             try:
-                                async with session.get(
-                                    url,
-                                    headers={"Range": _follow_range},
-                                    allow_redirects=True,
-                                    timeout=aiohttp.ClientTimeout(
-                                        total=follow_total,
-                                        connect=min(3.0, max(0.75, follow_total)),
-                                        sock_connect=min(3.0, max(0.75, follow_total)),
-                                        sock_read=max(0.90, follow_total),
-                                    ),
-                                ) as r2:
-                                    _follow_status = int(getattr(r2, "status", 0) or 0)
-                                    _follow_history = int(len(getattr(r2, "history", []) or []))
-                                    try:
-                                        from urllib.parse import urlparse
-                                        _follow_final_host = urlparse(str(getattr(r2, "url", "") or "")).netloc or ""
-                                    except Exception:
-                                        _follow_final_host = ""
-                                    _follow_phase = f"higher_body_{off}"
-                                    chunk = await r2.content.read(higher_span)
-                                    _follow_bytes = int(len(chunk or b""))
-                                    higher_lengths.append(_follow_bytes)
-                            except asyncio.TimeoutError:
-                                _record_timeout(phase=_follow_phase, attempt=attempt, req_range=_follow_range, started_at=_follow_started_at, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes)
-                                return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
-                            except asyncio.CancelledError:
-                                return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
+                                open_sem.release()
                             except Exception:
-                                return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
+                                pass
+                            _open_acquired = False
+                        _status = int(getattr(resp, "status", 0) or 0)
+                        _history = int(len(getattr(resp, "history", []) or []))
+                        try:
+                            from urllib.parse import urlparse
+                            _final_host = urlparse(str(getattr(resp, "url", "") or "")).netloc or ""
+                        except Exception:
+                            _final_host = ""
+                        _phase = "initial_body"
+                        data = await resp.content.read(initial_bytes)
+                        _bytes_read = int(len(data or b""))
+                        total = _parse_total(resp)
+                        first_len = int(_bytes_read)
+                        kind = _detect_kind(data)
+                        suspicious = bool((total is not None and int(total) < 100_000) or kind == "MP4")
 
-                        real_high = sum(1 for n in higher_lengths if int(n or 0) >= 1000)
-                        empty_high = sum(1 for n in higher_lengths if int(n or 0) < 100)
-                        if real_high >= 1:
-                            return _finish(ok=True, size=int(total or max(higher_lengths or [0])), reason="REAL_HIGHER_OFFSETS", phase=f"higher_body_{higher_offsets[-1]}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=max(higher_lengths or [0]), attempt=attempt)
-                        if higher_lengths and empty_high == len(higher_lengths):
-                            return _finish(ok=False, size=int(total or 0), reason="PURE_STUB_CONFIRMED", phase=f"higher_body_{higher_offsets[-1]}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=max(higher_lengths or [0]), attempt=attempt)
-                        return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=f"higher_body_{higher_offsets[-1]}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=max(higher_lengths or [0]), attempt=attempt)
+                        if suspicious:
+                            higher_lengths: List[int] = []
+                            for off in higher_offsets:
+                                remaining3 = _remaining()
+                                if remaining3 <= 0.90:
+                                    return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=f"higher_budget_{off}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+                                follow_total = min(max(0.90, remaining3 - 0.05), float(timeout_s))
+                                _follow_range = f"bytes={off}-{off + higher_span - 1}"
+                                _follow_phase = f"higher_open_{off}"
+                                _follow_status = 0
+                                _follow_history = 0
+                                _follow_final_host = ""
+                                _follow_bytes = 0
+                                _follow_started_at = time.monotonic()
+                                try:
+                                    _follow_open_acquired = False
+                                    try:
+                                        if open_sem is not None:
+                                            await open_sem.acquire()
+                                            _follow_open_acquired = True
+                                        async with session.get(
+                                            url,
+                                            headers={"Range": _follow_range},
+                                            allow_redirects=True,
+                                            timeout=aiohttp.ClientTimeout(
+                                                total=follow_total,
+                                                connect=min(3.0, max(0.75, follow_total)),
+                                                sock_connect=min(3.0, max(0.75, follow_total)),
+                                                sock_read=max(0.90, follow_total),
+                                            ),
+                                        ) as r2:
+                                            if _follow_open_acquired:
+                                                try:
+                                                    open_sem.release()
+                                                except Exception:
+                                                    pass
+                                                _follow_open_acquired = False
+                                            _follow_status = int(getattr(r2, "status", 0) or 0)
+                                            _follow_history = int(len(getattr(r2, "history", []) or []))
+                                            try:
+                                                from urllib.parse import urlparse
+                                                _follow_final_host = urlparse(str(getattr(r2, "url", "") or "")).netloc or ""
+                                            except Exception:
+                                                _follow_final_host = ""
+                                            _follow_phase = f"higher_body_{off}"
+                                            chunk = await r2.content.read(higher_span)
+                                            _follow_bytes = int(len(chunk or b""))
+                                            higher_lengths.append(_follow_bytes)
+                                    finally:
+                                        if _follow_open_acquired:
+                                            try:
+                                                open_sem.release()
+                                            except Exception:
+                                                pass
+                                except asyncio.TimeoutError:
+                                    _record_timeout(phase=_follow_phase, attempt=attempt, req_range=_follow_range, started_at=_follow_started_at, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes)
+                                    return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
+                                except asyncio.CancelledError:
+                                    return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
+                                except Exception:
+                                    return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
 
-                    if first_len <= 0:
-                        return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+                            real_high = sum(1 for n in higher_lengths if int(n or 0) >= 1000)
+                            empty_high = sum(1 for n in higher_lengths if int(n or 0) < 100)
+                            if real_high >= 1:
+                                return _finish(ok=True, size=int(total or max(higher_lengths or [0])), reason="REAL_HIGHER_OFFSETS", phase=f"higher_body_{higher_offsets[-1]}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=max(higher_lengths or [0]), attempt=attempt)
+                            if higher_lengths and empty_high == len(higher_lengths):
+                                return _finish(ok=False, size=int(total or 0), reason="PURE_STUB_CONFIRMED", phase=f"higher_body_{higher_offsets[-1]}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=max(higher_lengths or [0]), attempt=attempt)
+                            return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=f"higher_body_{higher_offsets[-1]}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=max(higher_lengths or [0]), attempt=attempt)
+                finally:
+                    if _open_acquired:
+                        try:
+                            open_sem.release()
+                        except Exception:
+                            pass
 
-                    return _finish(ok=True, size=int(total or first_len), reason="REAL_INITIAL", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+                if first_len <= 0:
+                    return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+
+                return _finish(ok=True, size=int(total or first_len), reason="REAL_INITIAL", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+
 
             finally:
                 try:
@@ -2435,7 +2478,7 @@ def _apply_usenet_playability_probe(
                 if _budget_missing:
                     _rc["BUDGET_UNLAUNCHED"] += _budget_missing
 
-                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v21 reasons={dict(_rc.most_common(8))}'
+                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v22 reasons={dict(_rc.most_common(8))}'
                 logger.info(_reasons_msg)
                 try:
                     logging.getLogger("gunicorn.error").info(_reasons_msg)
