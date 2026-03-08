@@ -1640,16 +1640,12 @@ async def _usenet_range_probe_is_real_async(
     guard: bool = True,
     budget_s: float = 8.5,
     target_real: int = 0,
-    prefer_force_close: bool = False,
+    prefer_force_close: bool = True,
 ) -> List[Tuple[str, bool, int, str]]:
     """
     Probe usenet proxy URLs and classify them using a fixed initial byte window.
 
-    v31 flow:
-    - preserve original single-batch scheduler (no phase split starvation)
-    - keepalive connector is preferred first; force-close is fallback only
-    - smaller initial byte window comes from env/caller (e.g. 8192)
-    - suspicious MP4 only escalates when total is missing
+    v26 flow reset:
     - keep the configured initial body read (default 20,000 bytes)
     - keep interleaved launch order for the selected probe batch
     - launch the full selected batch immediately, like the standalone baseline
@@ -1878,7 +1874,7 @@ async def _usenet_range_probe_is_real_async(
                 logger.info("USENET_PROBE_SAMPLE rid=%s sample=%s", _rid(), _sample)
             try:
                 _rc = Counter(str(r[3]) for r in results)
-                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v31 reasons={dict(_rc.most_common(8))}'
+                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v26 reasons={dict(_rc.most_common(8))}'
                 logger.info(_reasons_msg)
                 print(_reasons_msg)
             except Exception:
@@ -2051,7 +2047,7 @@ async def _probe_single(
                     total = _parse_total(resp)
                     first_len = int(_bytes_read)
                     kind = _detect_kind(data)
-                    suspicious = bool((total is not None and int(total) < 100_000) or (kind == "MP4" and total is None))
+                    suspicious = bool((total is not None and int(total) < 100_000) or kind == "MP4")
 
                     if suspicious:
                         _host_key = _final_host
@@ -2428,7 +2424,7 @@ def _apply_usenet_playability_probe(
                     guard=bool(RANGE_PROBE_GUARD),
                     budget_s=float(budget),
                     target_real=int(target),
-                    prefer_force_close=False,
+                    prefer_force_close=True,
                 )
 
             async def _fallback_main() -> List[Tuple[str, bool, int, str]]:
@@ -2441,7 +2437,7 @@ def _apply_usenet_playability_probe(
                     guard=bool(RANGE_PROBE_GUARD),
                     budget_s=float(budget),
                     target_real=int(target),
-                    prefer_force_close=True,
+                    prefer_force_close=False,
                 )
 
             try:
