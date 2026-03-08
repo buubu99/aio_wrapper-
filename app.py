@@ -1750,7 +1750,7 @@ async def _usenet_range_probe_is_real_async(
                     timeout_s=float(timeout_s),
                     initial_bytes=int(pass1_bytes),
                     guard=bool(guard),
-                    deadline=deadline,
+                    deadline=pass1_deadline,
                 )
             )
             pass1_tasks[t] = url
@@ -1804,7 +1804,7 @@ async def _usenet_range_probe_is_real_async(
         if suspicious_rows and time.monotonic() < deadline:
             verify_tasks: Dict[asyncio.Task, str] = {}
             for row in suspicious_rows:
-                t = asyncio.create_task(_verify_suspicious_single(session, row, sem, float(timeout_s)))
+                t = asyncio.create_task(_verify_suspicious_single(session, row, sem, float(timeout_s), deadline=deadline))
                 verify_tasks[t] = str(row.get("url") or "")
             done2, pending2 = await asyncio.wait(
                 list(verify_tasks.keys()),
@@ -1873,7 +1873,7 @@ async def _usenet_range_probe_is_real_async(
                 logger.info("USENET_PROBE_SAMPLE rid=%s sample=%s", _rid(), _sample)
             try:
                 _rc = Counter(str(r[3]) for r in results)
-                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v27 reasons={dict(_rc.most_common(8))}'
+                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v30 reasons={dict(_rc.most_common(8))}'
                 logger.info(_reasons_msg)
                 print(_reasons_msg)
             except Exception:
@@ -1919,7 +1919,7 @@ async def _probe_single(
 
     attempts = max(1, int(retries or 0) + 1)
     pass1_bytes = max(1024, min(int(initial_bytes or USENET_PROBE_INITIAL_BYTES or 8192), 8192))
-    base_total = max(1.0, min(float(timeout_s or 1.0), 6.0))
+    configured_total = max(1.0, float(timeout_s or 1.0))
 
     def _parse_total(resp: aiohttp.ClientResponse) -> Optional[int]:
         try:
@@ -1965,15 +1965,32 @@ async def _probe_single(
             started = True
             started_at = time.monotonic()
             try:
+                remaining = max(0.0, float(deadline or 0.0) - time.monotonic() - 0.10)
+                if remaining < 0.75:
+                    return {
+                        "url": url,
+                        "ok": False,
+                        "size": int(total or 0),
+                        "reason": "BUDGET_STARTED" if started else "BUDGET_UNLAUNCHED",
+                        "suspicious": True,
+                        "started": bool(started),
+                        "total": total,
+                        "kind": kind,
+                        "status": status,
+                        "history": history,
+                        "final_host": final_host,
+                        "bytes_read": bytes_read,
+                    }
+                req_total = max(0.75, min(configured_total, remaining))
                 async with session.get(
                     url,
                     headers={"Range": req_range},
                     allow_redirects=True,
                     timeout=aiohttp.ClientTimeout(
-                        total=base_total,
-                        connect=min(2.5, max(1.0, base_total * 0.45)),
-                        sock_connect=min(2.5, max(1.0, base_total * 0.45)),
-                        sock_read=max(2.0, base_total),
+                        total=req_total,
+                        connect=min(3.0, max(1.0, req_total * 0.45)),
+                        sock_connect=min(3.0, max(1.0, req_total * 0.45)),
+                        sock_read=max(2.0, req_total),
                     ),
                 ) as resp:
                     status = int(getattr(resp, "status", 0) or 0)
@@ -2108,13 +2125,15 @@ async def _verify_suspicious_single(
     row: Dict[str, Any],
     sem: asyncio.Semaphore,
     timeout_s: float,
+    *,
+    deadline: float,
 ) -> Tuple[str, bool, int, str]:
     """Phase-2 verifier for suspicious links using only two higher-range checks."""
     url = str(row.get("url") or "")
     total = int(row.get("total") or 0)
     higher_offsets = (65536, 131072)
     higher_span = 4096
-    follow_total = max(1.0, min(2.5, float(timeout_s or 2.5)))
+    configured_follow_total = max(1.0, float(timeout_s or 2.5))
     started = False
 
     try:
@@ -2130,14 +2149,18 @@ async def _verify_suspicious_single(
             bytes_read = 0
             sig = ""
             try:
+                remaining = max(0.0, float(deadline or 0.0) - time.monotonic() - 0.10)
+                if remaining < 0.75:
+                    return (url, False, int(total or 0), "BUDGET_STARTED" if started else "BUDGET_UNLAUNCHED")
+                follow_total = max(0.75, min(configured_follow_total, remaining))
                 async with session.get(
                     url,
                     headers={"Range": req_range},
                     allow_redirects=True,
                     timeout=aiohttp.ClientTimeout(
                         total=follow_total,
-                        connect=min(1.5, max(0.8, follow_total * 0.5)),
-                        sock_connect=min(1.5, max(0.8, follow_total * 0.5)),
+                        connect=min(2.0, max(0.8, follow_total * 0.5)),
+                        sock_connect=min(2.0, max(0.8, follow_total * 0.5)),
                         sock_read=max(1.5, follow_total),
                     ),
                 ) as resp:
