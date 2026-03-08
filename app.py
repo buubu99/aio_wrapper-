@@ -528,6 +528,11 @@ USENET_PROBE_INITIAL_BYTES = _safe_int(os.environ.get("USENET_PROBE_INITIAL_BYTE
 USENET_PROBE_DEBUG_TIMEOUTS = _parse_bool(os.environ.get("USENET_PROBE_DEBUG_TIMEOUTS", "0"), False)
 USENET_PROBE_DEBUG_TIMEOUTS_N = _safe_int(os.environ.get("USENET_PROBE_DEBUG_TIMEOUTS_N", "0"), 0)
 USENET_PROBE_TRACE = _parse_bool(os.environ.get("USENET_PROBE_TRACE", "0"), False)
+# Additional probe tuning knobs used by the direct usenet classifier.
+USENET_PROBE_ATTEMPT1_TIMEOUT_S = _safe_float(os.environ.get("USENET_PROBE_ATTEMPT1_TIMEOUT_S", "0"), 0.0)
+USENET_PROBE_BUSY_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_BUSY_CONCURRENCY", str(USENET_PROBE_LIMIT_PER_HOST or 6)), max(1, int(USENET_PROBE_LIMIT_PER_HOST or 6)))
+USENET_PROBE_CONCURRENCY_CAP = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY_CAP", str(USENET_PROBE_CONCURRENCY or 8)), max(1, int(USENET_PROBE_CONCURRENCY or 8)))
+USENET_PROBE_RETRY_SLEEP_S = _safe_float(os.environ.get("USENET_PROBE_RETRY_SLEEP_S", "0.10"), 0.10)
 # Demote (and optionally drop) stubs aggressively so REAL usenet links float to the top.
 USENET_PROBE_DROP_STUBS = _parse_bool(os.environ.get("USENET_PROBE_DROP_STUBS", "1"), True)
 USENET_PROBE_MARK_READY = _parse_bool(os.environ.get("USENET_PROBE_MARK_READY", "1"), True)
@@ -1612,7 +1617,12 @@ async def _usenet_range_probe_is_real_async(
     results: List[Tuple[str, bool, int, str]] = []
     initial_bytes = max(1024, int(initial_bytes or USENET_PROBE_INITIAL_BYTES or 20000))
     target = max(0, int(target_real or 0))
-    eff_parallel = max(1, min(int(concurrency or 1), int(USENET_PROBE_LIMIT_PER_HOST or 8), int(len(urls) or 1)))
+    eff_parallel = max(1, min(
+        int(concurrency or 1),
+        int(USENET_PROBE_LIMIT_PER_HOST or 8),
+        int(USENET_PROBE_CONCURRENCY_CAP or int(concurrency or 1) or 8),
+        int(len(urls) or 1),
+    ))
     try:
         from urllib.parse import urlparse as _usp_urlparse
         _hosts = [(_usp_urlparse(str(u or '')).netloc or '') for u in (urls or []) if str(u or '').strip()]
@@ -1621,10 +1631,13 @@ async def _usenet_range_probe_is_real_async(
         if _host_counts:
             _dom_host, _dom_count = _host_counts.most_common(1)[0]
         if _dom_host and int(_dom_count) >= max(6, int(0.80 * max(1, len(urls)))):
+            _busy_cap = max(1, int(USENET_PROBE_BUSY_CONCURRENCY or 6))
             _old_eff_parallel = int(eff_parallel)
-            eff_parallel = max(1, min(int(eff_parallel), 6))
-            if int(eff_parallel) != int(_old_eff_parallel):
+            eff_parallel = max(1, min(int(eff_parallel), int(_busy_cap)))
+            try:
                 logger.info('USENET_PROBE_HOSTCAP rid=%s host=%s share=%s/%s eff_parallel=%s->%s', _rid(), _dom_host, int(_dom_count), int(len(urls)), int(_old_eff_parallel), int(eff_parallel))
+            except Exception:
+                pass
     except Exception:
         pass
     sem = asyncio.Semaphore(eff_parallel)
@@ -1819,7 +1832,7 @@ async def _usenet_range_probe_is_real_async(
                         int(d.get("status", 0)),
                         int(d.get("history", 0)),
                         d.get("range", ""),
-                        int(d.get("bytes_read", 0)),
+                        int(d.get("bytes", d.get("bytes_read", 0))),
                         int(d.get("total", 0)),
                         d.get("final_host", d.get("final", "")),
                         int(d.get("attempt", 0)),
@@ -1865,15 +1878,16 @@ async def _probe_single(
     """
     REAL/STUB classifier for direct usenet proxy links.
 
-    Important fix:
-    - a soft retry for INITIAL OPEN timeout must NOT consume the only attempt
-    - otherwise retries=0 can incorrectly fall through to BUDGET/final_fallthrough
-      for URLs that actually started but just needed one immediate re-open
+    v15 fixes:
+    - no hidden soft retry when retries=0
+    - large Content-Range totals classify as REAL from headers immediately
+    - dominant-host transport pressure is reduced by quicker success turnover
+    - BUDGET is reserved for true deadline/cancellation only
     """
     attempts = max(1, int(retries or 0) + 1)
     initial_bytes = max(1024, int(initial_bytes or USENET_PROBE_INITIAL_BYTES or 20000))
     higher_offsets = (65536, 262144)
-    soft_open_retry_left = 1
+    retry_sleep_s = max(0.0, float(USENET_PROBE_RETRY_SLEEP_S or 0.10))
 
     def _parse_total(resp: aiohttp.ClientResponse) -> Optional[int]:
         try:
@@ -1918,7 +1932,7 @@ async def _probe_single(
                 from urllib.parse import urlparse
                 _host = urlparse(url).netloc or "?"
                 _reason_up = str(reason or "").upper()
-                _verdict = "REAL" if ok else ("STUB" if _reason_up.startswith("PURE_STUB") else ("BUDGET" if _reason_up.startswith("BUDGET") or _reason_up == "SKIP_TARGET_REAL" else "ERR"))
+                _verdict = "REAL" if ok else ("STUB" if (_reason_up.startswith("PURE_STUB") or _reason_up.startswith("PARTIAL_STUB")) else ("BUDGET" if _reason_up.startswith("BUDGET") or _reason_up == "SKIP_TARGET_REAL" else "ERR"))
                 trace_debug.append({
                     "idx": int(trace_idx or 0),
                     "host": _host,
@@ -1952,7 +1966,10 @@ async def _probe_single(
             if remaining <= 0.35:
                 return _finish(ok=False, size=0, reason="BUDGET", phase="deadline_pre", started_at=_started_at, req_range=_initial_range, attempt=attempt)
 
-            this_total = min(float(timeout_s), max(0.10, remaining - 0.15))
+            base_total = float(timeout_s)
+            if attempt == 1 and float(USENET_PROBE_ATTEMPT1_TIMEOUT_S or 0.0) > 0.0:
+                base_total = min(base_total, float(USENET_PROBE_ATTEMPT1_TIMEOUT_S))
+            this_total = min(base_total, max(0.10, remaining - 0.15))
             if this_total <= 0.10:
                 return _finish(ok=False, size=0, reason="BUDGET", phase="deadline_pre", started_at=_started_at, req_range=_initial_range, attempt=attempt)
 
@@ -1974,8 +1991,8 @@ async def _probe_single(
                     allow_redirects=True,
                     timeout=aiohttp.ClientTimeout(
                         total=this_total2,
-                        connect=min(2.5, max(0.75, this_total2)),
-                        sock_connect=min(2.5, max(0.75, this_total2)),
+                        connect=min(2.0, max(0.75, this_total2)),
+                        sock_connect=min(2.0, max(0.75, this_total2)),
                         sock_read=max(1.0, this_total2),
                     ),
                 ) as resp:
@@ -1986,11 +2003,16 @@ async def _probe_single(
                         _final_host = urlparse(str(getattr(resp, "url", "") or "")).netloc or ""
                     except Exception:
                         _final_host = ""
-                    _phase = "initial_body"
-                    data = await resp.content.read(initial_bytes)
-                    _bytes_read = int(len(data or b""))
+
                     total = _parse_total(resp)
-                    first_len = int(len(data or b""))
+                    # Fast path: a non-tiny total is enough proof for these proxy links.
+                    if total is not None and int(total) >= 100_000:
+                        return _finish(ok=True, size=int(total), reason="REAL_INITIAL", phase="initial_headers", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=0, attempt=attempt)
+
+                    _phase = "initial_body"
+                    data = await resp.content.read(min(initial_bytes, 4096))
+                    _bytes_read = int(len(data or b""))
+                    first_len = int(_bytes_read)
 
                     if total is not None and total < 100_000:
                         higher_lengths: List[int] = []
@@ -2013,9 +2035,9 @@ async def _probe_single(
                                     allow_redirects=True,
                                     timeout=aiohttp.ClientTimeout(
                                         total=follow_total,
-                                        connect=min(2.0, max(0.75, follow_total)),
-                                        sock_connect=min(2.0, max(0.75, follow_total)),
-                                        sock_read=max(1.0, follow_total),
+                                        connect=min(1.5, max(0.50, follow_total)),
+                                        sock_connect=min(1.5, max(0.50, follow_total)),
+                                        sock_read=max(0.75, follow_total),
                                     ),
                                 ) as r2:
                                     _follow_status = int(getattr(r2, "status", 0) or 0)
@@ -2059,20 +2081,11 @@ async def _probe_single(
 
         except asyncio.TimeoutError:
             _record_timeout(phase=_phase, attempt=attempt, req_range=_initial_range, started_at=_started_at, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read)
-            if str(_phase) == "initial_open" and int(soft_open_retry_left) > 0:
-                try:
-                    _rem_retry = float(deadline - time.monotonic())
-                except Exception:
-                    _rem_retry = 0.0
-                if _rem_retry > 1.25:
-                    soft_open_retry_left -= 1
-                    await asyncio.sleep(0.10)
-                    # retry the same logical attempt; do not consume the only configured attempt
-                    continue
             if attempt >= attempts:
                 return _finish(ok=False, size=0, reason="FAIL_TimeoutError", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
             attempt += 1
-            await asyncio.sleep(0.15)
+            if retry_sleep_s > 0:
+                await asyncio.sleep(retry_sleep_s)
             continue
         except asyncio.CancelledError:
             return _finish(ok=False, size=0, reason="BUDGET", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
@@ -2080,7 +2093,8 @@ async def _probe_single(
             if attempt >= attempts:
                 return _finish(ok=False, size=0, reason=f"FAIL_{type(e).__name__}", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
             attempt += 1
-            await asyncio.sleep(0.15)
+            if retry_sleep_s > 0:
+                await asyncio.sleep(retry_sleep_s)
             continue
 
     return _finish(ok=False, size=0, reason="FAIL_FALLTHROUGH", phase="final_fallthrough", started_at=time.monotonic(), req_range="", attempt=attempts)
@@ -4210,7 +4224,7 @@ handler.setFormatter(SafeFormatter("%(asctime)s | %(levelname)s | %(rid)s | %(me
 logging.getLogger().addHandler(handler)
 logging.getLogger().setLevel(LOG_LEVEL)
 logging.getLogger().addFilter(RequestIdFilter())
-logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_initial_bytes={USENET_PROBE_INITIAL_BYTES} usenet_probe_debug_timeouts={USENET_PROBE_DEBUG_TIMEOUTS} usenet_probe_debug_timeouts_n={USENET_PROBE_DEBUG_TIMEOUTS_N} usenet_probe_trace={USENET_PROBE_TRACE} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N} wrap_url_backend={_WRAP_URL_BACKEND} web_concurrency_env={WEB_CONCURRENCY_ENV}")
+logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_initial_bytes={USENET_PROBE_INITIAL_BYTES} usenet_probe_debug_timeouts={USENET_PROBE_DEBUG_TIMEOUTS} usenet_probe_debug_timeouts_n={USENET_PROBE_DEBUG_TIMEOUTS_N} usenet_probe_trace={USENET_PROBE_TRACE} usenet_probe_attempt1_timeout_s={USENET_PROBE_ATTEMPT1_TIMEOUT_S} usenet_probe_busy_concurrency={USENET_PROBE_BUSY_CONCURRENCY} usenet_probe_concurrency_cap={USENET_PROBE_CONCURRENCY_CAP} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N} wrap_url_backend={_WRAP_URL_BACKEND} web_concurrency_env={WEB_CONCURRENCY_ENV}")
 
 logger.info(
     "LOG_FLAGS wrap_log_token_emit=%s wrap_log_token_hit=%s wrap_log_token_full=%s wrap_log_token_sample_pct=%s sort_proof_top_n=%s usenet_probe_log_urls=%s usenet_probe_log_urls_n=%s",
