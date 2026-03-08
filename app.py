@@ -1642,13 +1642,14 @@ async def _usenet_range_probe_is_real_async(
     """
     Probe usenet proxy URLs and classify them using a fixed initial byte window.
 
-    v22 app-adapted rules:
+    v23 app-adapted rules:
     - keep the configured initial body read (default 20,000 bytes)
     - use rolling scheduling so we can start far more than the active parallelism within the same global budget
     - never count unlaunched budget placeholders as "scanned/tested"
     - use interleaved launch order for the selected probe batch to avoid clustering slow links in one wave
     - use plain keepalive connector for dominant single-host proxy batches, but do not reduce active concurrency
     - for dominant single-host batches, limit same-host initial_open pressure separately from total batch width
+    - queued tasks do not start their active probe timer until they actually get an open slot
     - late or unfinished work becomes BUDGET_* (still BUDGET at the app-facing state level)
     """
     results: List[Tuple[str, bool, int, str]] = []
@@ -1701,9 +1702,11 @@ async def _usenet_range_probe_is_real_async(
     _use_force_close = bool(prefer_force_close) and (not _dominant_single_host)
     _conn_mode = "force_close" if _use_force_close else "plain_keepalive"
     # Limit only the same-host initial_open phase; do not shrink the whole batch width.
+    # v23: slightly raise the same-host open gate versus v22 so harder/random titles can get a bit more
+    # actual open throughput, while still avoiding the v21-style open storm.
     _open_parallel = int(eff_parallel)
     if _dominant_single_host:
-        _open_parallel = max(4, min(int(eff_parallel), max(5, int((int(eff_parallel) + 1) // 2))))
+        _open_parallel = max(4, min(int(eff_parallel), 6))
     open_sem = asyncio.Semaphore(max(1, int(_open_parallel)))
     try:
         logger.info(
@@ -2044,7 +2047,9 @@ async def _probe_single(
 
     attempt = 1
     while attempt <= attempts:
-        _started_at = time.monotonic()
+        _queued_at = time.monotonic()
+        _started_at = float(_queued_at)
+        _attempt_started = False
         _phase = "attempt_pre"
         _initial_range = f"bytes=0-{int(initial_bytes) - 1}"
         _status = 0
@@ -2054,22 +2059,22 @@ async def _probe_single(
         try:
             remaining = _remaining()
             if remaining <= (meaningful_launch_s + deadline_tail_s):
-                return _finish(ok=False, size=0, reason="BUDGET_UNLAUNCHED", phase="deadline_pre", started_at=_started_at, req_range=_initial_range, attempt=attempt)
+                return _finish(ok=False, size=0, reason="BUDGET_UNLAUNCHED", phase="deadline_pre", started_at=_queued_at, req_range=_initial_range, attempt=attempt)
 
             this_total = min(float(timeout_s), max(meaningful_launch_s, remaining - deadline_tail_s))
             if this_total < meaningful_launch_s:
-                return _finish(ok=False, size=0, reason="BUDGET_UNLAUNCHED", phase="deadline_pre", started_at=_started_at, req_range=_initial_range, attempt=attempt)
+                return _finish(ok=False, size=0, reason="BUDGET_UNLAUNCHED", phase="deadline_pre", started_at=_queued_at, req_range=_initial_range, attempt=attempt)
 
             headers = {"Range": _initial_range}
             await sem.acquire()
             try:
                 remaining2 = _remaining()
                 if remaining2 <= (meaningful_launch_s + deadline_tail_s):
-                    return _finish(ok=False, size=0, reason="BUDGET_STARTED", phase="deadline_sem", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+                    return _finish(ok=False, size=0, reason="BUDGET_UNLAUNCHED", phase="deadline_queue", started_at=_queued_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
 
                 this_total2 = min(float(this_total), max(meaningful_launch_s, remaining2 - deadline_tail_s))
                 if this_total2 < meaningful_launch_s:
-                    return _finish(ok=False, size=0, reason="BUDGET_STARTED", phase="deadline_sem", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+                    return _finish(ok=False, size=0, reason="BUDGET_UNLAUNCHED", phase="deadline_queue", started_at=_queued_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
 
                 _phase = "initial_open"
                 _open_acquired = False
@@ -2077,15 +2082,37 @@ async def _probe_single(
                     if open_sem is not None:
                         await open_sem.acquire()
                         _open_acquired = True
+                    remaining3 = _remaining()
+                    if remaining3 <= (meaningful_launch_s + deadline_tail_s):
+                        if _open_acquired:
+                            try:
+                                open_sem.release()
+                            except Exception:
+                                pass
+                            _open_acquired = False
+                        return _finish(ok=False, size=0, reason="BUDGET_UNLAUNCHED", phase="deadline_openq", started_at=_queued_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+
+                    this_total3 = min(float(this_total2), max(meaningful_launch_s, remaining3 - deadline_tail_s))
+                    if this_total3 < meaningful_launch_s:
+                        if _open_acquired:
+                            try:
+                                open_sem.release()
+                            except Exception:
+                                pass
+                            _open_acquired = False
+                        return _finish(ok=False, size=0, reason="BUDGET_UNLAUNCHED", phase="deadline_openq", started_at=_queued_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+
+                    _started_at = time.monotonic()
+                    _attempt_started = True
                     async with session.get(
                         url,
                         headers=headers,
                         allow_redirects=True,
                         timeout=aiohttp.ClientTimeout(
-                            total=this_total2,
-                            connect=min(5.5, max(1.25, this_total2 * 0.70)),
-                            sock_connect=min(5.5, max(1.25, this_total2 * 0.70)),
-                            sock_read=max(2.0, this_total2 * 0.85),
+                            total=this_total3,
+                            connect=min(5.5, max(1.25, this_total3 * 0.70)),
+                            sock_connect=min(5.5, max(1.25, this_total3 * 0.70)),
+                            sock_read=max(2.0, this_total3 * 0.85),
                         ),
                     ) as resp:
                         if _open_acquired:
@@ -2112,10 +2139,10 @@ async def _probe_single(
                         if suspicious:
                             higher_lengths: List[int] = []
                             for off in higher_offsets:
-                                remaining3 = _remaining()
-                                if remaining3 <= 0.90:
+                                remaining4 = _remaining()
+                                if remaining4 <= 0.90:
                                     return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=f"higher_budget_{off}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
-                                follow_total = min(max(0.90, remaining3 - 0.05), float(timeout_s))
+                                follow_total = min(max(0.90, remaining4 - 0.05), float(timeout_s))
                                 _follow_range = f"bytes={off}-{off + higher_span - 1}"
                                 _follow_phase = f"higher_open_{off}"
                                 _follow_status = 0
@@ -2129,15 +2156,26 @@ async def _probe_single(
                                         if open_sem is not None:
                                             await open_sem.acquire()
                                             _follow_open_acquired = True
+                                        _follow_remaining = _remaining()
+                                        if _follow_remaining <= 0.90:
+                                            if _follow_open_acquired:
+                                                try:
+                                                    open_sem.release()
+                                                except Exception:
+                                                    pass
+                                                _follow_open_acquired = False
+                                            return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=_follow_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+                                        _follow_total_eff = min(float(follow_total), max(0.90, _follow_remaining - 0.05))
+                                        _follow_started_at = time.monotonic()
                                         async with session.get(
                                             url,
                                             headers={"Range": _follow_range},
                                             allow_redirects=True,
                                             timeout=aiohttp.ClientTimeout(
-                                                total=follow_total,
-                                                connect=min(3.0, max(0.75, follow_total)),
-                                                sock_connect=min(3.0, max(0.75, follow_total)),
-                                                sock_read=max(0.90, follow_total),
+                                                total=_follow_total_eff,
+                                                connect=min(3.0, max(0.75, _follow_total_eff)),
+                                                sock_connect=min(3.0, max(0.75, _follow_total_eff)),
+                                                sock_read=max(0.90, _follow_total_eff),
                                             ),
                                         ) as r2:
                                             if _follow_open_acquired:
@@ -2198,22 +2236,25 @@ async def _probe_single(
                     pass
 
         except asyncio.TimeoutError:
-            _record_timeout(phase=_phase, attempt=attempt, req_range=_initial_range, started_at=_started_at, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read)
+            _record_timeout(phase=_phase, attempt=attempt, req_range=_initial_range, started_at=(_started_at if _attempt_started else _queued_at), status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read)
             if attempt >= attempts:
-                return _finish(ok=False, size=0, reason="BUDGET_STARTED", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+                _reason = "BUDGET_STARTED" if _attempt_started else "BUDGET_UNLAUNCHED"
+                return _finish(ok=False, size=0, reason=_reason, phase=_phase, started_at=(_started_at if _attempt_started else _queued_at), req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
             attempt += 1
             await asyncio.sleep(0.10)
             continue
         except asyncio.CancelledError:
-            return _finish(ok=False, size=0, reason="BUDGET_STARTED", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+            _reason = "BUDGET_STARTED" if _attempt_started else "BUDGET_UNLAUNCHED"
+            return _finish(ok=False, size=0, reason=_reason, phase=_phase, started_at=(_started_at if _attempt_started else _queued_at), req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
         except Exception:
             if attempt >= attempts:
-                return _finish(ok=False, size=0, reason="BUDGET_STARTED", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+                _reason = "BUDGET_STARTED" if _attempt_started else "BUDGET_UNLAUNCHED"
+                return _finish(ok=False, size=0, reason=_reason, phase=_phase, started_at=(_started_at if _attempt_started else _queued_at), req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
             attempt += 1
             await asyncio.sleep(0.10)
             continue
 
-    return _finish(ok=False, size=0, reason="BUDGET_STARTED", phase="final_fallthrough", started_at=time.monotonic(), req_range="", attempt=attempts)
+    return _finish(ok=False, size=0, reason="BUDGET_UNLAUNCHED", phase="final_fallthrough", started_at=time.monotonic(), req_range="", attempt=attempts)
 
 
 def _apply_usenet_playability_probe(
@@ -2478,7 +2519,7 @@ def _apply_usenet_playability_probe(
                 if _budget_missing:
                     _rc["BUDGET_UNLAUNCHED"] += _budget_missing
 
-                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v22 reasons={dict(_rc.most_common(8))}'
+                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v23 reasons={dict(_rc.most_common(8))}'
                 logger.info(_reasons_msg)
                 try:
                     logging.getLogger("gunicorn.error").info(_reasons_msg)
