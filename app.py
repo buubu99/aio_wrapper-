@@ -1640,29 +1640,20 @@ async def _usenet_range_probe_is_real_async(
     guard: bool = True,
     budget_s: float = 8.5,
     target_real: int = 0,
-    prefer_force_close: bool = True,
+    prefer_force_close: bool = False,
 ) -> List[Tuple[str, bool, int, str]]:
     """
-    Probe usenet proxy URLs and classify them using a fixed initial byte window.
+    Probe usenet proxy URLs with throughput-first scheduling.
 
-    v26 flow reset:
-    - keep the configured initial body read (default 20,000 bytes)
-    - keep interleaved launch order for the selected probe batch
-    - launch the full selected batch immediately, like the standalone baseline
-    - use a single semaphore for active concurrency (no separate initial_open clamp)
-    - keep fixed per-request probe timeouts; enforce the batch wall only at the outer wait/join layer
-    - queued tasks are cancelled by the global batch wall and map to BUDGET_* inside _probe_single
-    - late or unfinished work becomes BUDGET_* (still BUDGET at the app-facing state level)
+    v27 flow:
+    - phase 1 touches every selected URL with one cheap initial range read
+    - non-suspicious links become REAL immediately
+    - only suspicious links consume phase-2 verification work
+    - keepalive connector is preferred first; force-close is fallback only
+    - the outer batch wall is enforced across the whole probe batch
     """
     results: List[Tuple[str, bool, int, str]] = []
-    initial_bytes = max(1024, int(initial_bytes or USENET_PROBE_INITIAL_BYTES or 20000))
     target = max(0, int(target_real or 0))
-    eff_parallel = max(1, min(
-        int(concurrency or 1),
-        int(USENET_PROBE_LIMIT_PER_HOST or int(concurrency or 1) or 1),
-        int(USENET_PROBE_CONCURRENCY_CAP or int(concurrency or 1) or 1),
-        int(len(urls) or 1),
-    ))
 
     probe_urls = [str(u) for u in (urls or []) if str(u or '').strip()]
     if len(probe_urls) >= 4:
@@ -1677,7 +1668,15 @@ async def _usenet_range_probe_is_real_async(
                 _interleaved.append(_right[_i])
         probe_urls = _interleaved
 
-    sem = asyncio.Semaphore(eff_parallel)
+    if not probe_urls:
+        return results
+
+    eff_parallel = max(1, min(
+        int(concurrency or 1),
+        int(USENET_PROBE_LIMIT_PER_HOST or int(concurrency or 1) or 1),
+        int(USENET_PROBE_CONCURRENCY_CAP or int(concurrency or 1) or 1),
+        int(len(probe_urls) or 1),
+    ))
 
     _auth = None
     try:
@@ -1688,35 +1687,27 @@ async def _usenet_range_probe_is_real_async(
     except Exception:
         _auth = None
 
+    pass1_bytes = max(1024, min(int(initial_bytes or USENET_PROBE_INITIAL_BYTES or 8192), 8192))
     _use_force_close = bool(prefer_force_close)
     _conn_mode = "force_close" if _use_force_close else "plain_keepalive"
     try:
         logger.info(
-            "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s initial_bytes=%s budget_s=%.2f timeout_s=%.2f retries=%s target_real=%s mode=%s order=%s total=%s",
-            _rid(), int(concurrency or 1), int(eff_parallel), int(initial_bytes), float(budget_s), float(timeout_s), int(retries or 0), int(target),
+            "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s pass1_bytes=%s budget_s=%.2f timeout_s=%.2f retries=%s target_real=%s mode=%s order=%s total=%s",
+            _rid(), int(concurrency or 1), int(eff_parallel), int(pass1_bytes), float(budget_s), float(timeout_s), int(retries or 0), int(target),
             _conn_mode, "interleave_halves", int(len(probe_urls) or 0),
         )
     except Exception:
         pass
 
     try:
-        if _use_force_close:
-            connector = aiohttp.TCPConnector(
-                limit=eff_parallel,
-                limit_per_host=eff_parallel,
-                ttl_dns_cache=300,
-                force_close=True,
-                enable_cleanup_closed=True,
-            )
-        else:
-            connector = aiohttp.TCPConnector(
-                limit=eff_parallel,
-                limit_per_host=eff_parallel,
-                ttl_dns_cache=300,
-                force_close=False,
-                enable_cleanup_closed=True,
-                keepalive_timeout=20,
-            )
+        connector = aiohttp.TCPConnector(
+            limit=eff_parallel,
+            limit_per_host=eff_parallel,
+            ttl_dns_cache=300,
+            force_close=bool(_use_force_close),
+            enable_cleanup_closed=True,
+            keepalive_timeout=20 if not _use_force_close else None,
+        )
     except Exception as e:
         try:
             logger.warning("USENET_PROBE_CONN_FALLBACK rid=%s mode=%s err=%s", _rid(), _conn_mode, type(e).__name__)
@@ -1731,23 +1722,25 @@ async def _usenet_range_probe_is_real_async(
         )
 
     async with aiohttp.ClientSession(auth=_auth, connector=connector) as session:
-        task_url: Dict[asyncio.Task, str] = {}
-        pending: set[asyncio.Task] = set()
-        _real_hits = 0
-        _stop_target = False
-        _timeout_debug: List[Dict[str, Any]] = []
-        _timeout_debug_limit = max(0, int(USENET_PROBE_DEBUG_TIMEOUTS_N or 0))
-        if _timeout_debug_limit <= 0:
-            _timeout_debug_limit = int(len(probe_urls))
-        _timeout_debug_enabled = bool(USENET_PROBE_DEBUG_TIMEOUTS and _timeout_debug_limit > 0)
-        _trace_debug: List[Dict[str, Any]] = []
-        _trace_debug_enabled = bool(USENET_PROBE_TRACE)
-        _family_counts: Dict[Tuple[str, int, str, str], int] = {}
-        _family_verdicts: Dict[Tuple[str, int, str, str], str] = {}
-        _higher_key_counts: Dict[Tuple[str, int, int, str], int] = {}
-        _higher_stub_cache: set = set()
+        sem = asyncio.Semaphore(eff_parallel)
+        started_at = time.monotonic()
+        deadline = started_at + max(0.5, float(budget_s or 0.0))
+        # Reserve a small tail for phase-2 verification so suspicious links do not get starved.
+        verify_window = max(
+            1.5,
+            min(
+                3.5,
+                max(1.5, float(timeout_s or 0.0) * 0.9),
+                max(1.5, float(budget_s or 0.0) * 0.30),
+            ),
+        )
+        pass1_deadline = min(deadline, started_at + max(0.5, float(budget_s or 0.0) - verify_window))
+        pass1_tasks: Dict[asyncio.Task, str] = {}
+        rows_by_url: Dict[str, Dict[str, Any]] = {}
+        suspicious_rows: List[Dict[str, Any]] = []
+        real_hits = 0
 
-        for _probe_idx, url in enumerate(probe_urls, 1):
+        for url in probe_urls:
             t = asyncio.create_task(
                 _probe_single(
                     session,
@@ -1755,78 +1748,103 @@ async def _usenet_range_probe_is_real_async(
                     sem,
                     retries=int(retries or 0),
                     timeout_s=float(timeout_s),
-                    initial_bytes=int(initial_bytes),
+                    initial_bytes=int(pass1_bytes),
                     guard=bool(guard),
-                    deadline=0.0,
-                    open_sem=None,
-                    timeout_debug=_timeout_debug if _timeout_debug_enabled else None,
-                    timeout_debug_limit=_timeout_debug_limit,
-                    trace_debug=_trace_debug if _trace_debug_enabled else None,
-                    trace_idx=int(_probe_idx),
-                    family_counts=_family_counts,
-                    family_verdicts=_family_verdicts,
-                    higher_key_counts=_higher_key_counts,
-                    higher_stub_cache=_higher_stub_cache,
+                    deadline=deadline,
                 )
             )
-            pending.add(t)
-            task_url[t] = url
+            pass1_tasks[t] = url
 
-        _t0 = time.monotonic()
-        while pending:
-            _remaining = max(0.0, float(budget_s) - (time.monotonic() - _t0))
-            if _remaining <= 0.0:
-                break
+        done1, pending1 = await asyncio.wait(
+            list(pass1_tasks.keys()),
+            timeout=max(0.0, pass1_deadline - time.monotonic()),
+        )
 
-            done, pending = await asyncio.wait(
-                pending,
-                timeout=_remaining,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if not done:
-                break
+        for t in done1:
+            url = pass1_tasks.pop(t, "")
+            try:
+                row = t.result() or {"url": url, "ok": False, "size": 0, "reason": "BUDGET_UNLAUNCHED", "suspicious": True, "started": False}
+            except Exception as e:
+                row = {"url": url, "ok": False, "size": 0, "reason": f"FAIL_{type(e).__name__}", "suspicious": True, "started": False}
+            rows_by_url[url] = row
+            if bool(row.get("ok")):
+                results.append((url, True, int(row.get("size") or 0), str(row.get("reason") or "REAL_INITIAL")))
+                real_hits += 1
+            else:
+                reason = str(row.get("reason") or "")
+                if reason.startswith("BUDGET") or reason.startswith("FAIL_"):
+                    results.append((url, False, int(row.get("size") or 0), reason))
+                elif bool(row.get("suspicious")):
+                    suspicious_rows.append(row)
+                else:
+                    results.append((url, False, int(row.get("size") or 0), reason or "FAIL_Unknown"))
 
-            for t in done:
-                u = task_url.pop(t, "")
-                try:
-                    res = t.result()
-                    if res:
-                        results.append(res)
-                        try:
-                            if bool(res[1]):
-                                _real_hits += 1
-                        except Exception:
-                            pass
-                except Exception as e:
-                    logger.warning("PROBE_EXC url=%s err=%s", u, type(e).__name__)
-                    if u:
-                        results.append((u, False, 0, f"FAIL_{type(e).__name__}"))
-
-            if target > 0 and _real_hits >= target:
-                _stop_target = True
-                break
-
-        _elapsed = time.monotonic() - _t0
-
-        if pending:
-            _pending_list = list(pending)
-            for t in _pending_list:
+        if pending1:
+            cancelled = list(pending1)
+            for t in cancelled:
                 try:
                     t.cancel()
                 except Exception:
                     pass
-            _cancelled = await asyncio.gather(*_pending_list, return_exceptions=True)
-            for t, cres in zip(_pending_list, _cancelled):
-                u = task_url.pop(t, "")
-                if _stop_target:
-                    if u:
-                        results.append((u, False, 0, "SKIP_TARGET_REAL"))
-                    continue
-                if isinstance(cres, tuple) and len(cres) >= 4:
-                    results.append(cres)
-                elif u:
-                    results.append((u, False, 0, "BUDGET_STARTED"))
+            cancelled_res = await asyncio.gather(*cancelled, return_exceptions=True)
+            for t, cres in zip(cancelled, cancelled_res):
+                url = pass1_tasks.pop(t, "")
+                if isinstance(cres, dict):
+                    row = cres
+                else:
+                    row = {"url": url, "ok": False, "size": 0, "reason": "BUDGET_UNLAUNCHED", "suspicious": True, "started": False}
+                rows_by_url[url] = row
+                results.append((url, False, int(row.get("size") or 0), str(row.get("reason") or "BUDGET_UNLAUNCHED")))
 
+        if target > 0 and real_hits >= target:
+            for row in suspicious_rows:
+                results.append((str(row.get("url") or ""), False, int(row.get("size") or 0), "SKIP_TARGET_REAL"))
+            suspicious_rows = []
+
+        if suspicious_rows and time.monotonic() < deadline:
+            verify_tasks: Dict[asyncio.Task, str] = {}
+            for row in suspicious_rows:
+                t = asyncio.create_task(_verify_suspicious_single(session, row, sem, float(timeout_s)))
+                verify_tasks[t] = str(row.get("url") or "")
+            done2, pending2 = await asyncio.wait(
+                list(verify_tasks.keys()),
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+            for t in done2:
+                try:
+                    results.append(t.result())
+                except Exception as e:
+                    url = verify_tasks.get(t, "")
+                    results.append((url, False, 0, f"FAIL_{type(e).__name__}"))
+            if pending2:
+                cancelled = list(pending2)
+                for t in cancelled:
+                    try:
+                        t.cancel()
+                    except Exception:
+                        pass
+                cancelled_res = await asyncio.gather(*cancelled, return_exceptions=True)
+                for t, cres in zip(cancelled, cancelled_res):
+                    url = verify_tasks.get(t, "")
+                    if isinstance(cres, tuple) and len(cres) >= 4:
+                        results.append(cres)
+                    else:
+                        results.append((url, False, int(rows_by_url.get(url, {}).get("size") or 0), "BUDGET_STARTED"))
+        elif suspicious_rows:
+            for row in suspicious_rows:
+                results.append((str(row.get("url") or ""), False, int(row.get("size") or 0), "BUDGET_UNLAUNCHED"))
+
+        elapsed = time.monotonic() - started_at
+        try:
+            logger.info(
+                "USENET_PROBE_PHASES rid=%s pass1_deadline_in=%.2f verify_window=%.2f remaining_verify=%.2f",
+                _rid(),
+                max(0.0, pass1_deadline - started_at),
+                float(verify_window),
+                max(0.0, deadline - time.monotonic()),
+            )
+        except Exception:
+            pass
         try:
             _total = int(len(probe_urls))
             _started = sum(1 for (_u, _ok, _sz, _rs) in (results or []) if str(_rs).upper() != "BUDGET_UNLAUNCHED")
@@ -1835,32 +1853,13 @@ async def _usenet_range_probe_is_real_async(
             _budget_unlaunched = sum(1 for (_u, _ok, _sz, _rs) in (results or []) if str(_rs).upper() == "BUDGET_UNLAUNCHED")
             _skip_target = sum(1 for (_u, _ok, _sz, _rs) in (results or []) if str(_rs).upper() == "SKIP_TARGET_REAL")
             _msg = (
-                f"PROBE_PARTIAL: cand={_total} started={_started} definitive={_definitive} real={int(_real_hits)} "
+                f"PROBE_PARTIAL: cand={_total} started={_started} definitive={_definitive} real={sum(1 for r in results if bool(r[1]))} "
                 f"budget_started={int(_budget_started)} budget_unlaunched={int(_budget_unlaunched)} skip_target={int(_skip_target)} "
-                f"in {float(min(_elapsed, float(budget_s))):.2f} s"
+                f"in {float(min(elapsed, float(budget_s))):.2f} s"
             )
         except Exception:
-            _msg = f"PROBE_PARTIAL: results={int(len(results))} in {float(min(_elapsed, float(budget_s))):.2f} s"
+            _msg = f"PROBE_PARTIAL: results={int(len(results))} in {float(min(elapsed, float(budget_s))):.2f} s"
         try:
-            if _timeout_debug_enabled and _timeout_debug:
-                _tc = Counter(str(d.get("phase") or "?") for d in _timeout_debug)
-                logger.info("USENET_PROBE_TIMEOUT_PHASES rid=%s counts=%s", _rid(), dict(_tc))
-                _td = []
-                for d in _timeout_debug[:_timeout_debug_limit]:
-                    _td.append(
-                        "host=%s phase=%s attempt=%s elapsed_ms=%s status=%s hist=%s range=%s bytes=%s final=%s" % (
-                            d.get("host", "?"), d.get("phase", "?"), d.get("attempt", 0), d.get("elapsed_ms", 0),
-                            d.get("status", 0), d.get("history", 0), d.get("range", ""), d.get("bytes_read", 0), d.get("final_host", "")
-                        )
-                    )
-                if _td:
-                    logger.info("USENET_PROBE_TIMEOUT_DETAIL rid=%s details=%s", _rid(), _td)
-            if _trace_debug_enabled and _trace_debug:
-                for d in sorted(_trace_debug, key=lambda x: int(x.get("idx", 0) or 0)):
-                    logger.info(
-                        "USENET_PROBE_TRACE rid=%s idx=%s host=%s ms=%s verdict=%s reason=%s phase=%s status=%s hist=%s range=%s bytes=%s total=%s final=%s attempt=%s",
-                        _rid(), d.get("idx", 0), d.get("host", "?"), d.get("ms", 0), d.get("verdict", "?"), d.get("reason", ""), d.get("phase", "?"), d.get("status", 0), d.get("history", 0), d.get("range", ""), d.get("bytes", 0), d.get("total", 0), d.get("final", ""), d.get("attempt", 0),
-                    )
             logger.info(_msg)
             print(_msg)
             _sample = []
@@ -1874,7 +1873,7 @@ async def _usenet_range_probe_is_real_async(
                 logger.info("USENET_PROBE_SAMPLE rid=%s sample=%s", _rid(), _sample)
             try:
                 _rc = Counter(str(r[3]) for r in results)
-                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v26 reasons={dict(_rc.most_common(8))}'
+                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v27 reasons={dict(_rc.most_common(8))}'
                 logger.info(_reasons_msg)
                 print(_reasons_msg)
             except Exception:
@@ -1883,6 +1882,7 @@ async def _usenet_range_probe_is_real_async(
             pass
 
     return results
+
 
 
 async def _probe_single(
@@ -1904,21 +1904,22 @@ async def _probe_single(
     family_verdicts: Optional[Dict[Tuple[str, int, str, str], str]] = None,
     higher_key_counts: Optional[Dict[Tuple[str, int, int, str], int]] = None,
     higher_stub_cache: Optional[set] = None,
-) -> Tuple[str, bool, int, str]:
+) -> Dict[str, Any]:
     """
-    REAL/STUB/BUDGET classifier for direct usenet proxy links.
+    Pass-1 probe only.
 
-    v26 flow reset:
-    - REAL requires reading the configured initial byte window (no header-only REAL)
-    - suspicious tiny/header-weird links get only two higher-range checks
-    - fixed per-request timeouts; outer batch wall decides when to cancel remaining work
-    - healthy links stay on the fast path with zero extra work
+    Throughput-first version:
+    - do one cheap initial ranged read on every candidate first
+    - classify healthy links as REAL immediately
+    - defer suspicious links to phase 2 so they do not monopolize semaphore slots
+    - outer batch scheduler owns the 12s wall; cancelled/unfinished work maps to BUDGET_*
     """
+    del guard, open_sem, timeout_debug, timeout_debug_limit, trace_debug, trace_idx
+    del family_counts, family_verdicts, higher_key_counts, higher_stub_cache
+
     attempts = max(1, int(retries or 0) + 1)
-    initial_bytes = max(1024, int(initial_bytes or USENET_PROBE_INITIAL_BYTES or 20000))
-    higher_offsets = (65536, 131072)
-    higher_span = 4096
-    base_total = max(1.0, float(timeout_s or 1.0))
+    pass1_bytes = max(1024, min(int(initial_bytes or USENET_PROBE_INITIAL_BYTES or 8192), 8192))
+    base_total = max(1.0, min(float(timeout_s or 1.0), 6.0))
 
     def _parse_total(resp: aiohttp.ClientResponse) -> Optional[int]:
         try:
@@ -1948,267 +1949,233 @@ async def _probe_single(
             pass
         return "NONE"
 
-    def _sig12(buf: bytes) -> str:
-        try:
-            if not buf:
-                return ""
-            return hashlib.sha1(bytes(buf[:64])).hexdigest()[:12]
-        except Exception:
-            return ""
+    queued_at = time.monotonic()
+    started = False
+    status = 0
+    history = 0
+    final_host = ""
+    bytes_read = 0
+    total = None
+    kind = "NONE"
+    req_range = f"bytes=0-{int(pass1_bytes) - 1}"
 
-    def _record_timeout(*, phase: str, attempt: int, req_range: str, started_at: float, status: int = 0, history: int = 0, final_host: str = "", bytes_read: int = 0) -> None:
+    for attempt in range(1, attempts + 1):
         try:
-            if timeout_debug is None or int(timeout_debug_limit or 0) <= 0 or len(timeout_debug) >= int(timeout_debug_limit or 0):
-                return
-            from urllib.parse import urlparse
-            _host = urlparse(url).netloc or "?"
-            timeout_debug.append({
-                "host": _host,
-                "phase": str(phase or "?"),
-                "attempt": int(attempt or 0),
-                "range": str(req_range or ""),
-                "elapsed_ms": int(max(0.0, (time.monotonic() - float(started_at))) * 1000.0),
-                "status": int(status or 0),
-                "history": int(history or 0),
-                "final_host": str(final_host or ""),
-                "bytes_read": int(bytes_read or 0),
-            })
-        except Exception:
-            pass
-
-    def _finish(*, ok: bool, size: int, reason: str, phase: str, started_at: float, req_range: str, status: int = 0, history: int = 0, final_host: str = "", bytes_read: int = 0, attempt: int = 0) -> Tuple[str, bool, int, str]:
-        try:
-            if trace_debug is not None:
-                from urllib.parse import urlparse
-                _host = urlparse(url).netloc or "?"
-                _reason_up = str(reason or "").upper()
-                _is_stub = (_reason_up.startswith("PURE_STUB") or _reason_up.startswith("STUB") or _reason_up == "PARTIAL_STUB")
-                _is_budget = (_reason_up.startswith("BUDGET") or _reason_up == "SKIP_TARGET_REAL")
-                _verdict = "REAL" if ok else ("STUB" if _is_stub else ("BUDGET" if _is_budget else "ERR"))
-                trace_debug.append({
-                    "idx": int(trace_idx or 0),
-                    "host": _host,
-                    "ms": int(max(0.0, (time.monotonic() - float(started_at))) * 1000.0),
-                    "verdict": _verdict,
-                    "reason": str(reason or ""),
-                    "phase": str(phase or "?"),
-                    "status": int(status or 0),
-                    "history": int(history or 0),
-                    "range": str(req_range or ""),
-                    "bytes": int(bytes_read or 0),
-                    "total": int(size or 0),
-                    "final": str(final_host or ""),
-                    "attempt": int(attempt or 0),
-                })
-        except Exception:
-            pass
-        return (url, bool(ok), int(size or 0), str(reason or ""))
-
-    attempt = 1
-    while attempt <= attempts:
-        _queued_at = time.monotonic()
-        _started_at = float(_queued_at)
-        _attempt_started = False
-        _phase = "attempt_pre"
-        _initial_range = f"bytes=0-{int(initial_bytes) - 1}"
-        _status = 0
-        _history = 0
-        _final_host = ""
-        _bytes_read = 0
-        total = None
-        try:
-            headers = {"Range": _initial_range}
             await sem.acquire()
+            started = True
+            started_at = time.monotonic()
             try:
-                _phase = "initial_open"
-                _started_at = time.monotonic()
-                _attempt_started = True
                 async with session.get(
                     url,
-                    headers=headers,
+                    headers={"Range": req_range},
                     allow_redirects=True,
                     timeout=aiohttp.ClientTimeout(
                         total=base_total,
-                        connect=min(8.0, max(1.25, base_total * 0.70)),
-                        sock_connect=min(8.0, max(1.25, base_total * 0.70)),
+                        connect=min(2.5, max(1.0, base_total * 0.45)),
+                        sock_connect=min(2.5, max(1.0, base_total * 0.45)),
                         sock_read=max(2.0, base_total),
                     ),
                 ) as resp:
-                    _status = int(getattr(resp, "status", 0) or 0)
-                    _history = int(len(getattr(resp, "history", []) or []))
+                    status = int(getattr(resp, "status", 0) or 0)
+                    history = int(len(getattr(resp, "history", []) or []))
                     try:
                         from urllib.parse import urlparse
-                        _final_host = urlparse(str(getattr(resp, "url", "") or "")).netloc or ""
+                        final_host = urlparse(str(getattr(resp, "url", "") or "")).netloc or ""
                     except Exception:
-                        _final_host = ""
-                    _phase = "initial_body"
-                    data = await resp.content.read(initial_bytes)
-                    _bytes_read = int(len(data or b""))
+                        final_host = ""
+                    data = await resp.content.read(pass1_bytes)
+                    bytes_read = int(len(data or b""))
                     total = _parse_total(resp)
-                    first_len = int(_bytes_read)
                     kind = _detect_kind(data)
-                    suspicious = bool((total is not None and int(total) < 100_000) or kind == "MP4")
-
-                    if suspicious:
-                        _host_key = _final_host
-                        if not _host_key:
-                            try:
-                                from urllib.parse import urlparse
-                                _host_key = urlparse(url).netloc or ""
-                            except Exception:
-                                _host_key = ""
-                        _initial_sig = _sig12(data)
-                        _family_key = (_host_key or "", int(total or 0), str(kind or "NONE"), _initial_sig)
-                        _tiny_total = bool(total is not None and int(total or 0) < 100_000)
-
-                        try:
-                            if family_verdicts is not None:
-                                _known_family = str(family_verdicts.get(_family_key) or "").upper().strip()
-                                if _known_family == "STUB":
-                                    return _finish(ok=False, size=int(total or 0), reason="PURE_STUB_LEARNED", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
-                                if _known_family == "REAL":
-                                    return _finish(ok=True, size=int(total or first_len), reason="REAL_FAMILY_LEARNED", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
-                        except Exception:
-                            pass
-
-                        try:
-                            if family_counts is not None:
-                                family_counts[_family_key] = int(family_counts.get(_family_key, 0) or 0) + 1
-                                if _tiny_total and int(family_counts.get(_family_key, 0) or 0) >= 2:
-                                    if family_verdicts is not None:
-                                        family_verdicts[_family_key] = "STUB"
-                                    return _finish(ok=False, size=int(total or 0), reason="PURE_STUB_PROVISIONAL", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
-                        except Exception:
-                            pass
-
-                        higher_lengths: List[int] = []
-                        _stub_confirms = 0
-                        for off in higher_offsets:
-                            _follow_range = f"bytes={off}-{off + higher_span - 1}"
-                            _follow_phase = f"higher_open_{off}"
-                            _follow_status = 0
-                            _follow_history = 0
-                            _follow_final_host = ""
-                            _follow_bytes = 0
-                            _follow_started_at = time.monotonic()
-                            _follow_sig = ""
-                            try:
-                                async with session.get(
-                                    url,
-                                    headers={"Range": _follow_range},
-                                    allow_redirects=True,
-                                    timeout=aiohttp.ClientTimeout(
-                                        total=base_total,
-                                        connect=min(4.0, max(0.75, base_total * 0.50)),
-                                        sock_connect=min(4.0, max(0.75, base_total * 0.50)),
-                                        sock_read=max(1.0, base_total),
-                                    ),
-                                ) as r2:
-                                    _follow_status = int(getattr(r2, "status", 0) or 0)
-                                    _follow_history = int(len(getattr(r2, "history", []) or []))
-                                    try:
-                                        from urllib.parse import urlparse
-                                        _follow_final_host = urlparse(str(getattr(r2, "url", "") or "")).netloc or ""
-                                    except Exception:
-                                        _follow_final_host = ""
-                                    _follow_phase = f"higher_body_{off}"
-                                    chunk = await r2.content.read(higher_span)
-                                    _follow_bytes = int(len(chunk or b""))
-                                    _follow_sig = _sig12(chunk)
-                                    higher_lengths.append(_follow_bytes)
-                            except asyncio.TimeoutError:
-                                _record_timeout(phase=_follow_phase, attempt=attempt, req_range=_follow_range, started_at=_follow_started_at, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes)
-                                if attempt >= attempts:
-                                    return _finish(ok=False, size=int(total or 0), reason="FAIL_TimeoutError", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
-                                raise
-                            except asyncio.CancelledError:
-                                return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
-                            except Exception as e:
-                                if attempt >= attempts:
-                                    return _finish(ok=False, size=int(total or 0), reason=f"FAIL_{type(e).__name__}", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
-                                raise
-
-                            _hk_host = _follow_final_host or _host_key or ""
-                            _higher_key = (_hk_host, int(_follow_status or 0), int(_follow_bytes or 0), _follow_sig)
-                            _stub_like = bool(int(_follow_status or 0) >= 500 and int(_follow_bytes or 0) <= 256 and _follow_sig)
-
-                            try:
-                                if higher_stub_cache is not None and _stub_like and _higher_key in higher_stub_cache:
-                                    if family_verdicts is not None:
-                                        family_verdicts[_family_key] = "STUB"
-                                    return _finish(ok=False, size=int(total or 0), reason="PURE_STUB_LEARNED_HIGHER", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
-                            except Exception:
-                                pass
-
-                            if int(_follow_status or 0) in (200, 206) and int(_follow_bytes or 0) >= 1000:
-                                if family_verdicts is not None:
-                                    family_verdicts[_family_key] = "REAL"
-                                return _finish(ok=True, size=int(total or max(_follow_bytes, first_len, 0)), reason="REAL_HIGHER_OFFSETS", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
-
-                            if _stub_like:
-                                _stub_confirms += 1
-                                try:
-                                    if higher_key_counts is not None:
-                                        higher_key_counts[_higher_key] = int(higher_key_counts.get(_higher_key, 0) or 0) + 1
-                                        if int(higher_key_counts.get(_higher_key, 0) or 0) >= 2 and higher_stub_cache is not None:
-                                            higher_stub_cache.add(_higher_key)
-                                except Exception:
-                                    pass
-                                if _stub_confirms >= 2:
-                                    try:
-                                        if higher_stub_cache is not None:
-                                            higher_stub_cache.add(_higher_key)
-                                    except Exception:
-                                        pass
-                                    if family_verdicts is not None:
-                                        family_verdicts[_family_key] = "STUB"
-                                    return _finish(ok=False, size=int(total or 0), reason="PURE_STUB_CONFIRMED", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
-
-                        real_high = sum(1 for n in higher_lengths if int(n or 0) >= 1000)
-                        empty_high = sum(1 for n in higher_lengths if int(n or 0) < 100)
-                        if real_high >= 1:
-                            if family_verdicts is not None:
-                                family_verdicts[_family_key] = "REAL"
-                            return _finish(ok=True, size=int(total or max(higher_lengths or [0])), reason="REAL_HIGHER_OFFSETS", phase=f"higher_body_{higher_offsets[-1]}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=max(higher_lengths or [0]), attempt=attempt)
-                        if higher_lengths and empty_high == len(higher_lengths):
-                            if family_verdicts is not None:
-                                family_verdicts[_family_key] = "STUB"
-                            return _finish(ok=False, size=int(total or 0), reason="PURE_STUB_CONFIRMED", phase=f"higher_body_{higher_offsets[-1]}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=max(higher_lengths or [0]), attempt=attempt)
-                        return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=f"higher_body_{higher_offsets[-1]}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=max(higher_lengths or [0]), attempt=attempt)
-
-                if first_len <= 0:
-                    return _finish(ok=False, size=int(total or 0), reason="FAIL_EmptyRead", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
-
-                return _finish(ok=True, size=int(total or first_len), reason="REAL_INITIAL", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
-
+                    suspicious = bool((total is not None and int(total) < 100_000) or (kind == "MP4" and total is None))
+                    if bytes_read <= 0:
+                        return {
+                            "url": url,
+                            "ok": False,
+                            "size": int(total or 0),
+                            "reason": "FAIL_EmptyRead",
+                            "suspicious": True,
+                            "started": True,
+                            "total": total,
+                            "kind": kind,
+                            "status": status,
+                            "history": history,
+                            "final_host": final_host,
+                            "bytes_read": bytes_read,
+                        }
+                    if not suspicious:
+                        return {
+                            "url": url,
+                            "ok": True,
+                            "size": int(total or bytes_read),
+                            "reason": "REAL_INITIAL",
+                            "suspicious": False,
+                            "started": True,
+                            "total": total,
+                            "kind": kind,
+                            "status": status,
+                            "history": history,
+                            "final_host": final_host,
+                            "bytes_read": bytes_read,
+                        }
+                    return {
+                        "url": url,
+                        "ok": False,
+                        "size": int(total or bytes_read or 0),
+                        "reason": "PASS1_SUSPICIOUS",
+                        "suspicious": True,
+                        "started": True,
+                        "total": total,
+                        "kind": kind,
+                        "status": status,
+                        "history": history,
+                        "final_host": final_host,
+                        "bytes_read": bytes_read,
+                    }
             finally:
                 try:
                     sem.release()
                 except Exception:
                     pass
-
         except asyncio.TimeoutError:
-            _record_timeout(phase=_phase, attempt=attempt, req_range=_initial_range, started_at=(_started_at if _attempt_started else _queued_at), status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read)
             if attempt >= attempts:
-                if _attempt_started:
-                    return _finish(ok=False, size=0, reason="FAIL_TimeoutError", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
-                return _finish(ok=False, size=0, reason="BUDGET_UNLAUNCHED", phase=_phase, started_at=_queued_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
-            attempt += 1
+                return {
+                    "url": url,
+                    "ok": False,
+                    "size": 0,
+                    "reason": "FAIL_TimeoutError" if started else "BUDGET_UNLAUNCHED",
+                    "suspicious": True,
+                    "started": bool(started),
+                    "total": total,
+                    "kind": kind,
+                    "status": status,
+                    "history": history,
+                    "final_host": final_host,
+                    "bytes_read": bytes_read,
+                }
             await asyncio.sleep(0.10)
-            continue
         except asyncio.CancelledError:
-            _reason = "BUDGET_STARTED" if _attempt_started else "BUDGET_UNLAUNCHED"
-            return _finish(ok=False, size=0, reason=_reason, phase=_phase, started_at=(_started_at if _attempt_started else _queued_at), req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+            return {
+                "url": url,
+                "ok": False,
+                "size": 0,
+                "reason": "BUDGET_STARTED" if started else "BUDGET_UNLAUNCHED",
+                "suspicious": True,
+                "started": bool(started),
+                "total": total,
+                "kind": kind,
+                "status": status,
+                "history": history,
+                "final_host": final_host,
+                "bytes_read": bytes_read,
+            }
         except Exception as e:
             if attempt >= attempts:
-                if _attempt_started:
-                    return _finish(ok=False, size=0, reason=f"FAIL_{type(e).__name__}", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
-                return _finish(ok=False, size=0, reason="BUDGET_UNLAUNCHED", phase=_phase, started_at=_queued_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
-            attempt += 1
+                return {
+                    "url": url,
+                    "ok": False,
+                    "size": 0,
+                    "reason": f"FAIL_{type(e).__name__}" if started else "BUDGET_UNLAUNCHED",
+                    "suspicious": True,
+                    "started": bool(started),
+                    "total": total,
+                    "kind": kind,
+                    "status": status,
+                    "history": history,
+                    "final_host": final_host,
+                    "bytes_read": bytes_read,
+                }
             await asyncio.sleep(0.10)
-            continue
 
-    return _finish(ok=False, size=0, reason="BUDGET_UNLAUNCHED", phase="final_fallthrough", started_at=time.monotonic(), req_range="", attempt=attempts)
+    return {
+        "url": url,
+        "ok": False,
+        "size": 0,
+        "reason": "BUDGET_UNLAUNCHED",
+        "suspicious": True,
+        "started": bool(started),
+        "total": total,
+        "kind": kind,
+        "status": status,
+        "history": history,
+        "final_host": final_host,
+        "bytes_read": bytes_read,
+    }
+
+
+async def _verify_suspicious_single(
+    session: aiohttp.ClientSession,
+    row: Dict[str, Any],
+    sem: asyncio.Semaphore,
+    timeout_s: float,
+) -> Tuple[str, bool, int, str]:
+    """Phase-2 verifier for suspicious links using only two higher-range checks."""
+    url = str(row.get("url") or "")
+    total = int(row.get("total") or 0)
+    higher_offsets = (65536, 131072)
+    higher_span = 4096
+    follow_total = max(1.0, min(2.5, float(timeout_s or 2.5)))
+    started = False
+
+    try:
+        await sem.acquire()
+        started = True
+        real_high = 0
+        empty_high = 0
+        stub_confirms = 0
+        max_bytes = 0
+        for off in higher_offsets:
+            req_range = f"bytes={off}-{off + higher_span - 1}"
+            status = 0
+            bytes_read = 0
+            sig = ""
+            try:
+                async with session.get(
+                    url,
+                    headers={"Range": req_range},
+                    allow_redirects=True,
+                    timeout=aiohttp.ClientTimeout(
+                        total=follow_total,
+                        connect=min(1.5, max(0.8, follow_total * 0.5)),
+                        sock_connect=min(1.5, max(0.8, follow_total * 0.5)),
+                        sock_read=max(1.5, follow_total),
+                    ),
+                ) as resp:
+                    status = int(getattr(resp, "status", 0) or 0)
+                    chunk = await resp.content.read(higher_span)
+                    bytes_read = int(len(chunk or b""))
+                    max_bytes = max(max_bytes, bytes_read)
+                    try:
+                        sig = hashlib.sha1(bytes((chunk or b"")[:64])).hexdigest()[:12] if chunk else ""
+                    except Exception:
+                        sig = ""
+            except asyncio.TimeoutError:
+                return (url, False, int(total or 0), "FAIL_TimeoutError")
+            except asyncio.CancelledError:
+                return (url, False, int(total or 0), "BUDGET_STARTED" if started else "BUDGET_UNLAUNCHED")
+            except Exception as e:
+                return (url, False, int(total or 0), f"FAIL_{type(e).__name__}")
+
+            if status in (200, 206) and bytes_read >= 1000:
+                real_high += 1
+                return (url, True, int(total or bytes_read), "REAL_HIGHER_OFFSETS")
+            if bytes_read < 100:
+                empty_high += 1
+            if status >= 500 and bytes_read <= 256 and sig:
+                stub_confirms += 1
+
+        if real_high >= 1:
+            return (url, True, int(total or max_bytes or 0), "REAL_HIGHER_OFFSETS")
+        if stub_confirms >= 2 or empty_high == len(higher_offsets):
+            return (url, False, int(total or 0), "PURE_STUB_CONFIRMED")
+        return (url, False, int(total or 0), "BUDGET_STARTED")
+    finally:
+        if started:
+            try:
+                sem.release()
+            except Exception:
+                pass
+
 
 
 def _apply_usenet_playability_probe(
@@ -2424,7 +2391,7 @@ def _apply_usenet_playability_probe(
                     guard=bool(RANGE_PROBE_GUARD),
                     budget_s=float(budget),
                     target_real=int(target),
-                    prefer_force_close=True,
+                    prefer_force_close=False,
                 )
 
             async def _fallback_main() -> List[Tuple[str, bool, int, str]]:
