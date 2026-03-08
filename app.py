@@ -1607,7 +1607,7 @@ def sniff_magic(data: bytes) -> str:
 def _normalize_usenet_probe_state(raw: Any) -> str:
     """Normalize live probe states to REAL/STUB/ERR/BUDGET/OTHER_FAIL/SKIP_TARGET_REAL.
 
-    v25f restores explicit timeout/error accounting while keeping ranking logic simple:
+    v26 keeps the v25f probe behavior and removes the stale duplicate v23p logging path:
     only REAL counts as playable, STUB is bad content, BUDGET is batch-wall fallout,
     and ERR/OTHER_FAIL remain visible for logs and counters.
     """
@@ -1645,7 +1645,7 @@ async def _usenet_range_probe_is_real_async(
     """
     Probe usenet proxy URLs and classify them using a fixed initial byte window.
 
-    v25 flow reset:
+    v26 flow reset:
     - keep the configured initial body read (default 20,000 bytes)
     - keep interleaved launch order for the selected probe batch
     - launch the full selected batch immediately, like the standalone baseline
@@ -1874,7 +1874,7 @@ async def _usenet_range_probe_is_real_async(
                 logger.info("USENET_PROBE_SAMPLE rid=%s sample=%s", _rid(), _sample)
             try:
                 _rc = Counter(str(r[3]) for r in results)
-                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v25f reasons={dict(_rc.most_common(8))}'
+                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v26 reasons={dict(_rc.most_common(8))}'
                 logger.info(_reasons_msg)
                 print(_reasons_msg)
             except Exception:
@@ -1908,7 +1908,7 @@ async def _probe_single(
     """
     REAL/STUB/BUDGET classifier for direct usenet proxy links.
 
-    v25 flow reset:
+    v26 flow reset:
     - REAL requires reading the configured initial byte window (no header-only REAL)
     - suspicious tiny/header-weird links get only two higher-range checks
     - fixed per-request timeouts; outer batch wall decides when to cancel remaining work
@@ -2450,50 +2450,9 @@ def _apply_usenet_playability_probe(
             _definitive_count = sum(1 for (_u, _ok, _sz, _rs) in (batch_res or []) if str(_rs).upper() not in ("BUDGET_UNLAUNCHED", "BUDGET_STARTED", "SKIP_TARGET_REAL"))
             _budget_started_count = sum(1 for (_u, _ok, _sz, _rs) in (batch_res or []) if str(_rs).upper() == "BUDGET_STARTED")
             _budget_unlaunched_count = sum(1 for (_u, _ok, _sz, _rs) in (batch_res or []) if str(_rs).upper() == "BUDGET_UNLAUNCHED")
-            # Small sample of outcomes (first 5) for debugging host/status issues
-            try:
-                from urllib.parse import urlparse
-                _samp=[]
-                for (_u,_ok,_sz,_rs) in (batch_res or [])[:5]:
-                    try:
-                        _p=urlparse(_u)
-                        _samp.append(f"{_p.netloc or '(nohost)'} {_rs} {_sz}")
-                    except Exception:
-                        _samp.append(f"(bad_url) {_rs} {_sz}")
-                if _samp:
-                    logger.info("USENET_PROBE_SAMPLE rid=%s sample=%s", _rid(), _samp)
-            except Exception:
-                pass
-            # Reason histogram so we can immediately see if we're failing with TIMEOUT/DNS/SSL/etc.
-            try:
-                from collections import Counter
-                _rc = Counter([str(r[3]) for r in (batch_res or [])])
-                # Defensive: if batch_res is missing entries, count them as BUDGET (not ERR).
-                _budget_missing = max(0, len(urls) - len(batch_res or []))
-                if _budget_missing:
-                    _rc["BUDGET_UNLAUNCHED"] += _budget_missing
-
-                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v23p reasons={dict(_rc.most_common(8))}'
-                logger.info(_reasons_msg)
-                try:
-                    logging.getLogger("gunicorn.error").info(_reasons_msg)
-                except Exception:
-                    pass
-                try:
-                    sys.stdout.write(_reasons_msg + "\n")
-                    sys.stdout.flush()
-                except Exception:
-                    pass
-                try:
-                    sys.stderr.write(_reasons_msg + "\n")
-                    sys.stderr.flush()
-                except Exception:
-                    pass
-            except Exception as e:
-                try:
-                    logger.warning("USENET_PROBE_REASONS_ERR rid=%s err=%s", _rid(), type(e).__name__)
-                except Exception:
-                    pass
+            # Duplicate sample/reason logging is intentionally omitted here.
+            # The async probe function already emits the single canonical
+            # USENET_PROBE_SAMPLE / USENET_PROBE_REASONS lines for this batch.
 
             for u, idx in url_to_idx.items():
                 r = url_to_res.get(u)
