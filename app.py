@@ -539,7 +539,6 @@ _tmp_verify_retries = _safe_int(os.environ.get("VERIFY_RETRIES", "0"), 0)
 USENET_PROBE_RETRIES = _safe_int(os.environ.get("USENET_PROBE_RETRIES", str(_tmp_verify_retries)), _tmp_verify_retries)
 USENET_PROBE_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY", "40"), 40)
 USENET_PROBE_LIMIT_PER_HOST = _safe_int(os.environ.get("USENET_PROBE_LIMIT_PER_HOST", "8"), 8)
-USENET_PROBE_BUSY_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_BUSY_CONCURRENCY", "6"), 6)
 USENET_PROBE_CONCURRENCY_CAP = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY_CAP", str(USENET_PROBE_CONCURRENCY or 8)), max(1, int(USENET_PROBE_CONCURRENCY or 8)))
 # Fixed first ranged read size for the direct usenet probe: bytes=0-(initial_bytes-1).
 # This replaces the old stub_len / range_end model.
@@ -1643,11 +1642,12 @@ async def _usenet_range_probe_is_real_async(
     """
     Probe usenet proxy URLs and classify them using a fixed initial byte window.
 
-    v19 app-adapted rules:
+    v21 app-adapted rules:
     - keep the configured initial body read (default 20,000 bytes)
     - use rolling scheduling so we can start far more than the active parallelism within the same global budget
     - never count unlaunched budget placeholders as "scanned/tested"
-    - for dominant single-host proxy batches, honor the busy-host clamp and prefer a reusable connector
+    - use interleaved launch order for the selected probe batch to avoid clustering slow links in one wave
+    - use plain keepalive connector for dominant single-host proxy batches, but do not reduce active concurrency
     - late or unfinished work becomes BUDGET_* (still BUDGET at the app-facing state level)
     """
     results: List[Tuple[str, bool, int, str]] = []
@@ -1669,14 +1669,22 @@ async def _usenet_range_probe_is_real_async(
         if _host_counts:
             _dom_host, _dom_count = _host_counts.most_common(1)[0]
         _dominant_single_host = bool(_dom_host and int(_dom_count) >= max(6, int(0.80 * max(1, len(urls)))))
-        if _dominant_single_host:
-            _busy_cap = max(1, int(USENET_PROBE_BUSY_CONCURRENCY or 6))
-            _old_eff_parallel = int(eff_parallel)
-            eff_parallel = max(1, min(int(eff_parallel), int(_busy_cap)))
-            if int(eff_parallel) != int(_old_eff_parallel):
-                logger.info('USENET_PROBE_HOSTCAP rid=%s host=%s share=%s/%s eff_parallel=%s->%s', _rid(), _dom_host, int(_dom_count), int(len(urls)), int(_old_eff_parallel), int(eff_parallel))
     except Exception:
         pass
+
+    probe_urls = [str(u) for u in (urls or []) if str(u or '').strip()]
+    if len(probe_urls) >= 4:
+        _half = (len(probe_urls) + 1) // 2
+        _left = probe_urls[:_half]
+        _right = probe_urls[_half:]
+        _interleaved: List[str] = []
+        for _i in range(max(len(_left), len(_right))):
+            if _i < len(_left):
+                _interleaved.append(_left[_i])
+            if _i < len(_right):
+                _interleaved.append(_right[_i])
+        probe_urls = _interleaved
+
     sem = asyncio.Semaphore(eff_parallel)
 
     _auth = None
@@ -1693,9 +1701,9 @@ async def _usenet_range_probe_is_real_async(
     _conn_mode = "force_close" if _use_force_close else "plain_keepalive"
     try:
         logger.info(
-            "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s initial_bytes=%s budget_s=%.2f timeout_s=%.2f retries=%s target_real=%s mode=%s dom_host=%s dom_share=%s/%s",
+            "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s initial_bytes=%s budget_s=%.2f timeout_s=%.2f retries=%s target_real=%s mode=%s order=%s dom_host=%s dom_share=%s/%s",
             _rid(), int(concurrency or 1), int(eff_parallel), int(initial_bytes), float(budget_s), float(timeout_s), int(retries or 0), int(target),
-            _conn_mode, _dom_host or "", int(_dom_count or 0), int(len(urls) or 0),
+            _conn_mode, "interleave_halves", _dom_host or "", int(_dom_count or 0), int(len(probe_urls) or 0),
         )
     except Exception:
         pass
@@ -1742,23 +1750,23 @@ async def _usenet_range_probe_is_real_async(
         _timeout_debug: List[Dict[str, Any]] = []
         _timeout_debug_limit = max(0, int(USENET_PROBE_DEBUG_TIMEOUTS_N or 0))
         if _timeout_debug_limit <= 0:
-            _timeout_debug_limit = int(len(urls))
+            _timeout_debug_limit = int(len(probe_urls))
         _timeout_debug_enabled = bool(USENET_PROBE_DEBUG_TIMEOUTS and _timeout_debug_limit > 0)
         _trace_debug: List[Dict[str, Any]] = []
         _trace_debug_enabled = bool(USENET_PROBE_TRACE)
         _started_urls: set[str] = set()
-        _launch_floor_s = max(2.25, min(float(timeout_s or 0.0) * 0.45, 3.75))
+        _launch_floor_s = max(1.25, min(float(timeout_s or 0.0) * 0.20, 2.00))
 
         def _launch_more() -> None:
             nonlocal _idx
-            while _idx < len(urls) and len(pending) < eff_parallel and not (_stop_target or (target > 0 and _real_hits >= target)):
+            while _idx < len(probe_urls) and len(pending) < eff_parallel and not (_stop_target or (target > 0 and _real_hits >= target)):
                 try:
                     _remaining = float(_deadline - time.monotonic())
                 except Exception:
                     _remaining = 0.0
                 if _remaining <= _launch_floor_s:
                     break
-                url = urls[_idx]
+                url = probe_urls[_idx]
                 _probe_idx = int(_idx + 1)
                 _idx += 1
                 _started_urls.add(url)
@@ -1831,13 +1839,13 @@ async def _usenet_range_probe_is_real_async(
                 if u:
                     results.append((u, False, 0, _cancel_reason))
 
-        if _idx < len(urls):
+        if _idx < len(probe_urls):
             _tail_reason = "SKIP_TARGET_REAL" if _stop_target else "BUDGET_UNLAUNCHED"
-            for u in urls[_idx:]:
+            for u in probe_urls[_idx:]:
                 results.append((u, False, 0, _tail_reason))
 
         try:
-            _total = int(len(urls))
+            _total = int(len(probe_urls))
             _started = sum(1 for (_u, _ok, _sz, _rs) in (results or []) if str(_rs).upper() != "BUDGET_UNLAUNCHED")
             _definitive = sum(1 for (_u, _ok, _sz, _rs) in (results or []) if str(_rs).upper() not in ("BUDGET_UNLAUNCHED", "BUDGET_STARTED", "SKIP_TARGET_REAL"))
             _budget_started = sum(1 for (_u, _ok, _sz, _rs) in (results or []) if str(_rs).upper() == "BUDGET_STARTED")
@@ -1943,8 +1951,8 @@ async def _probe_single(
     initial_bytes = max(1024, int(initial_bytes or USENET_PROBE_INITIAL_BYTES or 20000))
     higher_offsets = (65536, 262144)
     higher_span = 4096
-    meaningful_launch_s = max(2.25, min(float(timeout_s or 0.0) * 0.45, 3.75))
-    deadline_tail_s = 0.25
+    meaningful_launch_s = max(1.25, min(float(timeout_s or 0.0) * 0.20, 2.00))
+    deadline_tail_s = 0.15
 
     def _parse_total(resp: aiohttp.ClientResponse) -> Optional[int]:
         try:
@@ -2427,7 +2435,7 @@ def _apply_usenet_playability_probe(
                 if _budget_missing:
                     _rc["BUDGET_UNLAUNCHED"] += _budget_missing
 
-                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v19 reasons={dict(_rc.most_common(8))}'
+                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v21 reasons={dict(_rc.most_common(8))}'
                 logger.info(_reasons_msg)
                 try:
                     logging.getLogger("gunicorn.error").info(_reasons_msg)
@@ -4306,7 +4314,7 @@ logger.info(
     int((_ENV_FILE_INFO or {}).get("loaded") or 0),
     int((_ENV_FILE_INFO or {}).get("overridden") or 0),
 )
-logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_initial_bytes={USENET_PROBE_INITIAL_BYTES} usenet_probe_limit_per_host={USENET_PROBE_LIMIT_PER_HOST} usenet_probe_busy_concurrency={USENET_PROBE_BUSY_CONCURRENCY} usenet_probe_concurrency={USENET_PROBE_CONCURRENCY} usenet_probe_concurrency_cap={USENET_PROBE_CONCURRENCY_CAP} usenet_probe_debug_timeouts={USENET_PROBE_DEBUG_TIMEOUTS} usenet_probe_debug_timeouts_n={USENET_PROBE_DEBUG_TIMEOUTS_N} usenet_probe_trace={USENET_PROBE_TRACE} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N} wrap_url_backend={_WRAP_URL_BACKEND} web_concurrency_env={WEB_CONCURRENCY_ENV}")
+logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_initial_bytes={USENET_PROBE_INITIAL_BYTES} usenet_probe_limit_per_host={USENET_PROBE_LIMIT_PER_HOST} usenet_probe_concurrency={USENET_PROBE_CONCURRENCY} usenet_probe_concurrency_cap={USENET_PROBE_CONCURRENCY_CAP} usenet_probe_debug_timeouts={USENET_PROBE_DEBUG_TIMEOUTS} usenet_probe_debug_timeouts_n={USENET_PROBE_DEBUG_TIMEOUTS_N} usenet_probe_trace={USENET_PROBE_TRACE} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N} wrap_url_backend={_WRAP_URL_BACKEND} web_concurrency_env={WEB_CONCURRENCY_ENV}")
 
 logger.info(
     "LOG_FLAGS wrap_log_token_emit=%s wrap_log_token_hit=%s wrap_log_token_full=%s wrap_log_token_sample_pct=%s sort_proof_top_n=%s usenet_probe_log_urls=%s usenet_probe_log_urls_n=%s",
