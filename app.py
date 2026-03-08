@@ -1764,6 +1764,10 @@ async def _usenet_range_probe_is_real_async(
         _trace_debug: List[Dict[str, Any]] = []
         _trace_debug_enabled = bool(USENET_PROBE_TRACE)
         _started_urls: set[str] = set()
+        _family_counts: Dict[Tuple[str, int, str, str], int] = {}
+        _family_verdicts: Dict[Tuple[str, int, str, str], str] = {}
+        _higher_key_counts: Dict[Tuple[str, int, int, str], int] = {}
+        _higher_stub_cache: set = set()
         _launch_floor_s = max(1.25, min(float(timeout_s or 0.0) * 0.20, 2.00))
 
         def _launch_more() -> None:
@@ -1794,6 +1798,10 @@ async def _usenet_range_probe_is_real_async(
                         timeout_debug_limit=_timeout_debug_limit,
                         trace_debug=_trace_debug if _trace_debug_enabled else None,
                         trace_idx=_probe_idx,
+                        family_counts=_family_counts,
+                        family_verdicts=_family_verdicts,
+                        higher_key_counts=_higher_key_counts,
+                        higher_stub_cache=_higher_stub_cache,
                     )
                 )
                 pending.add(t)
@@ -1948,6 +1956,10 @@ async def _probe_single(
     timeout_debug_limit: int = 0,
     trace_debug: Optional[List[Dict[str, Any]]] = None,
     trace_idx: int = 0,
+    family_counts: Optional[Dict[Tuple[str, int, str, str], int]] = None,
+    family_verdicts: Optional[Dict[Tuple[str, int, str, str], str]] = None,
+    higher_key_counts: Optional[Dict[Tuple[str, int, int, str], int]] = None,
+    higher_stub_cache: Optional[set] = None,
 ) -> Tuple[str, bool, int, str]:
     """
     REAL/STUB/BUDGET classifier for direct usenet proxy links.
@@ -1992,6 +2004,14 @@ async def _probe_single(
         except Exception:
             pass
         return "NONE"
+
+    def _sig12(buf: bytes) -> str:
+        try:
+            if not buf:
+                return ""
+            return hashlib.sha1(bytes(buf[:64])).hexdigest()[:12]
+        except Exception:
+            return ""
 
     def _record_timeout(*, phase: str, attempt: int, req_range: str, started_at: float, status: int = 0, history: int = 0, final_host: str = "", bytes_read: int = 0) -> None:
         try:
@@ -2137,7 +2157,39 @@ async def _probe_single(
                         suspicious = bool((total is not None and int(total) < 100_000) or kind == "MP4")
 
                         if suspicious:
+                            _host_key = _final_host
+                            if not _host_key:
+                                try:
+                                    from urllib.parse import urlparse
+                                    _host_key = urlparse(url).netloc or ""
+                                except Exception:
+                                    _host_key = ""
+                            _initial_sig = _sig12(data)
+                            _family_key = (_host_key or "", int(total or 0), str(kind or "NONE"), _initial_sig)
+                            _tiny_total = bool(total is not None and int(total or 0) < 100_000)
+
+                            try:
+                                if family_verdicts is not None:
+                                    _known_family = str(family_verdicts.get(_family_key) or "").upper().strip()
+                                    if _known_family == "STUB":
+                                        return _finish(ok=False, size=int(total or 0), reason="PURE_STUB_LEARNED", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+                                    if _known_family == "REAL":
+                                        return _finish(ok=True, size=int(total or first_len), reason="REAL_FAMILY_LEARNED", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+                            except Exception:
+                                pass
+
+                            try:
+                                if family_counts is not None:
+                                    family_counts[_family_key] = int(family_counts.get(_family_key, 0) or 0) + 1
+                                    if _tiny_total and int(family_counts.get(_family_key, 0) or 0) >= 2:
+                                        if family_verdicts is not None:
+                                            family_verdicts[_family_key] = "STUB"
+                                        return _finish(ok=False, size=int(total or 0), reason="PURE_STUB_PROVISIONAL", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
+                            except Exception:
+                                pass
+
                             higher_lengths: List[int] = []
+                            _stub_confirms = 0
                             for off in higher_offsets:
                                 remaining4 = _remaining()
                                 if remaining4 <= 0.90:
@@ -2150,6 +2202,7 @@ async def _probe_single(
                                 _follow_final_host = ""
                                 _follow_bytes = 0
                                 _follow_started_at = time.monotonic()
+                                _follow_sig = ""
                                 try:
                                     _follow_open_acquired = False
                                     try:
@@ -2194,6 +2247,7 @@ async def _probe_single(
                                             _follow_phase = f"higher_body_{off}"
                                             chunk = await r2.content.read(higher_span)
                                             _follow_bytes = int(len(chunk or b""))
+                                            _follow_sig = _sig12(chunk)
                                             higher_lengths.append(_follow_bytes)
                                     finally:
                                         if _follow_open_acquired:
@@ -2209,11 +2263,51 @@ async def _probe_single(
                                 except Exception:
                                     return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
 
+                                _hk_host = _follow_final_host or _host_key or ""
+                                _higher_key = (_hk_host, int(_follow_status or 0), int(_follow_bytes or 0), _follow_sig)
+                                _stub_like = bool(int(_follow_status or 0) >= 500 and int(_follow_bytes or 0) <= 256 and _follow_sig)
+
+                                try:
+                                    if higher_stub_cache is not None and _stub_like and _higher_key in higher_stub_cache:
+                                        if family_verdicts is not None:
+                                            family_verdicts[_family_key] = "STUB"
+                                        return _finish(ok=False, size=int(total or 0), reason="PURE_STUB_LEARNED_HIGHER", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
+                                except Exception:
+                                    pass
+
+                                if int(_follow_status or 0) in (200, 206) and int(_follow_bytes or 0) >= 1000:
+                                    if family_verdicts is not None:
+                                        family_verdicts[_family_key] = "REAL"
+                                    return _finish(ok=True, size=int(total or max(_follow_bytes, first_len, 0)), reason="REAL_HIGHER_OFFSETS", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
+
+                                if _stub_like:
+                                    _stub_confirms += 1
+                                    try:
+                                        if higher_key_counts is not None:
+                                            higher_key_counts[_higher_key] = int(higher_key_counts.get(_higher_key, 0) or 0) + 1
+                                            if int(higher_key_counts.get(_higher_key, 0) or 0) >= 2 and higher_stub_cache is not None:
+                                                higher_stub_cache.add(_higher_key)
+                                    except Exception:
+                                        pass
+                                    if _stub_confirms >= 2:
+                                        try:
+                                            if higher_stub_cache is not None:
+                                                higher_stub_cache.add(_higher_key)
+                                        except Exception:
+                                            pass
+                                        if family_verdicts is not None:
+                                            family_verdicts[_family_key] = "STUB"
+                                        return _finish(ok=False, size=int(total or 0), reason="PURE_STUB_CONFIRMED", phase=_follow_phase, started_at=_follow_started_at, req_range=_follow_range, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes, attempt=attempt)
+
                             real_high = sum(1 for n in higher_lengths if int(n or 0) >= 1000)
                             empty_high = sum(1 for n in higher_lengths if int(n or 0) < 100)
                             if real_high >= 1:
+                                if family_verdicts is not None:
+                                    family_verdicts[_family_key] = "REAL"
                                 return _finish(ok=True, size=int(total or max(higher_lengths or [0])), reason="REAL_HIGHER_OFFSETS", phase=f"higher_body_{higher_offsets[-1]}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=max(higher_lengths or [0]), attempt=attempt)
                             if higher_lengths and empty_high == len(higher_lengths):
+                                if family_verdicts is not None:
+                                    family_verdicts[_family_key] = "STUB"
                                 return _finish(ok=False, size=int(total or 0), reason="PURE_STUB_CONFIRMED", phase=f"higher_body_{higher_offsets[-1]}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=max(higher_lengths or [0]), attempt=attempt)
                             return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=f"higher_body_{higher_offsets[-1]}", started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=max(higher_lengths or [0]), attempt=attempt)
                 finally:
@@ -2222,7 +2316,6 @@ async def _probe_single(
                             open_sem.release()
                         except Exception:
                             pass
-
                 if first_len <= 0:
                     return _finish(ok=False, size=int(total or 0), reason="BUDGET_STARTED", phase=_phase, started_at=_started_at, req_range=_initial_range, status=_status, history=_history, final_host=_final_host, bytes_read=_bytes_read, attempt=attempt)
 
@@ -2519,7 +2612,7 @@ def _apply_usenet_playability_probe(
                 if _budget_missing:
                     _rc["BUDGET_UNLAUNCHED"] += _budget_missing
 
-                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v23 reasons={dict(_rc.most_common(8))}'
+                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v23p reasons={dict(_rc.most_common(8))}'
                 logger.info(_reasons_msg)
                 try:
                     logging.getLogger("gunicorn.error").info(_reasons_msg)
