@@ -540,6 +540,8 @@ USENET_PROBE_RETRIES = _safe_int(os.environ.get("USENET_PROBE_RETRIES", str(_tmp
 USENET_PROBE_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY", "40"), 40)
 USENET_PROBE_LIMIT_PER_HOST = _safe_int(os.environ.get("USENET_PROBE_LIMIT_PER_HOST", "8"), 8)
 USENET_PROBE_CONCURRENCY_CAP = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY_CAP", str(USENET_PROBE_CONCURRENCY or 8)), max(1, int(USENET_PROBE_CONCURRENCY or 8)))
+USENET_PROBE_OPEN_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_OPEN_CONCURRENCY", "4"), 4)
+USENET_PROBE_IMPL_VER = (os.environ.get("USENET_PROBE_IMPL_VER", "v26g1") or "v26g1").strip()
 # Fixed first ranged read size for the direct usenet probe: bytes=0-(initial_bytes-1).
 # This replaces the old stub_len / range_end model.
 USENET_PROBE_INITIAL_BYTES = _safe_int(os.environ.get("USENET_PROBE_INITIAL_BYTES", "20000"), 20000)
@@ -1678,6 +1680,8 @@ async def _usenet_range_probe_is_real_async(
         probe_urls = _interleaved
 
     sem = asyncio.Semaphore(eff_parallel)
+    open_conc = max(1, min(int(USENET_PROBE_OPEN_CONCURRENCY or 1), int(eff_parallel or 1)))
+    open_sem = asyncio.Semaphore(open_conc)
 
     _auth = None
     try:
@@ -1692,9 +1696,9 @@ async def _usenet_range_probe_is_real_async(
     _conn_mode = "force_close" if _use_force_close else "plain_keepalive"
     try:
         logger.info(
-            "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s initial_bytes=%s budget_s=%.2f timeout_s=%.2f retries=%s target_real=%s mode=%s order=%s total=%s",
-            _rid(), int(concurrency or 1), int(eff_parallel), int(initial_bytes), float(budget_s), float(timeout_s), int(retries or 0), int(target),
-            _conn_mode, "interleave_halves", int(len(probe_urls) or 0),
+            "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s open_conc=%s initial_bytes=%s budget_s=%.2f timeout_s=%.2f retries=%s target_real=%s mode=%s order=%s total=%s ver=%s",
+            _rid(), int(concurrency or 1), int(eff_parallel), int(open_conc), int(initial_bytes), float(budget_s), float(timeout_s), int(retries or 0), int(target),
+            _conn_mode, "interleave_halves", int(len(probe_urls) or 0), str(USENET_PROBE_IMPL_VER),
         )
     except Exception:
         pass
@@ -1758,7 +1762,7 @@ async def _usenet_range_probe_is_real_async(
                     initial_bytes=int(initial_bytes),
                     guard=bool(guard),
                     deadline=0.0,
-                    open_sem=None,
+                    open_sem=open_sem,
                     timeout_debug=_timeout_debug if _timeout_debug_enabled else None,
                     timeout_debug_limit=_timeout_debug_limit,
                     trace_debug=_trace_debug if _trace_debug_enabled else None,
@@ -1874,7 +1878,7 @@ async def _usenet_range_probe_is_real_async(
                 logger.info("USENET_PROBE_SAMPLE rid=%s sample=%s", _rid(), _sample)
             try:
                 _rc = Counter(str(r[3]) for r in results)
-                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver=v26 reasons={dict(_rc.most_common(8))}'
+                _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver={USENET_PROBE_IMPL_VER} reasons={dict(_rc.most_common(8))}'
                 logger.info(_reasons_msg)
                 print(_reasons_msg)
             except Exception:
@@ -2023,31 +2027,49 @@ async def _probe_single(
                 _phase = "initial_open"
                 _started_at = time.monotonic()
                 _attempt_started = True
-                async with session.get(
-                    url,
-                    headers=headers,
-                    allow_redirects=True,
-                    timeout=aiohttp.ClientTimeout(
-                        total=base_total,
-                        connect=min(8.0, max(1.25, base_total * 0.70)),
-                        sock_connect=min(8.0, max(1.25, base_total * 0.70)),
-                        sock_read=max(2.0, base_total),
-                    ),
-                ) as resp:
-                    _status = int(getattr(resp, "status", 0) or 0)
-                    _history = int(len(getattr(resp, "history", []) or []))
-                    try:
-                        from urllib.parse import urlparse
-                        _final_host = urlparse(str(getattr(resp, "url", "") or "")).netloc or ""
-                    except Exception:
-                        _final_host = ""
-                    _phase = "initial_body"
-                    data = await resp.content.read(initial_bytes)
-                    _bytes_read = int(len(data or b""))
-                    total = _parse_total(resp)
-                    first_len = int(_bytes_read)
-                    kind = _detect_kind(data)
-                    suspicious = bool((total is not None and int(total) < 100_000) or kind == "MP4")
+                _open_gate_held = False
+                if open_sem is not None:
+                    await open_sem.acquire()
+                    _open_gate_held = True
+                try:
+                    async with session.get(
+                        url,
+                        headers=headers,
+                        allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(
+                            total=base_total,
+                            connect=min(8.0, max(1.25, base_total * 0.70)),
+                            sock_connect=min(8.0, max(1.25, base_total * 0.70)),
+                            sock_read=max(2.0, base_total),
+                        ),
+                    ) as resp:
+                        if _open_gate_held:
+                            try:
+                                open_sem.release()
+                            except Exception:
+                                pass
+                            _open_gate_held = False
+                        _status = int(getattr(resp, "status", 0) or 0)
+                        _history = int(len(getattr(resp, "history", []) or []))
+                        try:
+                            from urllib.parse import urlparse
+                            _final_host = urlparse(str(getattr(resp, "url", "") or "")).netloc or ""
+                        except Exception:
+                            _final_host = ""
+                        _phase = "initial_body"
+                        data = await resp.content.read(initial_bytes)
+                        _bytes_read = int(len(data or b""))
+                        total = _parse_total(resp)
+                        first_len = int(_bytes_read)
+                        kind = _detect_kind(data)
+                        suspicious = bool((total is not None and int(total) < 100_000) or kind == "MP4")
+                finally:
+                    if _open_gate_held:
+                        try:
+                            open_sem.release()
+                        except Exception:
+                            pass
+                        _open_gate_held = False
 
                     if suspicious:
                         _host_key = _final_host
@@ -2093,29 +2115,47 @@ async def _probe_single(
                             _follow_started_at = time.monotonic()
                             _follow_sig = ""
                             try:
-                                async with session.get(
-                                    url,
-                                    headers={"Range": _follow_range},
-                                    allow_redirects=True,
-                                    timeout=aiohttp.ClientTimeout(
-                                        total=base_total,
-                                        connect=min(4.0, max(0.75, base_total * 0.50)),
-                                        sock_connect=min(4.0, max(0.75, base_total * 0.50)),
-                                        sock_read=max(1.0, base_total),
-                                    ),
-                                ) as r2:
-                                    _follow_status = int(getattr(r2, "status", 0) or 0)
-                                    _follow_history = int(len(getattr(r2, "history", []) or []))
-                                    try:
-                                        from urllib.parse import urlparse
-                                        _follow_final_host = urlparse(str(getattr(r2, "url", "") or "")).netloc or ""
-                                    except Exception:
-                                        _follow_final_host = ""
-                                    _follow_phase = f"higher_body_{off}"
-                                    chunk = await r2.content.read(higher_span)
-                                    _follow_bytes = int(len(chunk or b""))
-                                    _follow_sig = _sig12(chunk)
-                                    higher_lengths.append(_follow_bytes)
+                                _follow_gate_held = False
+                                if open_sem is not None:
+                                    await open_sem.acquire()
+                                    _follow_gate_held = True
+                                try:
+                                    async with session.get(
+                                        url,
+                                        headers={"Range": _follow_range},
+                                        allow_redirects=True,
+                                        timeout=aiohttp.ClientTimeout(
+                                            total=base_total,
+                                            connect=min(4.0, max(0.75, base_total * 0.50)),
+                                            sock_connect=min(4.0, max(0.75, base_total * 0.50)),
+                                            sock_read=max(1.0, base_total),
+                                        ),
+                                    ) as r2:
+                                        if _follow_gate_held:
+                                            try:
+                                                open_sem.release()
+                                            except Exception:
+                                                pass
+                                            _follow_gate_held = False
+                                        _follow_status = int(getattr(r2, "status", 0) or 0)
+                                        _follow_history = int(len(getattr(r2, "history", []) or []))
+                                        try:
+                                            from urllib.parse import urlparse
+                                            _follow_final_host = urlparse(str(getattr(r2, "url", "") or "")).netloc or ""
+                                        except Exception:
+                                            _follow_final_host = ""
+                                        _follow_phase = f"higher_body_{off}"
+                                        chunk = await r2.content.read(higher_span)
+                                        _follow_bytes = int(len(chunk or b""))
+                                        _follow_sig = _sig12(chunk)
+                                        higher_lengths.append(_follow_bytes)
+                                finally:
+                                    if _follow_gate_held:
+                                        try:
+                                            open_sem.release()
+                                        except Exception:
+                                            pass
+                                        _follow_gate_held = False
                             except asyncio.TimeoutError:
                                 _record_timeout(phase=_follow_phase, attempt=attempt, req_range=_follow_range, started_at=_follow_started_at, status=_follow_status, history=_follow_history, final_host=_follow_final_host, bytes_read=_follow_bytes)
                                 if attempt >= attempts:
@@ -4316,7 +4356,7 @@ logger.info(
     int((_ENV_FILE_INFO or {}).get("loaded") or 0),
     int((_ENV_FILE_INFO or {}).get("overridden") or 0),
 )
-logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_initial_bytes={USENET_PROBE_INITIAL_BYTES} usenet_probe_limit_per_host={USENET_PROBE_LIMIT_PER_HOST} usenet_probe_concurrency={USENET_PROBE_CONCURRENCY} usenet_probe_concurrency_cap={USENET_PROBE_CONCURRENCY_CAP} usenet_probe_debug_timeouts={USENET_PROBE_DEBUG_TIMEOUTS} usenet_probe_debug_timeouts_n={USENET_PROBE_DEBUG_TIMEOUTS_N} usenet_probe_trace={USENET_PROBE_TRACE} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N} wrap_url_backend={_WRAP_URL_BACKEND} web_concurrency_env={WEB_CONCURRENCY_ENV}")
+logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_initial_bytes={USENET_PROBE_INITIAL_BYTES} usenet_probe_limit_per_host={USENET_PROBE_LIMIT_PER_HOST} usenet_probe_concurrency={USENET_PROBE_CONCURRENCY} usenet_probe_concurrency_cap={USENET_PROBE_CONCURRENCY_CAP} usenet_probe_open_concurrency={USENET_PROBE_OPEN_CONCURRENCY} usenet_probe_impl_ver={USENET_PROBE_IMPL_VER} usenet_probe_debug_timeouts={USENET_PROBE_DEBUG_TIMEOUTS} usenet_probe_debug_timeouts_n={USENET_PROBE_DEBUG_TIMEOUTS_N} usenet_probe_trace={USENET_PROBE_TRACE} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N} wrap_url_backend={_WRAP_URL_BACKEND} web_concurrency_env={WEB_CONCURRENCY_ENV}")
 
 logger.info(
     "LOG_FLAGS wrap_log_token_emit=%s wrap_log_token_hit=%s wrap_log_token_full=%s wrap_log_token_sample_pct=%s sort_proof_top_n=%s usenet_probe_log_urls=%s usenet_probe_log_urls_n=%s",
