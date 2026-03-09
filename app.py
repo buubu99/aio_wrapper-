@@ -1894,16 +1894,6 @@ async def _usenet_range_probe_is_real_async(
                     results.append((u, False, 0, "BUDGET_STARTED"))
 
         try:
-            _counts = _summarize_probe_results(results, candidate_total=int(len(probe_urls)))
-            _msg = (
-                f"PROBE_PARTIAL: cand={_counts['candidates']} started={_counts['started']} definitive={_counts['definitive']} "
-                f"real={_counts['real']} stub={_counts['stub']} timeout={_counts['timeout']} error_other={_counts['error_other']} "
-                f"budget_started={_counts['budget_started']} budget_unlaunched={_counts['budget_unlaunched']} skip_target={_counts['skipped_target']} "
-                f"in {float(min(_elapsed, float(budget_s))):.2f} s"
-            )
-        except Exception:
-            _msg = f"PROBE_PARTIAL: results={int(len(results))} in {float(min(_elapsed, float(budget_s))):.2f} s"
-        try:
             if _timeout_debug_enabled and _timeout_debug:
                 _tc = Counter(str(d.get("phase") or "?") for d in _timeout_debug)
                 logger.info("USENET_PROBE_TIMEOUT_PHASES rid=%s counts=%s", _rid(), dict(_tc))
@@ -1924,8 +1914,6 @@ async def _usenet_range_probe_is_real_async(
                         "USENET_PROBE_TRACE rid=%s idx=%s host=%s ms=%s verdict=%s reason=%s phase=%s status=%s hist=%s range=%s bytes=%s total=%s final=%s attempt=%s queue_ms=%s open_ms=%s body_ms=%s task_ms=%s",
                         _rid(), d.get("idx", 0), d.get("host", "?"), d.get("ms", 0), d.get("verdict", "?"), d.get("reason", ""), d.get("phase", "?"), d.get("status", 0), d.get("history", 0), d.get("range", ""), d.get("bytes", 0), d.get("total", 0), d.get("final", ""), d.get("attempt", 0), d.get("queue_ms", 0), d.get("open_ms", 0), d.get("body_ms", 0), d.get("task_ms", 0),
                     )
-            logger.info(_msg)
-            print(_msg)
             _sample = []
             for (_u, _ok, _sz, _rs) in results[: min(5, len(results))]:
                 try:
@@ -1939,7 +1927,6 @@ async def _usenet_range_probe_is_real_async(
                 _rc = Counter(str(r[3]) for r in results)
                 _reasons_msg = f'USENET_PROBE_REASONS rid={_rid()} ver={USENET_PROBE_IMPL_VER} reasons={dict(_rc.most_common(8))}'
                 logger.info(_reasons_msg)
-                print(_reasons_msg)
             except Exception:
                 pass
         except Exception:
@@ -2687,10 +2674,6 @@ def _apply_usenet_playability_probe(
 
     try:
         ms = int((time.monotonic() - t0) * 1000)
-        logger.info(
-            "USENET_PROBE rid=%s candidates=%s started=%s definitive=%s real=%s stub=%s timeout=%s error_other=%s budget=%s budget_started=%s budget_unlaunched=%s skipped_target=%s ms=%s",
-            _rid(), int(candidate_count), int(started_count), int(definitive_count), int(len(real_idx)), int(len(stub_idx)), int(len(timeout_idx)), int(len(error_other_idx)), int(len(budget_idx)), int(budget_started_count), int(budget_unlaunched_count), int(len(skipped_target_idx)), int(ms),
-        )
         if stats is not None:
             try:
                 stats.fetch_p2["probe_candidates"] = int(candidate_count)
