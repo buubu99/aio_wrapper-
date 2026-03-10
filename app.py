@@ -540,7 +540,7 @@ USENET_PROBE_RETRIES = _safe_int(os.environ.get("USENET_PROBE_RETRIES", str(_tmp
 USENET_PROBE_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY", "40"), 40)
 USENET_PROBE_CONCURRENCY_CAP = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY_CAP", str(USENET_PROBE_CONCURRENCY or 8)), max(1, int(USENET_PROBE_CONCURRENCY or 8)))
 USENET_PROBE_OPEN_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_OPEN_CONCURRENCY", "4"), 4)
-USENET_PROBE_IMPL_VER = (os.environ.get("USENET_PROBE_IMPL_VER", "v26g2") or "v26g2").strip()
+USENET_PROBE_IMPL_VER = (os.environ.get("USENET_PROBE_IMPL_VER", "v26g7") or "v26g7").strip()
 # Prewarm uses the env-sized initial probe window; the measured batch uses a fixed 64 KiB open.
 USENET_PROBE_INITIAL_BYTES = _safe_int(os.environ.get("USENET_PROBE_INITIAL_BYTES", "8192"), 8192)
 USENET_PROBE_PREWARM_S = _safe_float(os.environ.get("USENET_PROBE_PREWARM_S", "3.0"), 3.0)
@@ -2209,7 +2209,8 @@ async def _usenet_range_probe_is_real_async(
     prewarm_timeout_s = max(0.25, float(USENET_PROBE_PREWARM_S or _USENET_PROBE_PREWARM_TIMEOUT_S_DEFAULT))
     measured_span = int(_USENET_PROBE_MEASURE_BYTES)
     eff_parallel = max(1, min(int(concurrency or 1), int(USENET_PROBE_CONCURRENCY_CAP or int(concurrency or 1) or 1), int(len(ordered_all) or 1)))
-    open_conc = max(1, min(int(USENET_PROBE_OPEN_CONCURRENCY or 1), int(eff_parallel), int(len(ordered_all) or 1)))
+    cfg_open_conc = max(1, int(USENET_PROBE_OPEN_CONCURRENCY or 1))
+    open_conc = int(eff_parallel)
     fast_lane_openers = max(1, min(int(_USENET_PROBE_FAST_LANE_OPENERS), int(open_conc)))
     verify_conc = int(_USENET_PROBE_VERIFY_CONC)
     warmers = _probe_pick_sacrificial_warmers(ordered_all, min(int(_USENET_PROBE_PREWARM_COUNT), len(ordered_all)))
@@ -2219,8 +2220,8 @@ async def _usenet_range_probe_is_real_async(
     seed_items, post_main, post_fast, post_reserve = _probe_choose_seeded_first_wave(candidate_items, main_items, fast_items, reserve_items, open_conc=open_conc)
     try:
         logger.info(
-            "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s open_conc=%s verify_conc=%s prewarm_count=%s prewarm_s=%.2f prewarm_bytes=%s measure_bytes=%s budget_s=%.2f timeout_s=%.2f target_real=%s mode=%s order=%s total=%s ver=%s",
-            _rid(), int(concurrency or 1), int(eff_parallel), int(open_conc), int(verify_conc), int(len(warmers)), float(prewarm_timeout_s), int(prewarm_span), int(measured_span), float(budget_s), float(timeout_s), int(target), "hybrid_prewarm_replace", "interleave_halves", int(len(ordered_all) or 0), str(USENET_PROBE_IMPL_VER),
+            "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s open_conc=%s cfg_open_conc=%s verify_conc=%s prewarm_count=%s prewarm_s=%.2f prewarm_bytes=%s measure_bytes=%s budget_s=%.2f timeout_s=%.2f target_real=%s mode=%s slot_model=%s order=%s total=%s ver=%s",
+            _rid(), int(concurrency or 1), int(eff_parallel), int(open_conc), int(cfg_open_conc), int(verify_conc), int(len(warmers)), float(prewarm_timeout_s), int(prewarm_span), int(measured_span), float(budget_s), float(timeout_s), int(target), "hybrid_prewarm_replace", "opener_only", "interleave_halves", int(len(ordered_all) or 0), str(USENET_PROBE_IMPL_VER),
         )
         logger.info(
             "USENET_PROBE_PLAN rid=%s warmers=%s candidates=%s preview=%s fast=%s reserve=%s seed=%s post_fast=%s post_reserve=%s post_main=%s",
@@ -2249,8 +2250,7 @@ async def _usenet_range_probe_is_real_async(
     verify_q: asyncio.Queue = asyncio.Queue()
     done_event = asyncio.Event()
     auth = _probe_auth()
-    open_sem = asyncio.Semaphore(max(1, int(open_conc)))
-    connector = aiohttp.TCPConnector(limit=max(eff_parallel + verify_conc + 8, 32), ttl_dns_cache=300)
+    connector = aiohttp.TCPConnector(limit=max(open_conc + verify_conc + 8, 32), ttl_dns_cache=300)
     timeout = _probe_initial_timeout_obj(float(timeout_s))
 
     def keep_result(out: Dict[str, Any]) -> None:
@@ -2308,7 +2308,7 @@ async def _usenet_range_probe_is_real_async(
                 seen_input_urls[c_url] = idx
             states[idx]["stage"] = "initial_open"
             eff_noheader = _probe_effective_noheader_timeout(_USENET_PROBE_NOHEADER_TIMEOUT_S, picked_at, batch_start, deadline)
-            out = await _probe_open_initial_with_deadline(session, url, span=measured_span, total_timeout_s=float(timeout_s), noheader_timeout_s=eff_noheader, open_sem=open_sem)
+            out = await _probe_open_initial_with_deadline(session, url, span=measured_span, total_timeout_s=float(timeout_s), noheader_timeout_s=eff_noheader)
             if out.get("ok"):
                 tr = {
                     "queue_wait_ms": q_ms,
@@ -2395,7 +2395,7 @@ async def _usenet_range_probe_is_real_async(
                         tr.setdefault("error_name", "TimeoutError")
                         break
                     per_fetch = min(float(timeout_s), _USENET_PROBE_VERIFY_FETCH_CAP_S, max(0.35, remain - 0.05))
-                    chk = await _probe_fetch_higher(session, url, start=int(off), span=int(_USENET_PROBE_VERIFY_SPAN), timeout_s=float(per_fetch), open_sem=open_sem)
+                    chk = await _probe_fetch_higher(session, url, start=int(off), span=int(_USENET_PROBE_VERIFY_SPAN), timeout_s=float(per_fetch))
                     checks.append(chk)
                     tr.setdefault("verify_open_gate_wait_ms", 0)
                     tr["verify_open_gate_wait_ms"] = int(tr.get("verify_open_gate_wait_ms", 0) or 0) + int(chk.get("open_gate_wait_ms", 0) or 0)
@@ -2492,10 +2492,12 @@ async def _usenet_range_probe_is_real_async(
                 "total": total,
                 "kind": out.get("kind"),
                 "queue_ms": int(trace.get("queue_wait_ms", 0) or 0),
+                "open_gate_ms": int(trace.get("open_gate_wait_ms", 0) or 0),
                 "open_ms": int(trace.get("open_ms", 0) or 0),
                 "body_ms": int(trace.get("initial_body_ms", 0) or 0),
                 "task_ms": int(trace.get("task_total_ms", 0) or 0),
                 "verify_queue_ms": int(trace.get("verify_queue_wait_ms", 0) or 0),
+                "verify_open_gate_ms": int(trace.get("verify_open_gate_wait_ms", 0) or 0),
                 "verify_total_ms": int(trace.get("verify_total_ms", 0) or 0),
                 "noheader_ms": int(trace.get("noheader_timeout_ms", 0) or 0),
                 "err": str(trace.get("error_name") or ""),
@@ -2505,11 +2507,24 @@ async def _usenet_range_probe_is_real_async(
         logger.info("USENET_PROBE_REASONS rid=%s ver=%s reasons=%s", _rid(), str(USENET_PROBE_IMPL_VER), dict(reason_counter.most_common(8)))
         if timeout_phases:
             logger.info("USENET_PROBE_TIMEOUT_PHASES rid=%s counts=%s stages=%s", _rid(), dict(timeout_phases), dict(timeout_stage_counts))
+        _state_counts = Counter(str((states.get(i, {}) or {}).get("stage") or "?") for i, _u, _n in candidate_items)
+        _open_gate_vals = [int(r.get("open_gate_ms", 0) or 0) for r in trace_rows]
+        _queue_vals = [int(r.get("queue_ms", 0) or 0) for r in trace_rows]
+        _open_vals = [int(r.get("open_ms", 0) or 0) for r in trace_rows]
+        _task_vals = [int(r.get("task_ms", 0) or 0) for r in trace_rows]
+        _verify_queue_vals = [int(r.get("verify_queue_ms", 0) or 0) for r in trace_rows]
+        _verify_open_gate_vals = [int(r.get("verify_open_gate_ms", 0) or 0) for r in trace_rows]
+        _verify_total_vals = [int(r.get("verify_total_ms", 0) or 0) for r in trace_rows]
+        logger.info(
+            "USENET_PROBE_FLOW rid=%s opener_workers=%s fast_workers=%s verify_workers=%s measured=%s started=%s untouched=%s real=%s target=%s states=%s queue_max_ms=%s open_gate_max_ms=%s open_max_ms=%s task_max_ms=%s verify_queue_max_ms=%s verify_open_gate_max_ms=%s verify_total_max_ms=%s",
+            _rid(), int(eff_parallel), int(min(fast_lane_openers, eff_parallel)), int(verify_conc), int(len(candidate_items)), int(len(candidate_items) - len(untouched)), int(len(untouched)), int(real_count), int(target), dict(_state_counts),
+            max(_queue_vals or [0]), max(_open_gate_vals or [0]), max(_open_vals or [0]), max(_task_vals or [0]), max(_verify_queue_vals or [0]), max(_verify_open_gate_vals or [0]), max(_verify_total_vals or [0]),
+        )
         if USENET_PROBE_TRACE and trace_rows:
             for row in trace_rows:
                 logger.info(
-                    "USENET_PROBE_TRACE rid=%s idx=%s verdict=%s reason=%s stage=%s status=%s total=%s kind=%s queue_ms=%s open_ms=%s body_ms=%s task_ms=%s verify_queue_ms=%s verify_total_ms=%s noheader_ms=%s err=%s dup_of=%s",
-                    _rid(), row.get("idx"), row.get("verdict"), row.get("reason"), row.get("stage"), row.get("status"), row.get("total"), row.get("kind"), row.get("queue_ms"), row.get("open_ms"), row.get("body_ms"), row.get("task_ms"), row.get("verify_queue_ms"), row.get("verify_total_ms"), row.get("noheader_ms"), row.get("err"), row.get("dup_of"),
+                    "USENET_PROBE_TRACE rid=%s idx=%s verdict=%s reason=%s stage=%s status=%s total=%s kind=%s queue_ms=%s open_gate_ms=%s open_ms=%s body_ms=%s task_ms=%s verify_queue_ms=%s verify_open_gate_ms=%s verify_total_ms=%s noheader_ms=%s err=%s dup_of=%s",
+                    _rid(), row.get("idx"), row.get("verdict"), row.get("reason"), row.get("stage"), row.get("status"), row.get("total"), row.get("kind"), row.get("queue_ms"), row.get("open_gate_ms"), row.get("open_ms"), row.get("body_ms"), row.get("task_ms"), row.get("verify_queue_ms"), row.get("verify_open_gate_ms"), row.get("verify_total_ms"), row.get("noheader_ms"), row.get("err"), row.get("dup_of"),
                 )
     except Exception:
         pass
@@ -7682,26 +7697,30 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
             now = time.monotonic()
             rem_fetch = max(0.05, deadline - now)
 
-            # How much probe time is left (based on recorded start + probe budget).
+            # How much probe time is left (recorded start + prewarm + measured budget).
             try:
-                pb = float(USENET_PROBE_BUDGET_S or 0.0)
+                pb_measure = float(USENET_PROBE_BUDGET_S or 0.0)
             except Exception:
-                pb = 0.0
-            if pb <= 0:
-                pb = 0.1
+                pb_measure = 0.0
+            try:
+                pb_prewarm = float(USENET_PROBE_PREWARM_S or 0.0)
+            except Exception:
+                pb_prewarm = 0.0
+            pb_total = max(0.1, float(pb_measure) + max(0.0, float(pb_prewarm)))
             if p2_probe_t0 is None:
                 p2_probe_t0 = now  # best-effort fallback
             probe_elapsed = max(0.0, now - float(p2_probe_t0))
-            probe_rem = max(0.05, float(pb) - float(probe_elapsed))
+            probe_rem = max(0.05, float(pb_total) - float(probe_elapsed))
 
-            # Allow a small slack beyond fetch-wall specifically to capture probe results.
-            # This should be safe on Tier-1: it is bounded and only applies when probe was started.
+            # Allow a bounded slack beyond fetch-wall specifically to capture probe results.
+            # Include prewarm in the slack cap because prewarm intentionally lives outside the 12s measured wall.
             try:
                 join_slack = float(os.getenv("USENET_PROBE_JOIN_SLACK_S", "1.5") or 1.5)
             except Exception:
                 join_slack = 1.5
 
-            join_timeout = min(probe_rem + 0.10, rem_fetch + max(0.0, join_slack))
+            join_cap = rem_fetch + max(0.0, join_slack) + max(0.0, float(pb_prewarm))
+            join_timeout = min(probe_rem + 0.10, join_cap)
             join_timeout = max(0.05, float(join_timeout))
 
             _tjp = time.monotonic()
@@ -7713,6 +7732,8 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                     p2_meta.update(probe_meta2)
                     p2_meta["probe_join_ms"] = int((time.monotonic() - _tjp) * 1000)
                     p2_meta["probe_join_timeout_s"] = float(join_timeout)
+                    p2_meta["probe_total_budget_s"] = float(pb_total)
+                    p2_meta["probe_prewarm_s"] = float(pb_prewarm)
             except Exception:
                 pass
         except FuturesTimeoutError:
@@ -7724,6 +7745,8 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                 if isinstance(p2_meta, dict):
                     p2_meta["probe_early_err"] = "timeout_join"
                     p2_meta["probe_join_timeout_s"] = float(join_timeout) if 'join_timeout' in locals() else None
+                    p2_meta["probe_total_budget_s"] = float(pb_total) if 'pb_total' in locals() else None
+                    p2_meta["probe_prewarm_s"] = float(pb_prewarm) if 'pb_prewarm' in locals() else None
             except Exception:
                 pass
         except Exception as e:
