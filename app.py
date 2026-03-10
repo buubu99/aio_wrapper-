@@ -540,7 +540,7 @@ USENET_PROBE_RETRIES = _safe_int(os.environ.get("USENET_PROBE_RETRIES", str(_tmp
 USENET_PROBE_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY", "40"), 40)
 USENET_PROBE_CONCURRENCY_CAP = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY_CAP", str(USENET_PROBE_CONCURRENCY or 8)), max(1, int(USENET_PROBE_CONCURRENCY or 8)))
 USENET_PROBE_OPEN_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_OPEN_CONCURRENCY", "4"), 4)
-USENET_PROBE_IMPL_VER = (os.environ.get("USENET_PROBE_IMPL_VER", "v26g7") or "v26g7").strip()
+USENET_PROBE_IMPL_VER = (os.environ.get("USENET_PROBE_IMPL_VER", "v26g8") or "v26g8").strip()
 # Prewarm uses the env-sized initial probe window; the measured batch uses a fixed 64 KiB open.
 USENET_PROBE_INITIAL_BYTES = _safe_int(os.environ.get("USENET_PROBE_INITIAL_BYTES", "8192"), 8192)
 USENET_PROBE_PREWARM_S = _safe_float(os.environ.get("USENET_PROBE_PREWARM_S", "3.0"), 3.0)
@@ -2220,7 +2220,7 @@ async def _usenet_range_probe_is_real_async(
     seed_items, post_main, post_fast, post_reserve = _probe_choose_seeded_first_wave(candidate_items, main_items, fast_items, reserve_items, open_conc=open_conc)
     try:
         logger.info(
-            "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s open_conc=%s cfg_open_conc=%s verify_conc=%s prewarm_count=%s prewarm_s=%.2f prewarm_bytes=%s measure_bytes=%s budget_s=%.2f timeout_s=%.2f target_real=%s mode=%s slot_model=%s order=%s total=%s ver=%s",
+            "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s open_conc=%s legacy_cfg_open_conc=%s verify_conc=%s prewarm_count=%s prewarm_s=%.2f prewarm_bytes=%s measure_bytes=%s budget_s=%.2f timeout_s=%.2f target_real=%s mode=%s slot_model=%s order=%s total=%s ver=%s",
             _rid(), int(concurrency or 1), int(eff_parallel), int(open_conc), int(cfg_open_conc), int(verify_conc), int(len(warmers)), float(prewarm_timeout_s), int(prewarm_span), int(measured_span), float(budget_s), float(timeout_s), int(target), "hybrid_prewarm_replace", "opener_only", "interleave_halves", int(len(ordered_all) or 0), str(USENET_PROBE_IMPL_VER),
         )
         logger.info(
@@ -2508,6 +2508,10 @@ async def _usenet_range_probe_is_real_async(
         if timeout_phases:
             logger.info("USENET_PROBE_TIMEOUT_PHASES rid=%s counts=%s stages=%s", _rid(), dict(timeout_phases), dict(timeout_stage_counts))
         _state_counts = Counter(str((states.get(i, {}) or {}).get("stage") or "?") for i, _u, _n in candidate_items)
+        _final_buckets = dict(reason_counter)
+        _launched_count = sum(1 for i, _u, _n in candidate_items if str((states.get(i, {}) or {}).get("stage") or "pending") != "pending")
+        _finalized_count = int(len(trace_rows))
+        _pending_state_count = max(0, int(len(candidate_items)) - int(_launched_count))
         _open_gate_vals = [int(r.get("open_gate_ms", 0) or 0) for r in trace_rows]
         _queue_vals = [int(r.get("queue_ms", 0) or 0) for r in trace_rows]
         _open_vals = [int(r.get("open_ms", 0) or 0) for r in trace_rows]
@@ -2516,8 +2520,8 @@ async def _usenet_range_probe_is_real_async(
         _verify_open_gate_vals = [int(r.get("verify_open_gate_ms", 0) or 0) for r in trace_rows]
         _verify_total_vals = [int(r.get("verify_total_ms", 0) or 0) for r in trace_rows]
         logger.info(
-            "USENET_PROBE_FLOW rid=%s opener_workers=%s fast_workers=%s verify_workers=%s measured=%s started=%s untouched=%s real=%s target=%s states=%s queue_max_ms=%s open_gate_max_ms=%s open_max_ms=%s task_max_ms=%s verify_queue_max_ms=%s verify_open_gate_max_ms=%s verify_total_max_ms=%s",
-            _rid(), int(eff_parallel), int(min(fast_lane_openers, eff_parallel)), int(verify_conc), int(len(candidate_items)), int(len(candidate_items) - len(untouched)), int(len(untouched)), int(real_count), int(target), dict(_state_counts),
+            "USENET_PROBE_FLOW rid=%s opener_workers=%s fast_workers=%s verify_workers=%s measured=%s launched=%s finalized=%s pending_state=%s real=%s target=%s live_states=%s final_buckets=%s queue_max_ms=%s open_gate_max_ms=%s open_max_ms=%s task_max_ms=%s verify_queue_max_ms=%s verify_open_gate_max_ms=%s verify_total_max_ms=%s",
+            _rid(), int(eff_parallel), int(min(fast_lane_openers, eff_parallel)), int(verify_conc), int(len(candidate_items)), int(_launched_count), int(_finalized_count), int(_pending_state_count), int(real_count), int(target), dict(_state_counts), _final_buckets,
             max(_queue_vals or [0]), max(_open_gate_vals or [0]), max(_open_vals or [0]), max(_task_vals or [0]), max(_verify_queue_vals or [0]), max(_verify_open_gate_vals or [0]), max(_verify_total_vals or [0]),
         )
         if USENET_PROBE_TRACE and trace_rows:
