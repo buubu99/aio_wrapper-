@@ -540,7 +540,7 @@ USENET_PROBE_RETRIES = _safe_int(os.environ.get("USENET_PROBE_RETRIES", str(_tmp
 USENET_PROBE_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY", "40"), 40)
 USENET_PROBE_CONCURRENCY_CAP = _safe_int(os.environ.get("USENET_PROBE_CONCURRENCY_CAP", str(USENET_PROBE_CONCURRENCY or 8)), max(1, int(USENET_PROBE_CONCURRENCY or 8)))
 USENET_PROBE_OPEN_CONCURRENCY = _safe_int(os.environ.get("USENET_PROBE_OPEN_CONCURRENCY", "4"), 4)
-USENET_PROBE_IMPL_VER = (os.environ.get("USENET_PROBE_IMPL_VER", "v26g8") or "v26g8").strip()
+USENET_PROBE_IMPL_VER = (os.environ.get("USENET_PROBE_IMPL_VER", "v26g9") or "v26g9").strip()
 # Prewarm uses the env-sized initial probe window; the measured batch uses a fixed 64 KiB open.
 USENET_PROBE_INITIAL_BYTES = _safe_int(os.environ.get("USENET_PROBE_INITIAL_BYTES", "8192"), 8192)
 USENET_PROBE_PREWARM_S = _safe_float(os.environ.get("USENET_PROBE_PREWARM_S", "3.0"), 3.0)
@@ -2507,11 +2507,17 @@ async def _usenet_range_probe_is_real_async(
         logger.info("USENET_PROBE_REASONS rid=%s ver=%s reasons=%s", _rid(), str(USENET_PROBE_IMPL_VER), dict(reason_counter.most_common(8)))
         if timeout_phases:
             logger.info("USENET_PROBE_TIMEOUT_PHASES rid=%s counts=%s stages=%s", _rid(), dict(timeout_phases), dict(timeout_stage_counts))
-        _state_counts = Counter(str((states.get(i, {}) or {}).get("stage") or "?") for i, _u, _n in candidate_items)
         _final_buckets = dict(reason_counter)
-        _launched_count = sum(1 for i, _u, _n in candidate_items if str((states.get(i, {}) or {}).get("stage") or "pending") != "pending")
-        _finalized_count = int(len(trace_rows))
-        _pending_state_count = max(0, int(len(candidate_items)) - int(_launched_count))
+        _budget_unlaunched = int(reason_counter.get("BUDGET_UNLAUNCHED", 0) or 0)
+        _started_count = max(0, int(len(candidate_items)) - _budget_unlaunched)
+        _definitive_count = max(0, int(len(candidate_items)) - _budget_unlaunched)
+        _finalized_idx = {int(r.get("idx")) for r in trace_rows if r.get("idx") is not None}
+        _live_state_counts = Counter(
+            str((states.get(i, {}) or {}).get("stage") or "?")
+            for i, _u, _n in candidate_items
+            if int(i) not in _finalized_idx
+        )
+        _pending_state_count = max(0, int(len(candidate_items)) - int(len(_finalized_idx)))
         _open_gate_vals = [int(r.get("open_gate_ms", 0) or 0) for r in trace_rows]
         _queue_vals = [int(r.get("queue_ms", 0) or 0) for r in trace_rows]
         _open_vals = [int(r.get("open_ms", 0) or 0) for r in trace_rows]
@@ -2520,8 +2526,8 @@ async def _usenet_range_probe_is_real_async(
         _verify_open_gate_vals = [int(r.get("verify_open_gate_ms", 0) or 0) for r in trace_rows]
         _verify_total_vals = [int(r.get("verify_total_ms", 0) or 0) for r in trace_rows]
         logger.info(
-            "USENET_PROBE_FLOW rid=%s opener_workers=%s fast_workers=%s verify_workers=%s measured=%s launched=%s finalized=%s pending_state=%s real=%s target=%s live_states=%s final_buckets=%s queue_max_ms=%s open_gate_max_ms=%s open_max_ms=%s task_max_ms=%s verify_queue_max_ms=%s verify_open_gate_max_ms=%s verify_total_max_ms=%s",
-            _rid(), int(eff_parallel), int(min(fast_lane_openers, eff_parallel)), int(verify_conc), int(len(candidate_items)), int(_launched_count), int(_finalized_count), int(_pending_state_count), int(real_count), int(target), dict(_state_counts), _final_buckets,
+            "USENET_PROBE_FLOW rid=%s opener_workers=%s fast_workers=%s verify_workers=%s measured=%s started=%s definitive=%s budget_unlaunched=%s pending_state=%s real=%s target=%s live_states=%s final_buckets=%s queue_max_ms=%s open_gate_max_ms=%s open_max_ms=%s task_max_ms=%s verify_queue_max_ms=%s verify_open_gate_max_ms=%s verify_total_max_ms=%s",
+            _rid(), int(eff_parallel), int(min(fast_lane_openers, eff_parallel)), int(verify_conc), int(len(candidate_items)), int(_started_count), int(_definitive_count), int(_budget_unlaunched), int(_pending_state_count), int(real_count), int(target), dict(_live_state_counts), _final_buckets,
             max(_queue_vals or [0]), max(_open_gate_vals or [0]), max(_open_vals or [0]), max(_task_vals or [0]), max(_verify_queue_vals or [0]), max(_verify_open_gate_vals or [0]), max(_verify_total_vals or [0]),
         )
         if USENET_PROBE_TRACE and trace_rows:
@@ -10849,6 +10855,60 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             )
         except Exception:
             pass
+
+    try:
+        if USENET_PROBE_ENABLE:
+            _usenet_provs_trace = {str(p).upper() for p in (USENET_PROVIDERS or USENET_PRIORITY or [])}
+            _usenet_provs_trace.add("ND")
+
+            def _probe_real_pair(_pair: Tuple[Dict[str, Any], Dict[str, Any]]) -> bool:
+                _s, _m = _pair
+                try:
+                    _prov = str((_m.get("provider") or "")).upper().strip()
+                    return _prov in _usenet_provs_trace and _normalize_usenet_probe_state(_m.get("usenet_probe")) == "REAL"
+                except Exception:
+                    return False
+
+            def _pair_key(_pair: Tuple[Dict[str, Any], Dict[str, Any]]) -> Tuple[str, str, str, str]:
+                _s, _m = _pair
+                _u = str((_s.get("url") or _s.get("externalUrl") or "")).strip()
+                _ih = str((_m.get("infohash") or _m.get("infoHash") or _s.get("infohash") or _s.get("infoHash") or "")).strip().lower()
+                _n = str((_s.get("name") or _s.get("title") or "")).strip()
+                _p = str((_m.get("provider") or "")).upper().strip()
+                return (_u, _ih, _n, _p)
+
+            def _brief(_pair: Tuple[Dict[str, Any], Dict[str, Any]]) -> str:
+                _s, _m = _pair
+                _prov = str((_m.get("provider") or "UNK")).upper().strip()
+                _res = str((_m.get("res") or "SD")).strip()
+                _nm = str((_s.get("name") or _s.get("title") or "")).strip()
+                if len(_nm) > 80:
+                    _nm = _nm[:77] + "..."
+                return f"{_prov}:{_res}:{_nm}"
+
+            _probe_real_out = [p for p in out_pairs if _probe_real_pair(p)]
+            _probe_real_candidates = [p for p in candidates if _probe_real_pair(p)]
+            _probe_real_deliver = [p for p in candidates[:deliver_cap_eff] if _probe_real_pair(p)]
+            _probe_real_ready_out = sum(1 for _s, _m in _probe_real_out if bool((_m or {}).get("ready")))
+            _probe_real_ready_candidates = sum(1 for _s, _m in _probe_real_candidates if bool((_m or {}).get("ready")))
+            _probe_real_ready_deliver = sum(1 for _s, _m in _probe_real_deliver if bool((_m or {}).get("ready")))
+            _cand_keys = {_pair_key(p) for p in _probe_real_candidates}
+            _deliver_keys = {_pair_key(p) for p in _probe_real_deliver}
+            _lost_before_candidates = [p for p in _probe_real_out if _pair_key(p) not in _cand_keys]
+            _lost_before_deliver = [p for p in _probe_real_candidates if _pair_key(p) not in _deliver_keys]
+            logger.info(
+                "USENET_REAL_TRACE rid=%s probe_real=%s probe_ready=%s candidates_real=%s candidates_ready=%s deliver_real=%s deliver_ready=%s lost_before_candidates=%s lost_before_deliver=%s sample_lost_before_candidates=%s sample_lost_before_deliver=%s",
+                _rid(),
+                int(len(_probe_real_out)), int(_probe_real_ready_out),
+                int(len(_probe_real_candidates)), int(_probe_real_ready_candidates),
+                int(len(_probe_real_deliver)), int(_probe_real_ready_deliver),
+                int(len(_lost_before_candidates)), int(len(_lost_before_deliver)),
+                [_brief(p) for p in _lost_before_candidates[:3]],
+                [_brief(p) for p in _lost_before_deliver[:3]],
+            )
+        
+    except Exception:
+        pass
 
     # Format (last step)
     delivered: List[Dict[str, Any]] = []
