@@ -15,6 +15,7 @@ import random
 import subprocess
 import asyncio
 import aiohttp  # required
+from urllib.parse import urlparse
 
 
 # Base logger must exist early because some env validation happens before later logging setup.
@@ -2037,6 +2038,71 @@ def _probe_headers_with_range(range_value: str) -> Dict[str, str]:
     }
 
 
+def _probe_host(url: str) -> str:
+    try:
+        return (urlparse(str(url or "")).netloc or "").lower()
+    except Exception:
+        return ""
+
+
+def _probe_url_hash(url: str, n: int = 12) -> str:
+    try:
+        canon = _probe_canonical_url(str(url or ""))
+        if not canon:
+            return ""
+        return hashlib.sha1(canon.encode("utf-8", "ignore")).hexdigest()[:max(4, int(n))]
+    except Exception:
+        return ""
+
+
+def _probe_name_tag(name: Any, max_len: int = 120) -> str:
+    try:
+        s = re.sub(r"\s+", " ", str(name or "")).strip()
+        if len(s) > max_len:
+            s = s[: max_len - 1] + "…"
+        return s
+    except Exception:
+        return ""
+
+
+def _probe_item_log_meta(idx: Any, url: str, name: Any) -> Dict[str, Any]:
+    return {
+        "idx": int(idx or 0),
+        "url_hash": _probe_url_hash(url),
+        "host": _probe_host(url),
+        "name_tag": _probe_name_tag(name),
+    }
+
+
+def _probe_trace_identity_from_lookup(idx: Any, lookup: Dict[int, Tuple[str, str]], trace: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    try:
+        i = int(idx or 0)
+    except Exception:
+        i = 0
+    url, name = lookup.get(i, ("", ""))
+    tr = dict(trace or {})
+    final_url = str(tr.get("final_url") or "")
+    return {
+        "url_hash": _probe_url_hash(url),
+        "host": _probe_host(url),
+        "name_tag": _probe_name_tag(name),
+        "final_url_hash": _probe_url_hash(final_url),
+        "final_host": _probe_host(final_url),
+        "history": int(tr.get("history_len", 0) or 0),
+    }
+
+
+def _probe_log_item_group(phase: str, items: List[Tuple[int, str, str]]) -> None:
+    if not USENET_PROBE_TRACE:
+        return
+    for idx, url, name in items:
+        meta = _probe_item_log_meta(idx, url, name)
+        logger.info(
+            "USENET_PROBE_ITEM rid=%s phase=%s idx=%s url_hash=%s host=%s name=%s",
+            _rid(), str(phase), meta["idx"], meta["url_hash"], meta["host"], meta["name_tag"],
+        )
+
+
 async def _probe_prewarm_urls(items: List[Tuple[int, str, str]], *, prewarm_timeout_s: float, prewarm_span: int) -> None:
     if not items:
         return
@@ -2237,6 +2303,7 @@ async def _usenet_range_probe_is_real_async(
     candidate_items = [it for it in ordered_all if it[0] not in warmer_ids]
     main_items, fast_items, reserve_items = _probe_split_fast_lane(candidate_items)
     seed_items, post_main, post_fast, post_reserve = _probe_choose_seeded_first_wave(candidate_items, main_items, fast_items, reserve_items, open_conc=open_conc)
+    candidate_lookup: Dict[int, Tuple[str, str]] = {int(i): (str(u), str(n)) for i, u, n in ordered_all}
     try:
         logger.info(
             "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s open_conc=%s legacy_cfg_open_conc=%s verify_conc=%s prewarm_count=%s prewarm_s=%.2f prewarm_bytes=%s measure_bytes=%s budget_s=%.2f timeout_s=%.2f target_real=%s mode=%s slot_model=%s order=%s total=%s ver=%s ua=%s auth_present=%s",
@@ -2246,6 +2313,14 @@ async def _usenet_range_probe_is_real_async(
             "USENET_PROBE_PLAN rid=%s warmers=%s candidates=%s preview=%s fast=%s reserve=%s seed=%s post_fast=%s post_reserve=%s post_main=%s",
             _rid(), [it[0] for it in warmers], [it[0] for it in candidate_items], [it[0] for it in candidate_items[:max(0, int(target))]], [it[0] for it in fast_items], [it[0] for it in reserve_items], [it[0] for it in seed_items], [it[0] for it in post_fast], [it[0] for it in post_reserve], [it[0] for it in post_main],
         )
+        _probe_log_item_group("warmer", warmers)
+        _probe_log_item_group("candidate", candidate_items)
+        _probe_log_item_group("fast", fast_items)
+        _probe_log_item_group("reserve", reserve_items)
+        _probe_log_item_group("seed", seed_items)
+        _probe_log_item_group("post_fast", post_fast)
+        _probe_log_item_group("post_reserve", post_reserve)
+        _probe_log_item_group("post_main", post_main)
     except Exception:
         pass
     if warmers:
@@ -2501,6 +2576,7 @@ async def _usenet_range_probe_is_real_async(
             timeout_phases[str(reason or "?")] += 1
             timeout_stage_counts[str(trace.get("stage") or "?")] += 1
         if USENET_PROBE_TRACE:
+            _idmeta = _probe_trace_identity_from_lookup(idx, candidate_lookup, trace)
             trace_rows.append({
                 "idx": idx,
                 "verdict": bucket,
@@ -2521,6 +2597,11 @@ async def _usenet_range_probe_is_real_async(
                 "noheader_ms": int(trace.get("noheader_timeout_ms", 0) or 0),
                 "err": str(trace.get("error_name") or ""),
                 "dup_of": trace.get("duplicate_of"),
+                "url_hash": _idmeta.get("url_hash"),
+                "host": _idmeta.get("host"),
+                "name": _idmeta.get("name_tag"),
+                "final_url_hash": _idmeta.get("final_url_hash"),
+                "final_host": _idmeta.get("final_host"),
             })
     try:
         logger.info("USENET_PROBE_REASONS rid=%s ver=%s reasons=%s", _rid(), str(USENET_PROBE_IMPL_VER), dict(reason_counter.most_common(8)))
@@ -2552,8 +2633,8 @@ async def _usenet_range_probe_is_real_async(
         if USENET_PROBE_TRACE and trace_rows:
             for row in trace_rows:
                 logger.info(
-                    "USENET_PROBE_TRACE rid=%s idx=%s verdict=%s reason=%s stage=%s status=%s total=%s kind=%s queue_ms=%s open_gate_ms=%s open_ms=%s body_ms=%s task_ms=%s verify_queue_ms=%s verify_open_gate_ms=%s verify_total_ms=%s noheader_ms=%s err=%s dup_of=%s",
-                    _rid(), row.get("idx"), row.get("verdict"), row.get("reason"), row.get("stage"), row.get("status"), row.get("total"), row.get("kind"), row.get("queue_ms"), row.get("open_gate_ms"), row.get("open_ms"), row.get("body_ms"), row.get("task_ms"), row.get("verify_queue_ms"), row.get("verify_open_gate_ms"), row.get("verify_total_ms"), row.get("noheader_ms"), row.get("err"), row.get("dup_of"),
+                    "USENET_PROBE_TRACE rid=%s idx=%s verdict=%s reason=%s stage=%s status=%s total=%s kind=%s queue_ms=%s open_gate_ms=%s open_ms=%s body_ms=%s task_ms=%s verify_queue_ms=%s verify_open_gate_ms=%s verify_total_ms=%s noheader_ms=%s err=%s dup_of=%s url_hash=%s host=%s final_url_hash=%s final_host=%s name=%s",
+                    _rid(), row.get("idx"), row.get("verdict"), row.get("reason"), row.get("stage"), row.get("status"), row.get("total"), row.get("kind"), row.get("queue_ms"), row.get("open_gate_ms"), row.get("open_ms"), row.get("body_ms"), row.get("task_ms"), row.get("verify_queue_ms"), row.get("verify_open_gate_ms"), row.get("verify_total_ms"), row.get("noheader_ms"), row.get("err"), row.get("dup_of"), row.get("url_hash"), row.get("host"), row.get("final_url_hash"), row.get("final_host"), row.get("name"),
                 )
     except Exception:
         pass
