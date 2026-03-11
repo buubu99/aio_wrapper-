@@ -2509,8 +2509,8 @@ async def _usenet_range_probe_is_real_async(
             logger.info("USENET_PROBE_TIMEOUT_PHASES rid=%s counts=%s stages=%s", _rid(), dict(timeout_phases), dict(timeout_stage_counts))
         _final_buckets = dict(reason_counter)
         _budget_unlaunched = int(reason_counter.get("BUDGET_UNLAUNCHED", 0) or 0)
-        _started_count = max(0, int(len(candidate_items)) - _budget_unlaunched)
-        _definitive_count = max(0, int(len(candidate_items)) - _budget_unlaunched)
+        _started_count = int(sum(1 for r in trace_rows if str(r.get("reason") or "").upper() != "BUDGET_UNLAUNCHED"))
+        _definitive_count = int(sum(1 for r in trace_rows if str(r.get("verdict") or "").upper() not in ("BUDGET", "SKIP_TARGET_REAL")))
         _finalized_idx = {int(r.get("idx")) for r in trace_rows if r.get("idx") is not None}
         _live_state_counts = Counter(
             str((states.get(i, {}) or {}).get("stage") or "?")
@@ -7442,7 +7442,7 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                 if isinstance(_s, dict):
                     _pairs.append((_s, {"provider": "ND"}))
             if not _pairs:
-                return _streams, {"probe_early": True, "probe_ms": 0, "probe_candidates": 0, "probe_started": 0, "probe_definitive": 0, "probe_scanned": 0, "probe_real": 0, "probe_stub": 0, "probe_timeout": 0, "probe_error_other": 0, "probe_err": 0, "probe_budget": 0, "probe_budget_started": 0, "probe_budget_unlaunched": 0, "probe_other_fail": 0, "probe_skipped_target": 0}
+                return _streams, {"probe_early": True, "probe_launched": True, "probe_completed": True, "probe_ms": 0, "probe_candidates": 0, "probe_started": 0, "probe_definitive": 0, "probe_scanned": 0, "probe_real": 0, "probe_stub": 0, "probe_timeout": 0, "probe_error_other": 0, "probe_err": 0, "probe_budget": 0, "probe_budget_started": 0, "probe_budget_unlaunched": 0, "probe_other_fail": 0, "probe_skipped_target": 0}
 
             _pairs2 = _apply_usenet_playability_probe(
                 _pairs,
@@ -7532,9 +7532,9 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
                 out = out_all
 
             ms = int((time.monotonic() - t0p) * 1000)
-            return out, {"probe_early": True, "probe_ms": ms, "probe_candidates": int(candidate_count), "probe_started": int(started_count), "probe_definitive": int(definitive_count), "probe_scanned": int(definitive_count), "probe_real": int(real), "probe_stub": int(stub), "probe_timeout": int(timeout), "probe_error_other": int(error_other), "probe_err": int(timeout), "probe_budget": int(budget), "probe_budget_started": int(budget_started_count), "probe_budget_unlaunched": int(budget_unlaunched_count), "probe_other_fail": int(error_other), "probe_skipped_target": int(skipped_target)}
+            return out, {"probe_early": True, "probe_launched": True, "probe_completed": True, "probe_ms": ms, "probe_candidates": int(candidate_count), "probe_started": int(started_count), "probe_definitive": int(definitive_count), "probe_scanned": int(definitive_count), "probe_real": int(real), "probe_stub": int(stub), "probe_timeout": int(timeout), "probe_error_other": int(error_other), "probe_err": int(timeout), "probe_budget": int(budget), "probe_budget_started": int(budget_started_count), "probe_budget_unlaunched": int(budget_unlaunched_count), "probe_other_fail": int(error_other), "probe_skipped_target": int(skipped_target)}
         except Exception as _e:
-            return _streams, {"probe_early": True, "probe_early_err": f"error:{type(_e).__name__}"}
+            return _streams, {"probe_early": True, "probe_launched": True, "probe_completed": False, "probe_early_err": f"error:{type(_e).__name__}"}
         finally:
             try:
                 if _prev_rid is None:
@@ -8263,6 +8263,33 @@ def _size_bucket(size_bytes: int) -> str:
 def _bump(d: Dict[str, int], k: str, n: int = 1):
     d[k] = int(d.get(k, 0)) + int(n)
 
+def _allowed_supplier_tags() -> set[str]:
+    vals = {str(AIO_TAG or "AIO").upper().strip(), str(PROV2_TAG or "P2").upper().strip()}
+    return {v for v in vals if v}
+
+def _supplier_tag_for_log(s: Any = None, m: Any = None, default: str = "UNK") -> str:
+    """Return a trustworthy wrapper supplier tag for logging/counts.
+
+    Avoid defaulting malformed/missing supplier tags to AIO because that hides provenance issues.
+    """
+    allowed = _allowed_supplier_tags()
+    try:
+        bh = (s.get("behaviorHints") or {}) if isinstance(s, dict) else {}
+        if not isinstance(bh, dict):
+            bh = {}
+    except Exception:
+        bh = {}
+    candidates = [
+        bh.get("wrap_src"),
+        bh.get("source_tag"),
+        (m.get("supplier") if isinstance(m, dict) else None),
+    ]
+    for raw in candidates:
+        tag = str(raw or "").strip().upper()
+        if tag and tag in allowed:
+            return tag
+    return str(default or "UNK").strip().upper() or "UNK"
+
 def _summarize_streams_for_counts(streams: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Compact summary for logs/debug: counts by supplier/provider/stack/res/hash/cached/size."""
     out: Dict[str, Any] = {
@@ -8284,14 +8311,7 @@ def _summarize_streams_for_counts(streams: List[Dict[str, Any]]) -> Dict[str, An
         bh = s.get("behaviorHints")
         if not isinstance(bh, dict):
             bh = {}
-        supplier = (bh.get("wrap_src") or "")
-        if not supplier:
-            # Only trust source_tag when it matches our wrapper supplier tags (avoid WEB/BLURAY/REMUX/etc pollution)
-            st = (bh.get("source_tag") or "").strip()
-            st_u = str(st).upper() if st else ""
-            allowed = {str(AIO_TAG).upper(), str(PROV2_TAG).upper()}
-            supplier = st_u if st_u in allowed else str(AIO_TAG or "AIO").upper()
-        supplier = str(supplier).upper()
+        supplier = _supplier_tag_for_log(s, None, default="UNK")
 
         try:
             m = classify_cached(s)
@@ -8336,7 +8356,7 @@ def _compact_fetch_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(meta, dict):
         return {}
     # Only keep the safe/compact keys
-    keep = ('tag', 'src', 'ok', 'status', 'bytes', 'count', 'ms', 'last_fetch_ms', 'ms_provider', 'wait_ms', 'late_grace_ms', 'http_ms', 'read_ms', 'json_ms', 'post_ms', 'req_epoch_ms', 'conn_ms', 'tls_ms', 'pre_net_ms', 'svrwait_ms', 'soft_timeout_ms', 'err', 'probe_early', 'probe_ms', 'probe_candidates', 'probe_started', 'probe_definitive', 'probe_scanned', 'probe_real', 'probe_stub', 'probe_timeout', 'probe_error_other', 'probe_err', 'probe_budget', 'probe_budget_started', 'probe_budget_unlaunched', 'probe_other_fail', 'probe_skipped_target', 'probe_join_ms', 'probe_early_err')
+    keep = ('tag', 'src', 'ok', 'status', 'bytes', 'count', 'ms', 'last_fetch_ms', 'ms_provider', 'wait_ms', 'late_grace_ms', 'http_ms', 'read_ms', 'json_ms', 'post_ms', 'req_epoch_ms', 'conn_ms', 'tls_ms', 'pre_net_ms', 'svrwait_ms', 'soft_timeout_ms', 'err', 'probe_early', 'probe_launched', 'probe_completed', 'probe_ms', 'probe_candidates', 'probe_started', 'probe_definitive', 'probe_scanned', 'probe_real', 'probe_stub', 'probe_timeout', 'probe_error_other', 'probe_err', 'probe_budget', 'probe_budget_started', 'probe_budget_unlaunched', 'probe_other_fail', 'probe_skipped_target', 'probe_join_ms', 'probe_early_err')
     return {k: meta.get(k) for k in keep if k in meta and meta.get(k) not in (None, "", {})}
 
 # Diversify top M while preserving quality: pick from a larger pool, bucketed by resolution, then mix providers/suppliers.
@@ -8364,7 +8384,7 @@ def _diversify_by_quality_bucket(
         bh = (s.get("behaviorHints") or {}) if isinstance(s, dict) else {}
         if not isinstance(bh, dict):
             bh = {}
-        return str((bh.get("wrap_src") or bh.get("source_tag") or _m.get("supplier") or (AIO_TAG or "AIO"))).upper()
+        return _supplier_tag_for_log(s, _m, default="UNK")
 
     def _size_gb(pair) -> float:
         _s, _m = pair
@@ -9812,7 +9832,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 bh = (s.get("behaviorHints") or {}) if isinstance(s, dict) else {}
                 if not isinstance(bh, dict):
                     bh = {}
-                supplier = (bh.get("wrap_src") or bh.get("source_tag") or (AIO_TAG or "AIO"))
+                supplier = _supplier_tag_for_log(s, m, default="UNK")
                 desc = ""
                 try:
                     if isinstance(s, dict):
@@ -9954,7 +9974,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 bh = (_s.get('behaviorHints') or {}) if isinstance(_s, dict) else {}
                 if not isinstance(bh, dict):
                     bh = {}
-                sup_top10.append(str((bh.get('wrap_src') or bh.get('source_tag') or (AIO_TAG or 'AIO'))).upper())
+                sup_top10.append(_supplier_tag_for_log(_s, _m, default="UNK"))
             logger.debug("POST_DIVERSITY_BUCKET rid=%s sup_top10=%s", rid, sup_top10)
         except Exception:
             pass
@@ -10196,7 +10216,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         def _pair_supplier(p):
             _s, _m = p
             bh = (_s.get("behaviorHints") or {}) if isinstance(_s, dict) else {}
-            return str(bh.get("wrap_src") or bh.get("source_tag") or _m.get("supplier") or "").upper()
+            return _supplier_tag_for_log(_s, _m, default="UNK")
 
         def _is_usenet_pair(p):
             prov = _pair_provider(p)
@@ -10444,8 +10464,8 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     try:
         logger.info(
-            "TB_API_CHECK rid=%s ran=%s reason=%s hashes=%d min=%d cache_hints=%s api_key=%s fast=%s validate_off=%s verify_cached_only=%s",
-            _rid(), bool(tb_api_ran), str(tb_api_reason), int(len(tb_hashes)), int(TB_API_MIN_HASHES or 0),
+            "TB_API_CHECK rid=%s ran=%s reason=%s tb_hashes_total=%d tb_hashes_api=%d min=%d cache_hints=%s api_key=%s fast=%s validate_off=%s verify_cached_only=%s",
+            _rid(), bool(tb_api_ran), str(tb_api_reason), int(len(tb_hashes)), int(len(tb_hashes_api)), int(TB_API_MIN_HASHES or 0),
             bool(TB_CACHE_HINTS), bool(TB_API_KEY), bool(fast_mode), bool(VALIDATE_OFF), bool(VERIFY_CACHED_ONLY),
         )
     except Exception:
@@ -10663,7 +10683,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
 
     # Clarity log: tells you if TB checks actually ran and how many hashes were checked.
     logger.info(
-        "TB_CHECKS rid=%s webdav_active=%s webdav_reason=%s api_ran=%s api_reason=%s api_hashes=%s tb_hashes=%s min=%s cache_hints=%s api_key=%s fast=%s validate_off=%s verify_cached_only=%s",
+        "TB_CHECKS rid=%s webdav_active=%s webdav_reason=%s api_ran=%s api_reason=%s api_hashes=%s tb_hashes_total=%s tb_hashes_api=%s min=%s cache_hints=%s api_key=%s fast=%s validate_off=%s verify_cached_only=%s",
         _rid(),
         False,
         "INACTIVE",
@@ -10671,6 +10691,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         str(tb_api_reason),
         int(stats.tb_api_hashes or 0),
         int(len(tb_hashes)),
+        int(len(tb_hashes_api)),
         int(TB_API_MIN_HASHES or 0),
         bool(TB_CACHE_HINTS),
         bool(TB_API_KEY),
@@ -11455,7 +11476,7 @@ def stream(type_: str, id_: str):
             except Exception:
                 stats.ms_fetch_aio_remote = 0
                 stats.ms_fetch_p2_remote = 0
-            # Error breakdown from fetch meta (timeout/json/other)
+            # Error breakdown from fetch meta only (provider fetch/join/cache paths, not downstream probe failures).
             try:
                 for _fm in (stats.fetch_aio, stats.fetch_p2):
                     _err = str((_fm or {}).get("err") or "").lower().strip()
@@ -11469,6 +11490,20 @@ def stream(type_: str, id_: str):
                         stats.errors_api += 1
             except Exception:
                 pass
+            try:
+                _p2fm = stats.fetch_p2 or {}
+                stats.ms_usenet_probe = int(max(int(getattr(stats, "ms_usenet_probe", 0) or 0), int(_p2fm.get("probe_ms") or 0)))
+                stats.ms_usenet_probe_fail_reasons = {
+                    "STUB": int(_p2fm.get("probe_stub") or 0),
+                    "TIMEOUT": int(_p2fm.get("probe_timeout", _p2fm.get("probe_err") or 0) or 0),
+                    "ERROR_OTHER": int(_p2fm.get("probe_error_other", _p2fm.get("probe_other_fail") or 0) or 0),
+                    "BUDGET": int(_p2fm.get("probe_budget") or 0),
+                    "BUDGET_STARTED": int(_p2fm.get("probe_budget_started") or 0),
+                    "BUDGET_UNLAUNCHED": int(_p2fm.get("probe_budget_unlaunched") or 0),
+                    "SKIP_TARGET_REAL": int(_p2fm.get("probe_skipped_target") or 0),
+                }
+            except Exception:
+                stats.ms_usenet_probe_fail_reasons = {}
         except Exception:
             stats.fetch_aio, stats.fetch_p2 = {}, {}
         try:
@@ -11522,6 +11557,30 @@ def stream(type_: str, id_: str):
                 else:
                     cleaned.append(_s)
             out_for_client = cleaned
+        except Exception:
+            pass
+        try:
+            stats.counts_out = _summarize_streams_for_counts(out_for_client)
+        except Exception:
+            pass
+        try:
+            stats.delivered = int(len(out_for_client or []))
+            hit = miss = likely = 0
+            for _s in (out_for_client or []):
+                if not isinstance(_s, dict):
+                    continue
+                _bh = _s.get("behaviorHints") or {}
+                _c = _bh.get("cached", None)
+                if _c is True:
+                    hit += 1
+                elif _c is False:
+                    miss += 1
+                elif _c == "LIKELY":
+                    likely += 1
+            stats.cache_hit = int(hit)
+            stats.cache_miss = int(miss)
+            _den = hit + miss + likely
+            stats.cache_rate = (float(hit) + (0.5 * float(likely))) / float(_den) if _den > 0 else 0.0
         except Exception:
             pass
         payload: Dict[str, Any] = {"streams": out_for_client, "cacheMaxAge": int(CACHE_TTL)}
@@ -11616,7 +11675,7 @@ def stream(type_: str, id_: str):
                                     "aio": {"http": aio_http_ms, "read": aio_read_ms, "json": aio_json_ms, "post": aio_post_ms},
                                     "p2":  {"http": p2_http_ms,  "read": p2_read_ms,  "json": p2_json_ms,  "post": p2_post_ms},
                                 },
-                                "delivered": int(stats.delivered or 0),
+                                "delivered": int(len(out_for_client) if out_for_client is not None else 0),
                 "drops": {
                     "error": int(stats.dropped_error or 0),
                     "missing_url": int(stats.dropped_missing_url or 0),
@@ -11878,32 +11937,31 @@ def stream(type_: str, id_: str):
             out_size = 0
 
         logger.info(
-            "WRAP_STATS rid=%s mark=%s build=%s git=%s path=%s client_platform=%s ua_tok=%s ua_family=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_placeholder=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s dropped_android_magnets=%s dropped_iphone_magnets=%s dropped_platform_specific=%s dropped_magnet=%s deduped=%s dedup=%s delivered=%s out_bytes=%s cache_hit=%s cache_miss=%s cache_rate=%s platform=%s flags=%s errors=%s errors_timeout=%s errors_parse=%s errors_api=%s ms=%s total_streams=%s",
+            "WRAP_STATS rid=%s mark=%s build=%s git=%s path=%s client_platform=%s ua_tok=%s ua_family=%s type=%s id=%s aio_in=%s prov2_in=%s merged_in=%s dropped_error=%s dropped_missing_url=%s dropped_pollution=%s dropped_low_seeders=%s dropped_lang=%s dropped_low_premium=%s dropped_rd=%s dropped_ad=%s dropped_low_res=%s dropped_old_age=%s dropped_blacklist=%s dropped_fakes_db=%s dropped_title_mismatch=%s skipped_title_mismatch=%s dropped_dead_url=%s dropped_uncached=%s dropped_uncached_tb=%s dropped_android_magnets=%s dropped_iphone_magnets=%s dropped_low_size_iphone=%s dropped_platform_specific=%s deduped=%s delivered=%s out_bytes=%s cache_hit=%s cache_miss=%s cache_rate=%s platform=%s flags=%s errors=%s fetch_errors_timeout=%s fetch_errors_parse=%s fetch_errors_api=%s probe_fail_reasons=%s memory_peak_kb=%s ms=%s total_streams=%s",
             _rid(), _mark(), BUILD, GIT_COMMIT, request.path, str(stats.client_platform or "unknown"),
             getattr(g, "_cached_ua_tok", ""),
             getattr(g, "_cached_ua_family", ""),
             type_, id_,
             int(stats.aio_in or 0), int(stats.prov2_in or 0), int(stats.merged_in or 0),
             int(stats.dropped_error or 0), int(stats.dropped_missing_url or 0),
-            int(stats.dropped_pollution or 0),  # legacy name
-            int(stats.dropped_pollution or 0),  # alias: dropped_placeholder
+            int(stats.dropped_pollution or 0),
             int(stats.dropped_low_seeders or 0), int(stats.dropped_lang or 0), int(stats.dropped_low_premium or 0),
             int(stats.dropped_rd or 0), int(stats.dropped_ad or 0),
             int(stats.dropped_low_res or 0), int(stats.dropped_old_age or 0),
             int(stats.dropped_blacklist or 0), int(stats.dropped_fakes_db or 0),
-            int(stats.dropped_title_mismatch or 0), int(stats.dropped_dead_url or 0), int(stats.dropped_uncached or 0),
+            int(stats.dropped_title_mismatch or 0), int(stats.skipped_title_mismatch or 0), int(stats.dropped_dead_url or 0), int(stats.dropped_uncached or 0),
             int(stats.dropped_uncached_tb or 0),
-            int(stats.dropped_android_magnets or 0), int(stats.dropped_iphone_magnets or 0),
-            int(stats.dropped_platform_specific or 0),  # legacy name
-            int(stats.dropped_platform_specific or 0),  # alias: dropped_magnet
-            int(stats.deduped or 0),  # legacy name
-            int(stats.deduped or 0),  # alias: dedup
+            int(stats.dropped_android_magnets or 0), int(stats.dropped_iphone_magnets or 0), int(stats.dropped_low_size_iphone or 0),
+            int(stats.dropped_platform_specific or 0),
+            int(stats.deduped or 0),
             int(stats.delivered or 0), int(out_size or 0),
             int(stats.cache_hit or 0), int(stats.cache_miss or 0), float(stats.cache_rate or 0.0),
             str(stats.client_platform or ""),
             ",".join(list(stats.flag_issues)[:8]) if isinstance(stats.flag_issues, list) else "",
             ",".join(list(stats.error_reasons)[:6]) if isinstance(stats.error_reasons, list) else "",
             int(stats.errors_timeout or 0), int(stats.errors_parse or 0), int(stats.errors_api or 0),
+            json.dumps(getattr(stats, "ms_usenet_probe_fail_reasons", {}) or {}, separators=(",", ":"), sort_keys=True),
+            int(getattr(stats, "memory_peak_kb", 0) or 0),
             ms_total,
             int(total_streams or 0),
         )
@@ -12009,6 +12067,30 @@ def handle_unhandled_exception(e):
         dbg_q = request.args.get("debug") or request.args.get("dbg") or ""
         want_dbg = WRAP_EMBED_DEBUG or (isinstance(dbg_q, str) and dbg_q.strip() not in ("", "0", "false", "False"))
 
+        try:
+            stats.counts_out = _summarize_streams_for_counts(out_for_client)
+        except Exception:
+            pass
+        try:
+            stats.delivered = int(len(out_for_client or []))
+            hit = miss = likely = 0
+            for _s in (out_for_client or []):
+                if not isinstance(_s, dict):
+                    continue
+                _bh = _s.get("behaviorHints") or {}
+                _c = _bh.get("cached", None)
+                if _c is True:
+                    hit += 1
+                elif _c is False:
+                    miss += 1
+                elif _c == "LIKELY":
+                    likely += 1
+            stats.cache_hit = int(hit)
+            stats.cache_miss = int(miss)
+            _den = hit + miss + likely
+            stats.cache_rate = (float(hit) + (0.5 * float(likely))) / float(_den) if _den > 0 else 0.0
+        except Exception:
+            pass
         payload: Dict[str, Any] = {"streams": out_for_client, "cacheMaxAge": int(CACHE_TTL)}
         if want_dbg:
             try:
