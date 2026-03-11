@@ -1922,18 +1922,24 @@ def _probe_choose_seeded_first_wave(
     seed: List[Tuple[int, str, str]] = []
     used: set[int] = set()
 
-    def add_first(cands: List[Tuple[int, str, str]]) -> None:
+    def add_one(cands: List[Tuple[int, str, str]]) -> None:
+        if len(seed) >= open_conc:
+            return
         for it in cands:
-            if len(seed) >= open_conc:
-                break
             if it[0] not in used:
                 seed.append(it)
                 used.add(it[0])
+                break
 
-    add_first(main_early)
-    add_first(fast_items)
-    add_first(main_late)
-    add_first(reserve_items)
+    for bucket in (fast_items, main_early, main_late, reserve_items):
+        add_one(bucket)
+
+    for it in ordered:
+        if len(seed) >= open_conc:
+            break
+        if it[0] not in used:
+            seed.append(it)
+            used.add(it[0])
 
     def strip_used(cands: List[Tuple[int, str, str]]) -> List[Tuple[int, str, str]]:
         return [it for it in cands if it[0] not in used]
@@ -2018,6 +2024,19 @@ def _probe_auth() -> Optional[aiohttp.BasicAuth]:
     return None
 
 
+_USENET_PROBE_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6.1 Safari/605.1.15"
+)
+
+
+def _probe_headers_with_range(range_value: str) -> Dict[str, str]:
+    return {
+        "Range": str(range_value),
+        "User-Agent": _USENET_PROBE_UA,
+    }
+
+
 async def _probe_prewarm_urls(items: List[Tuple[int, str, str]], *, prewarm_timeout_s: float, prewarm_span: int) -> None:
     if not items:
         return
@@ -2027,7 +2046,7 @@ async def _probe_prewarm_urls(items: List[Tuple[int, str, str]], *, prewarm_time
     async with aiohttp.ClientSession(auth=auth, timeout=timeout, connector=connector) as session:
         async def one(item: Tuple[int, str, str]) -> None:
             idx, url, _name = item
-            headers = {"Range": f"bytes=0-{int(prewarm_span) - 1}"}
+            headers = _probe_headers_with_range(f"bytes=0-{int(prewarm_span) - 1}")
             t0 = time.monotonic()
             status = 0
             open_ms = body_ms = task_ms = 0
@@ -2067,7 +2086,7 @@ async def _probe_open_initial_with_deadline(
 ) -> Dict[str, Any]:
     t0 = time.monotonic()
     gate_wait_ms = 0
-    headers = {"Range": f"bytes=0-{int(span) - 1}"}
+    headers = _probe_headers_with_range(f"bytes=0-{int(span) - 1}")
     req_timeout = _probe_initial_timeout_obj(float(total_timeout_s))
     gate_held = False
     try:
@@ -2148,7 +2167,7 @@ async def _probe_open_initial_with_deadline(
 async def _probe_fetch_higher(session: aiohttp.ClientSession, url: str, *, start: int, span: int, timeout_s: float, open_sem: Optional[asyncio.Semaphore] = None) -> Dict[str, Any]:
     t0 = time.monotonic()
     gate_wait_ms = 0
-    headers = {"Range": f"bytes={int(start)}-{int(start) + int(span) - 1}"}
+    headers = _probe_headers_with_range(f"bytes={int(start)}-{int(start) + int(span) - 1}")
     timeout = _probe_verify_timeout_obj(float(timeout_s))
     gate_held = False
     try:
@@ -2220,8 +2239,8 @@ async def _usenet_range_probe_is_real_async(
     seed_items, post_main, post_fast, post_reserve = _probe_choose_seeded_first_wave(candidate_items, main_items, fast_items, reserve_items, open_conc=open_conc)
     try:
         logger.info(
-            "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s open_conc=%s legacy_cfg_open_conc=%s verify_conc=%s prewarm_count=%s prewarm_s=%.2f prewarm_bytes=%s measure_bytes=%s budget_s=%.2f timeout_s=%.2f target_real=%s mode=%s slot_model=%s order=%s total=%s ver=%s",
-            _rid(), int(concurrency or 1), int(eff_parallel), int(open_conc), int(cfg_open_conc), int(verify_conc), int(len(warmers)), float(prewarm_timeout_s), int(prewarm_span), int(measured_span), float(budget_s), float(timeout_s), int(target), "hybrid_prewarm_replace", "opener_only", "interleave_halves", int(len(ordered_all) or 0), str(USENET_PROBE_IMPL_VER),
+            "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s open_conc=%s legacy_cfg_open_conc=%s verify_conc=%s prewarm_count=%s prewarm_s=%.2f prewarm_bytes=%s measure_bytes=%s budget_s=%.2f timeout_s=%.2f target_real=%s mode=%s slot_model=%s order=%s total=%s ver=%s ua=%s auth_present=%s",
+            _rid(), int(concurrency or 1), int(eff_parallel), int(open_conc), int(cfg_open_conc), int(verify_conc), int(len(warmers)), float(prewarm_timeout_s), int(prewarm_span), int(measured_span), float(budget_s), float(timeout_s), int(target), "hybrid_prewarm_replace", "opener_only", "interleave_halves", int(len(ordered_all) or 0), str(USENET_PROBE_IMPL_VER), _USENET_PROBE_UA, bool(_probe_auth()),
         )
         logger.info(
             "USENET_PROBE_PLAN rid=%s warmers=%s candidates=%s preview=%s fast=%s reserve=%s seed=%s post_fast=%s post_reserve=%s post_main=%s",
