@@ -1731,7 +1731,15 @@ _USENET_PROBE_LATE_VERIFY_CUTOFF_S = 2.4
 _USENET_PROBE_VERIFY_FETCH_CAP_S = 2.25
 _USENET_PROBE_VERIFY_MIN_START_S = 0.60
 _USENET_PROBE_TINY_STUB_TOTAL_MAX = 200000
-_USENET_PROBE_NOHEADER_TIMEOUT_S = 5.2
+# No-header timeout policy: tuned for the slower Render->ElfHosted path while still
+# reserving time for later candidates / second-wave probing inside the same batch budget.
+_USENET_PROBE_NOHEADER_TIMEOUT_S = _safe_float(os.environ.get("USENET_PROBE_NOHEADER_TIMEOUT_S", "7.0"), 7.0)
+_USENET_PROBE_NOHEADER_FLOOR_S = _safe_float(os.environ.get("USENET_PROBE_NOHEADER_FLOOR_S", "4.8"), 4.8)
+_USENET_PROBE_NOHEADER_ABS_MIN_S = _safe_float(os.environ.get("USENET_PROBE_NOHEADER_ABS_MIN_S", "3.6"), 3.6)
+_USENET_PROBE_NOHEADER_RESERVE_S = _safe_float(os.environ.get("USENET_PROBE_NOHEADER_RESERVE_S", "2.2"), 2.2)
+_USENET_PROBE_NOHEADER_ENABLE_SQUEEZE = _parse_bool(os.environ.get("USENET_PROBE_NOHEADER_ENABLE_SQUEEZE", "0"), False)
+_USENET_PROBE_NOHEADER_SQUEEZE_AFTER_S = _safe_float(os.environ.get("USENET_PROBE_NOHEADER_SQUEEZE_AFTER_S", "6.0"), 6.0)
+_USENET_PROBE_NOHEADER_SQUEEZE_CAP_S = _safe_float(os.environ.get("USENET_PROBE_NOHEADER_SQUEEZE_CAP_S", "4.8"), 4.8)
 
 
 def _probe_ms(sec: float) -> int:
@@ -2006,12 +2014,39 @@ def _probe_stub_family_key(total: Optional[int], sig0: Optional[str], kind: Opti
 
 
 def _probe_effective_noheader_timeout(base_noheader_timeout_s: float, picked_at: float, batch_start: float, deadline: float) -> float:
-    remaining = max(0.0, deadline - picked_at)
-    eff = min(base_noheader_timeout_s, max(2.2, remaining - 0.8))
-    queue_age = picked_at - batch_start
-    if queue_age > 4.0:
-        eff = min(eff, 3.4)
-    return max(2.0, min(eff, base_noheader_timeout_s))
+    """Compute the per-open no-header deadline.
+
+    Goal: be materially closer to the standalone probe on Render without starving later
+    candidates inside the same 12s batch. We therefore:
+      * raise the early-open allowance,
+      * reserve a slice of the batch for second-wave/verify work,
+      * keep a healthy floor for mid-batch candidates,
+      * and disable the old aggressive queue-age squeeze by default.
+    """
+    abs_min = max(0.5, float(_USENET_PROBE_NOHEADER_ABS_MIN_S or 0.0))
+    base = max(abs_min, float(base_noheader_timeout_s or 0.0))
+    floor_s = min(base, max(abs_min, float(_USENET_PROBE_NOHEADER_FLOOR_S or 0.0)))
+    reserve_s = max(0.25, float(_USENET_PROBE_NOHEADER_RESERVE_S or 0.0))
+    remaining = max(0.0, float(deadline) - float(picked_at))
+
+    # Keep part of the batch available for later opens / verify work.
+    eff = min(base, max(abs_min, remaining - reserve_s))
+
+    # If there is enough runway left, guarantee a healthy floor so the second wave
+    # is not punished as harshly as before.
+    if remaining >= (reserve_s + floor_s):
+        eff = max(eff, floor_s)
+
+    # Optional late-candidate squeeze (disabled by default for parity with standalone).
+    if _USENET_PROBE_NOHEADER_ENABLE_SQUEEZE:
+        queue_age = max(0.0, float(picked_at) - float(batch_start))
+        if queue_age > float(_USENET_PROBE_NOHEADER_SQUEEZE_AFTER_S or 0.0):
+            squeeze_cap = min(base, max(abs_min, float(_USENET_PROBE_NOHEADER_SQUEEZE_CAP_S or 0.0)))
+            eff = min(eff, squeeze_cap)
+
+    # Never consume the entire remaining batch slice; leave a tiny tail buffer.
+    eff = min(eff, max(abs_min, remaining - 0.20))
+    return max(abs_min, min(eff, base))
 
 
 def _probe_auth() -> Optional[aiohttp.BasicAuth]:
@@ -2306,8 +2341,8 @@ async def _usenet_range_probe_is_real_async(
     candidate_lookup: Dict[int, Tuple[str, str]] = {int(i): (str(u), str(n)) for i, u, n in ordered_all}
     try:
         logger.info(
-            "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s open_conc=%s legacy_cfg_open_conc=%s verify_conc=%s prewarm_count=%s prewarm_s=%.2f prewarm_bytes=%s measure_bytes=%s budget_s=%.2f timeout_s=%.2f target_real=%s mode=%s slot_model=%s order=%s total=%s ver=%s ua=%s auth_present=%s",
-            _rid(), int(concurrency or 1), int(eff_parallel), int(open_conc), int(cfg_open_conc), int(verify_conc), int(len(warmers)), float(prewarm_timeout_s), int(prewarm_span), int(measured_span), float(budget_s), float(timeout_s), int(target), "hybrid_prewarm_replace", "opener_only", "interleave_halves", int(len(ordered_all) or 0), str(USENET_PROBE_IMPL_VER), _USENET_PROBE_UA, bool(_probe_auth()),
+            "USENET_PROBE_CONN rid=%s conc=%s eff_parallel=%s open_conc=%s legacy_cfg_open_conc=%s verify_conc=%s prewarm_count=%s prewarm_s=%.2f prewarm_bytes=%s measure_bytes=%s budget_s=%.2f timeout_s=%.2f target_real=%s noheader_base_s=%.2f noheader_floor_s=%.2f noheader_abs_min_s=%.2f noheader_reserve_s=%.2f noheader_squeeze=%s noheader_squeeze_after_s=%.2f noheader_squeeze_cap_s=%.2f mode=%s slot_model=%s order=%s total=%s ver=%s ua=%s auth_present=%s",
+            _rid(), int(concurrency or 1), int(eff_parallel), int(open_conc), int(cfg_open_conc), int(verify_conc), int(len(warmers)), float(prewarm_timeout_s), int(prewarm_span), int(measured_span), float(budget_s), float(timeout_s), int(target), float(_USENET_PROBE_NOHEADER_TIMEOUT_S), float(_USENET_PROBE_NOHEADER_FLOOR_S), float(_USENET_PROBE_NOHEADER_ABS_MIN_S), float(_USENET_PROBE_NOHEADER_RESERVE_S), bool(_USENET_PROBE_NOHEADER_ENABLE_SQUEEZE), float(_USENET_PROBE_NOHEADER_SQUEEZE_AFTER_S), float(_USENET_PROBE_NOHEADER_SQUEEZE_CAP_S), "hybrid_prewarm_replace", "opener_only", "interleave_halves", int(len(ordered_all) or 0), str(USENET_PROBE_IMPL_VER), _USENET_PROBE_UA, bool(_probe_auth()),
         )
         logger.info(
             "USENET_PROBE_PLAN rid=%s warmers=%s candidates=%s preview=%s fast=%s reserve=%s seed=%s post_fast=%s post_reserve=%s post_main=%s",
