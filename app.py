@@ -2329,8 +2329,8 @@ async def _usenet_range_probe_is_real_async(
     prewarm_timeout_s = max(0.25, float(USENET_PROBE_PREWARM_S or _USENET_PROBE_PREWARM_TIMEOUT_S_DEFAULT))
     measured_span = int(_USENET_PROBE_MEASURE_BYTES)
     eff_parallel = max(1, min(int(concurrency or 1), int(USENET_PROBE_CONCURRENCY_CAP or int(concurrency or 1) or 1), int(len(ordered_all) or 1)))
-    cfg_open_conc = max(1, int(USENET_PROBE_OPEN_CONCURRENCY or 1))
-    open_conc = int(eff_parallel)
+    cfg_open_conc = max(1, min(int(USENET_PROBE_OPEN_CONCURRENCY or 1), int(USENET_PROBE_CONCURRENCY_CAP or int(USENET_PROBE_OPEN_CONCURRENCY or 1) or 1), int(len(ordered_all) or 1)))
+    open_conc = int(cfg_open_conc)
     fast_lane_openers = max(1, min(int(_USENET_PROBE_FAST_LANE_OPENERS), int(open_conc)))
     verify_conc = int(_USENET_PROBE_VERIFY_CONC)
     warmers = _probe_pick_sacrificial_warmers(ordered_all, min(int(_USENET_PROBE_PREWARM_COUNT), len(ordered_all)))
@@ -4556,9 +4556,9 @@ def _wrap_url_meta_update(token: str, meta: Dict[str, Any]) -> None:
     """Update metadata for an existing short token (best-effort)."""
     # Multi-worker-safe backends for WRAP_URL_SHORT token metadata
     if _WRAP_URL_BACKEND == "sqlite":
-        return _wrap_sqlite_meta_update(token, patch)
+        return _wrap_sqlite_meta_update(token, meta)
     if _WRAP_URL_BACKEND == "redis":
-        return _wrap_redis_meta_update(token, patch)
+        return _wrap_redis_meta_update(token, meta)
 
     if not (token and isinstance(meta, dict)):
         return
