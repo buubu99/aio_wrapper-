@@ -399,6 +399,13 @@ PROV2_AUTH = os.environ.get("PROV2_AUTH", "")  # 'user:pass' for Basic auth if n
 PROV2_TAG = os.environ.get("PROV2_TAG", "P2")
 AIO_TAG = os.environ.get("AIO_TAG", "AIO")
 
+# Small playable P2 set bypass: when PROV2 returns only a few URL-backed streams,
+# keep them visible instead of letting wrapper-side probe/pollution/min-res filters shrink them away.
+PROV2_SMALLSET_BYPASS_N = _safe_int(os.environ.get("PROV2_SMALLSET_BYPASS_N", "10"), 10)
+PROV2_SMALLSET_SKIP_PROBE = _parse_bool(os.environ.get("PROV2_SMALLSET_SKIP_PROBE", "true"), True)
+PROV2_SMALLSET_SKIP_POLLUTION = _parse_bool(os.environ.get("PROV2_SMALLSET_SKIP_POLLUTION", "true"), True)
+PROV2_SMALLSET_ALLOW_SUB_MIN_RES = _parse_bool(os.environ.get("PROV2_SMALLSET_ALLOW_SUB_MIN_RES", "true"), True)
+
 USE_AIO_READY = _parse_bool(os.environ.get("USE_AIO_READY", "false"), False)  # Trust AIOStreams 2.23+ C:/P:/T: tags
 
 # P1 Hybrid A+C (merge/sort only; no new network calls).
@@ -7571,6 +7578,62 @@ def get_streams(type_: str, id_: str, *, is_android: bool = False, is_iphone: bo
             except Exception:
                 pass
 
+            # Small-set bypass: if PROV2 returned only a few playable URL-backed streams,
+            # skip the early probe entirely and let them pass through for final display.
+            try:
+                _playable_url_count = 0
+                for _s in (_streams or []):
+                    if not isinstance(_s, dict):
+                        continue
+                    if str((_s.get('url') or '')).strip():
+                        _playable_url_count += 1
+                _smallset_mode = bool(
+                    int(PROV2_SMALLSET_BYPASS_N or 0) > 0
+                    and _playable_url_count > 0
+                    and _playable_url_count < int(PROV2_SMALLSET_BYPASS_N or 0)
+                )
+            except Exception:
+                _playable_url_count = 0
+                _smallset_mode = False
+
+            if _smallset_mode and bool(PROV2_SMALLSET_SKIP_PROBE):
+                try:
+                    logger.info(
+                        'P2_SMALLSET_BYPASS rid=%s mode=probe_skip playable_url=%d threshold=%d total=%d skip_probe=%s skip_pollution=%s allow_sub_min_res=%s',
+                        _rid(),
+                        int(_playable_url_count or 0),
+                        int(PROV2_SMALLSET_BYPASS_N or 0),
+                        int(len(_streams or [])),
+                        bool(PROV2_SMALLSET_SKIP_PROBE),
+                        bool(PROV2_SMALLSET_SKIP_POLLUTION),
+                        bool(PROV2_SMALLSET_ALLOW_SUB_MIN_RES),
+                    )
+                except Exception:
+                    pass
+                return _streams, {
+                    "probe_early": True,
+                    "probe_launched": False,
+                    "probe_completed": True,
+                    "probe_ms": 0,
+                    "probe_candidates": 0,
+                    "probe_started": 0,
+                    "probe_definitive": 0,
+                    "probe_scanned": 0,
+                    "probe_real": 0,
+                    "probe_stub": 0,
+                    "probe_timeout": 0,
+                    "probe_error_other": 0,
+                    "probe_err": 0,
+                    "probe_budget": 0,
+                    "probe_budget_started": 0,
+                    "probe_budget_unlaunched": 0,
+                    "probe_other_fail": 0,
+                    "probe_skipped_target": 0,
+                    "probe_smallset_bypass": True,
+                    "probe_smallset_playable_url": int(_playable_url_count or 0),
+                    "probe_smallset_threshold": int(PROV2_SMALLSET_BYPASS_N or 0),
+                }
+
             # Build lightweight (stream, meta) pairs for the probe. Provider ND is treated as usenet.
             _pairs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
             for _s in (_streams or []):
@@ -8942,6 +9005,39 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     tb_max_hashes = _choose_tb_max_hashes(platform)
 
     iphone_usenet_mode = bool(is_iphone and IPHONE_USENET_ONLY)
+
+    def _raw_is_p2_smallset_playable(_s: Any) -> bool:
+        try:
+            if not isinstance(_s, dict):
+                return False
+            _bh = _s.get("behaviorHints") or {}
+            if not isinstance(_bh, dict):
+                _bh = {}
+            _sup = str((_bh.get("wrap_src") or _bh.get("source_tag") or "")).upper().strip()
+            return _sup == str(PROV2_TAG or "P2").upper().strip() and bool(str((_s.get("url") or "")).strip())
+        except Exception:
+            return False
+
+    p2_smallset_playable_raw = sum(1 for _s in (streams or []) if _raw_is_p2_smallset_playable(_s))
+    p2_smallset_mode = bool(
+        int(PROV2_SMALLSET_BYPASS_N or 0) > 0
+        and p2_smallset_playable_raw > 0
+        and p2_smallset_playable_raw < int(PROV2_SMALLSET_BYPASS_N or 0)
+    )
+    try:
+        logger.info(
+            "P2_SMALLSET_MODE rid=%s playable_url=%d threshold=%d mode=%s skip_probe=%s skip_pollution=%s allow_sub_min_res=%s",
+            rid,
+            int(p2_smallset_playable_raw or 0),
+            int(PROV2_SMALLSET_BYPASS_N or 0),
+            bool(p2_smallset_mode),
+            bool(PROV2_SMALLSET_SKIP_PROBE),
+            bool(PROV2_SMALLSET_SKIP_POLLUTION),
+            bool(PROV2_SMALLSET_ALLOW_SUB_MIN_RES),
+        )
+    except Exception:
+        pass
+
     usenet_priority_set = {str(p).upper() for p in (USENET_PRIORITY or []) if p}
     if iphone_usenet_mode and usenet_priority_set:
         _before = len(streams)
@@ -9316,6 +9412,20 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
             )
             continue
 
+        # Small-set P2 bypass applies only to URL-backed playable P2 streams.
+        try:
+            _bh_small = (s.get("behaviorHints") or {}) if isinstance(s, dict) else {}
+            if not isinstance(_bh_small, dict):
+                _bh_small = {}
+            _small_sup = _supplier_tag_for_log(s, m, default="UNK")
+            is_p2_smallset_item = bool(
+                p2_smallset_mode
+                and _small_sup == str(PROV2_TAG or "P2").upper().strip()
+                and bool(str((s.get("url") or "")).strip())
+            )
+        except Exception:
+            is_p2_smallset_item = False
+
         # Optional hard drops first
         if DROP_RD and m.get("provider") == "RD":
             stats.dropped_rd += 1
@@ -9338,7 +9448,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 drop_reasons['lang'] += 1
                 continue
             # Pollution
-            if DROP_POLLUTED and is_polluted(s, type_, season, episode):
+            if DROP_POLLUTED and not (is_p2_smallset_item and PROV2_SMALLSET_SKIP_POLLUTION) and is_polluted(s, type_, season, episode):
                 stats.dropped_pollution += 1
                 drop_reasons['pollution'] += 1
                 continue
@@ -9349,7 +9459,7 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
                 continue
 
             # Resolution
-            if MIN_RES > 0:
+            if MIN_RES > 0 and not (is_p2_smallset_item and PROV2_SMALLSET_ALLOW_SUB_MIN_RES):
                 if _res_to_int(m.get('res', '')) < MIN_RES:
                     stats.dropped_low_res += 1
                     drop_reasons['low_res'] += 1
@@ -10834,6 +10944,32 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
         bool(VALIDATE_OFF),
         bool(VERIFY_CACHED_ONLY),
     )
+
+    # Ensure small playable P2 sets stay visible in the final deliver window.
+    if p2_smallset_mode and candidates:
+        try:
+            def _is_small_p2_pair(p):
+                _s, _m = p
+                return bool(
+                    _supplier_tag_for_log(_s, _m, default="UNK") == str(PROV2_TAG or "P2").upper().strip()
+                    and str((_s.get("url") or "")).strip()
+                )
+
+            _p2_small_pairs = [p for p in candidates if _is_small_p2_pair(p)]
+            _missing_small = [p for p in out_pairs if _is_small_p2_pair(p) and p not in _p2_small_pairs]
+            if _missing_small:
+                candidates = _p2_small_pairs + _missing_small + [p for p in candidates if not _is_small_p2_pair(p)]
+                logger.info(
+                    "P2_SMALLSET_FINAL rid=%s playable_url=%d injected=%d deliver_cap=%d",
+                    rid, len(_p2_small_pairs) + len(_missing_small), len(_missing_small), int(deliver_cap_eff or 0)
+                )
+            else:
+                logger.info(
+                    "P2_SMALLSET_FINAL rid=%s playable_url=%d injected=0 deliver_cap=%d",
+                    rid, len(_p2_small_pairs), int(deliver_cap_eff or 0)
+                )
+        except Exception as e:
+            logger.warning("P2_SMALLSET_FINAL_FAIL rid=%s err=%s", rid, e)
 
     # Ensure we keep/deliver some usenet entries (if configured).
     if MIN_USENET_KEEP or MIN_USENET_DELIVER:
