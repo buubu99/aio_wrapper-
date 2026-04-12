@@ -1101,6 +1101,102 @@ def sanitize_stream_inplace(s: Dict[str, Any]) -> bool:
     return True
 
 
+def _classify_upstream_aux_row(s: Dict[str, Any]) -> Optional[str]:
+    """Classify non-playable upstream rows that should be logged separately from real links.
+
+    AIOStreams statistics rows (e.g. addon/filter summaries) usually come through as
+    stream-like dicts without a playable url. We want them visible in logs/metrics, but
+    they must never enter the normal filtering/ranking pipeline.
+    """
+    try:
+        if not isinstance(s, dict):
+            return None
+        if str((s.get('url') or '')).strip() or str((s.get('externalUrl') or '')).strip():
+            return None
+        sd = s.get('streamData') or {}
+        if isinstance(sd, dict) and str(sd.get('type') or '').strip().lower() == 'error':
+            return 'error'
+
+        name = str(s.get('name') or '')
+        desc = str(s.get('description') or '')
+        msg = str(s.get('message') or '')
+        text = ' '.join(x for x in (name, desc, msg) if x).strip().lower()
+        if not text:
+            return None
+
+        # AIOStreams statistics/summary rows when statistics.enabled=true
+        stat_hints = (
+            'statistics', 'statistic', 'summary', 'summaries',
+            'addon', 'add-on', 'filter', 'filters',
+            'timing', 'time', 'latency', 'duration', 'elapsed',
+            'passed', 'dropped', 'total', 'results', 'ms',
+        )
+        if any(tok in text for tok in stat_hints):
+            if ('timing' in text) or ('latency' in text) or ('duration' in text) or ('elapsed' in text):
+                return 'timing'
+            if ('addon' in text) or ('add-on' in text):
+                return 'addon'
+            if ('filter' in text):
+                return 'filter'
+            if ('statistics' in text) or ('summary' in text):
+                return 'stats'
+
+        # Explicit labels sometimes appear as short non-playable rows.
+        m = re.match(r'^\s*(addon|filter|statistics|summary|timing)\b', text)
+        if m:
+            lbl = (m.group(1) or '').lower()
+            if lbl == 'timing':
+                return 'timing'
+            if lbl == 'addon':
+                return 'addon'
+            if lbl == 'filter':
+                return 'filter'
+            return 'stats'
+    except Exception:
+        return None
+    return None
+
+
+def _split_upstream_aux_rows(streams: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, str]], Dict[str, Any]]:
+    """Split provider rows into playable streams vs auxiliary rows for logging only."""
+    playable: List[Dict[str, Any]] = []
+    aux_rows: List[Dict[str, str]] = []
+    kinds: Dict[str, int] = {}
+
+    for s in (streams or []):
+        if not isinstance(s, dict):
+            playable.append(s)
+            continue
+        kind = _classify_upstream_aux_row(s)
+        if not kind:
+            playable.append(s)
+            continue
+        try:
+            name = str(s.get('name') or '').strip()
+            desc = str(s.get('description') or '').strip()
+            msg = str(s.get('message') or '').strip()
+            preview = ' | '.join(x for x in (name, desc, msg) if x)
+        except Exception:
+            name = desc = msg = ''
+            preview = ''
+        aux_rows.append({
+            'kind': str(kind),
+            'name': name[:500],
+            'description': desc[:3000],
+            'message': msg[:1000],
+            'preview': preview[:500],
+        })
+        kinds[str(kind)] = int(kinds.get(str(kind), 0) or 0) + 1
+
+    meta = {
+        'aux_rows': int(len(aux_rows)),
+        'aux_kinds': '|'.join(f"{k}:{kinds[k]}" for k in sorted(kinds)) if kinds else '',
+        'aux_preview': ' || '.join(r.get('preview', '') for r in aux_rows[:3])[:1200] if aux_rows else '',
+        'aux_rows_detail': aux_rows[:20],
+    }
+    return playable, aux_rows, meta
+
+
 def _load_remote_lines(url: str, timeout: float = 4.0) -> List[str]:
     if not url:
         return []
@@ -7353,7 +7449,39 @@ def _fetch_streams_from_base_with_meta(base: str, auth: str, type_: str, id_: st
 
             streams = []
             if isinstance(data, dict):
-                streams = (data.get("streams") or [])[:INPUT_CAP]
+                streams = (data.get("streams") or [])
+
+            # Separate AIOStreams summary/stat rows from real links before downstream processing.
+            aux_rows = []
+            try:
+                streams, aux_rows, aux_meta = _split_upstream_aux_rows(streams)
+                meta["count_raw"] = int(len((data.get("streams") or [])) if isinstance(data, dict) else len(streams))
+                meta["aux_rows"] = int(aux_meta.get("aux_rows") or 0)
+                meta["aux_kinds"] = str(aux_meta.get("aux_kinds") or "")
+                meta["aux_preview"] = str(aux_meta.get("aux_preview") or "")
+                meta["aux_rows_detail"] = list(aux_meta.get("aux_rows_detail") or [])
+                if aux_rows:
+                    try:
+                        logger.info(
+                            'UPSTREAM_AUX rid=%s tag=%s count=%d kinds=%s preview=%s',
+                            _rid(), str(tag), int(meta.get("aux_rows") or 0),
+                            str(meta.get("aux_kinds") or ''),
+                            str(meta.get("aux_preview") or '')[:1200],
+                        )
+                        logger.info(
+                            'UPSTREAM_AUX_DETAIL rid=%s tag=%s rows=%s',
+                            _rid(), str(tag), json.dumps(meta.get("aux_rows_detail") or [], separators=(",",":"), ensure_ascii=False),
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                meta.setdefault("count_raw", int(len(streams)))
+                meta.setdefault("aux_rows", 0)
+                meta.setdefault("aux_kinds", "")
+                meta.setdefault("aux_preview", "")
+                meta.setdefault("aux_rows_detail", [])
+
+            streams = streams[:INPUT_CAP]
 
             # Lightweight post-load tagging timing (does not expose tokens)
             t_post0 = time.monotonic()
@@ -8554,7 +8682,7 @@ def _compact_fetch_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(meta, dict):
         return {}
     # Only keep the safe/compact keys
-    keep = ('tag', 'src', 'ok', 'status', 'bytes', 'count', 'ms', 'last_fetch_ms', 'ms_provider', 'wait_ms', 'late_grace_ms', 'http_ms', 'read_ms', 'json_ms', 'post_ms', 'req_epoch_ms', 'conn_ms', 'tls_ms', 'pre_net_ms', 'svrwait_ms', 'soft_timeout_ms', 'err', 'probe_early', 'probe_launched', 'probe_completed', 'probe_ms', 'probe_candidates', 'probe_started', 'probe_definitive', 'probe_scanned', 'probe_real', 'probe_stub', 'probe_timeout', 'probe_error_other', 'probe_err', 'probe_budget', 'probe_budget_started', 'probe_budget_unlaunched', 'probe_other_fail', 'probe_skipped_target', 'probe_join_ms', 'probe_early_err')
+    keep = ('tag', 'src', 'ok', 'status', 'bytes', 'count', 'count_raw', 'aux_rows', 'aux_kinds', 'aux_preview', 'aux_rows_detail', 'ms', 'last_fetch_ms', 'ms_provider', 'wait_ms', 'late_grace_ms', 'http_ms', 'read_ms', 'json_ms', 'post_ms', 'req_epoch_ms', 'conn_ms', 'tls_ms', 'pre_net_ms', 'svrwait_ms', 'soft_timeout_ms', 'err', 'probe_early', 'probe_launched', 'probe_completed', 'probe_ms', 'probe_candidates', 'probe_started', 'probe_definitive', 'probe_scanned', 'probe_real', 'probe_stub', 'probe_timeout', 'probe_error_other', 'probe_err', 'probe_budget', 'probe_budget_started', 'probe_budget_unlaunched', 'probe_other_fail', 'probe_skipped_target', 'probe_join_ms', 'probe_early_err')
     return {k: meta.get(k) for k in keep if k in meta and meta.get(k) not in (None, "", {})}
 
 # Diversify top M while preserving quality: pick from a larger pool, bucketed by resolution, then mix providers/suppliers.
@@ -10561,7 +10689,6 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     tb_api_ran = False
     tb_api_reason = ""
     tb_hashes: List[str] = []
-    tb_hashes_api: List[str] = []
     tb_skip_checks = False
     tb_skip_reason = ""
     # Optional early-exit: if enough cached hints already exist in the top slice, skip TorBox API calls.
