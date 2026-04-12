@@ -1104,27 +1104,45 @@ def sanitize_stream_inplace(s: Dict[str, Any]) -> bool:
 def _classify_upstream_aux_row(s: Dict[str, Any]) -> Optional[str]:
     """Classify non-playable upstream rows that should be logged separately from real links.
 
-    AIOStreams statistics rows (e.g. addon/filter summaries) usually come through as
-    stream-like dicts without a playable url. We want them visible in logs/metrics, but
-    they must never enter the normal filtering/ranking pipeline.
+    AIOStreams statistics rows (e.g. addon/filter summaries) often come through as
+    stream-like dicts with an ``externalUrl`` plus ``streamData.type = 'statistic'``.
+    We want them visible in logs/metrics, but they must never enter the normal
+    filtering/ranking pipeline.
     """
     try:
         if not isinstance(s, dict):
             return None
-        if str((s.get('url') or '')).strip() or str((s.get('externalUrl') or '')).strip():
-            return None
+
         sd = s.get('streamData') or {}
-        if isinstance(sd, dict) and str(sd.get('type') or '').strip().lower() == 'error':
+        sd_type = str(sd.get('type') or '').strip().lower() if isinstance(sd, dict) else ''
+        if sd_type == 'error':
             return 'error'
 
         name = str(s.get('name') or '')
         desc = str(s.get('description') or '')
         msg = str(s.get('message') or '')
         text = ' '.join(x for x in (name, desc, msg) if x).strip().lower()
+
+        # AIOStreams statistics rows must be detected *before* we reject rows with
+        # externalUrl, because the built-in summaries/timing/filter rows use
+        # externalUrl=https://github.com/Viren070/AIOStreams and no playable url.
+        if sd_type == 'statistic':
+            if ('timing' in text) or ('latency' in text) or ('duration' in text) or ('elapsed' in text) or ('pipeline timing' in text):
+                return 'timing'
+            if ('filter breakdown' in text) or ('filter' in text) or ('included reasons' in text):
+                return 'filter'
+            if ('scrape summary' in text) or ('addon' in text) or ('add-on' in text):
+                return 'addon'
+            return 'stats'
+
+        # Real playable rows may carry a url/externalUrl; keep them in the normal pipeline.
+        if str((s.get('url') or '')).strip() or str((s.get('externalUrl') or '')).strip():
+            return None
+
         if not text:
             return None
 
-        # AIOStreams statistics/summary rows when statistics.enabled=true
+        # Fallback classification for non-playable summary-like rows.
         stat_hints = (
             'statistics', 'statistic', 'summary', 'summaries',
             'addon', 'add-on', 'filter', 'filters',
@@ -1141,7 +1159,6 @@ def _classify_upstream_aux_row(s: Dict[str, Any]) -> Optional[str]:
             if ('statistics' in text) or ('summary' in text):
                 return 'stats'
 
-        # Explicit labels sometimes appear as short non-playable rows.
         m = re.match(r'^\s*(addon|filter|statistics|summary|timing)\b', text)
         if m:
             lbl = (m.group(1) or '').lower()
