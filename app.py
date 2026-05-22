@@ -10706,6 +10706,11 @@ def filter_and_format(type_: str, id_: str, streams: List[Dict[str, Any]], aio_i
     tb_api_ran = False
     tb_api_reason = ""
     tb_hashes: List[str] = []
+    # Must exist even when TorBox checking is skipped (fast_mode/VALIDATE_OFF/
+    # TB_CACHE_HINTS=false/no API key/no candidates/min_hashes). Later diagnostic
+    # logging always reports len(tb_hashes_api); without this default an empty
+    # candidate set can raise UnboundLocalError and break /stream responses.
+    tb_hashes_api: List[str] = []
     tb_skip_checks = False
     tb_skip_reason = ""
     # Optional early-exit: if enough cached hints already exist in the top slice, skip TorBox API calls.
