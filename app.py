@@ -4884,7 +4884,12 @@ def add_common_headers(response):
 
 @app.get("/")
 def root():
-    return "ok", 200
+    # Some Stremio Lite clients probe the configured base addon URL verbatim
+    # instead of appending /manifest.json.  Serve the descriptor at both paths
+    # so a base-URL installation remains discoverable and stream requests are
+    # not silently suppressed by the client.
+    logger.info("ROOT_MANIFEST_COMPAT rid=%s", _rid())
+    return manifest()
 
 
 @app.route("/r/<path:token>", methods=["GET", "HEAD", "OPTIONS"])

@@ -1,5 +1,5 @@
 {
-  "id": "org.jason.wrapper",
+  "id": "org.buubuu.aio.wrapper.merge",
   "version": "11.7.0",
   "name": "BuuBuu Super Wrapper – Ultimate Stream Mix!",
   "description": "Movies & Series | The best mix of AIOStreams, usenet & debrid for premium, filtered streams — fast & reliable!",
@@ -12,7 +12,8 @@
   ],
   "catalogs": [],
   "idPrefixes": [
-    "tt""logo": "https://aio-wrapper-add-on.onrender.com/logo.png",
+    "tt",
+    "tmdb"
   ],
   "logo": "",
   "behaviorHints": {
