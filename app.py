@@ -620,7 +620,15 @@ VERIFY_TB_CACHE_OFF = _parse_bool(os.environ.get("VERIFY_TB_CACHE_OFF", "false")
 # Use short opaque /r/<token> urls instead of base64-encoding the full upstream URL.
 # Fixes Android/Google TV URL-length limits and keeps playback URLs private.
 WRAP_URL_SHORT = _parse_bool(os.environ.get("WRAP_URL_SHORT", "true"), True)
-WRAP_URL_TTL = _safe_int(os.environ.get('WRAP_URL_TTL', '3600'), 3600)  # seconds
+# Stremio clients can retain a stream result for days.  Keep the opaque
+# short-token -> upstream-URL relationship for the promised 30-day window so
+# a cached client result does not turn into a wrapper-generated 404 after only
+# an hour.  The OVH deployment also sets this explicitly as a second guard.
+WRAP_URL_TTL_DEFAULT = 30 * 24 * 60 * 60
+WRAP_URL_TTL = max(
+    60,
+    _safe_int(os.environ.get('WRAP_URL_TTL', str(WRAP_URL_TTL_DEFAULT)), WRAP_URL_TTL_DEFAULT),
+)
 WRAP_URL_BACKEND = (os.environ.get('WRAP_URL_BACKEND', 'auto') or 'auto').strip().lower()
 WRAP_URL_SQLITE_PATH = (os.environ.get('WRAP_URL_SQLITE_PATH', '/tmp/aio_wrap_tokens.sqlite3') or '/tmp/aio_wrap_tokens.sqlite3').strip()
 # Best-effort: infer intended worker count from env (used only to pick safe /r token backend)
@@ -4339,9 +4347,22 @@ def _wrap_sqlite_load(token: str) -> Optional[str]:
     with _WRAP_SQLITE_LOCK:
         row = conn.execute("SELECT url, exp FROM wrap_tokens WHERE token = ?", (token,)).fetchone()
         if not row:
+            logger.warning(
+                "TOKEN_MISS rid=%s backend=sqlite reason=missing tok=%s ttl_s=%s",
+                _rid(),
+                (token[:4] + "…" + token[-4:]) if len(token) > 10 else token,
+                int(WRAP_URL_TTL or 0),
+            )
             return None
         url, exp = row[0], float(row[1] or 0)
         if exp and now > exp:
+            logger.warning(
+                "TOKEN_MISS rid=%s backend=sqlite reason=expired tok=%s expired_by_s=%s ttl_s=%s",
+                _rid(),
+                (token[:4] + "…" + token[-4:]) if len(token) > 10 else token,
+                int(max(0, now - exp)),
+                int(WRAP_URL_TTL or 0),
+            )
             try:
                 conn.execute("DELETE FROM wrap_tokens WHERE token=?", (token,))
                 conn.execute("DELETE FROM wrap_hash WHERE token=?", (token,))
@@ -5220,7 +5241,7 @@ logger.info(
     int((_ENV_FILE_INFO or {}).get("loaded") or 0),
     int((_ENV_FILE_INFO or {}).get("overridden") or 0),
 )
-logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_initial_bytes={USENET_PROBE_INITIAL_BYTES} usenet_probe_prewarm_s={USENET_PROBE_PREWARM_S} usenet_probe_concurrency={USENET_PROBE_CONCURRENCY} usenet_probe_concurrency_cap={USENET_PROBE_CONCURRENCY_CAP} usenet_probe_open_concurrency={USENET_PROBE_OPEN_CONCURRENCY} usenet_probe_impl_ver={USENET_PROBE_IMPL_VER} usenet_probe_debug_timeouts={USENET_PROBE_DEBUG_TIMEOUTS} usenet_probe_debug_timeouts_n={USENET_PROBE_DEBUG_TIMEOUTS_N} usenet_probe_trace={USENET_PROBE_TRACE} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N} wrap_url_backend={_WRAP_URL_BACKEND} web_concurrency_env={WEB_CONCURRENCY_ENV}")
+logger.info(f"CONFIG tmdb_force_imdb={TMDB_FORCE_IMDB} tb_api_min_hashes={TB_API_MIN_HASHES} nzbgeek_title_match_min_ratio={NZBGEEK_TITLE_MATCH_MIN_RATIO} nzbgeek_timeout={NZBGEEK_TIMEOUT} nzbgeek_title_fallback={NZBGEEK_TITLE_FALLBACK} use_nzbgeek_ready={USE_NZBGEEK_READY} usenet_probe_enable={USENET_PROBE_ENABLE} usenet_probe_top_n={USENET_PROBE_TOP_N} usenet_probe_target_real={USENET_PROBE_TARGET_REAL} usenet_probe_timeout_s={USENET_PROBE_TIMEOUT_S} usenet_probe_budget_s={USENET_PROBE_BUDGET_S} usenet_probe_drop_fails={USENET_PROBE_DROP_FAILS} usenet_probe_initial_bytes={USENET_PROBE_INITIAL_BYTES} usenet_probe_prewarm_s={USENET_PROBE_PREWARM_S} usenet_probe_concurrency={USENET_PROBE_CONCURRENCY} usenet_probe_concurrency_cap={USENET_PROBE_CONCURRENCY_CAP} usenet_probe_open_concurrency={USENET_PROBE_OPEN_CONCURRENCY} usenet_probe_impl_ver={USENET_PROBE_IMPL_VER} usenet_probe_debug_timeouts={USENET_PROBE_DEBUG_TIMEOUTS} usenet_probe_debug_timeouts_n={USENET_PROBE_DEBUG_TIMEOUTS_N} usenet_probe_trace={USENET_PROBE_TRACE} usenet_probe_real_top10_pct={USENET_PROBE_REAL_TOP10_PCT} usenet_probe_real_top20_n={USENET_PROBE_REAL_TOP20_N} wrap_url_backend={_WRAP_URL_BACKEND} wrap_url_ttl_s={WRAP_URL_TTL} wrap_url_sqlite_path={WRAP_URL_SQLITE_PATH} web_concurrency_env={WEB_CONCURRENCY_ENV}")
 
 logger.info(
     "LOG_FLAGS wrap_log_token_emit=%s wrap_log_token_hit=%s wrap_log_token_full=%s wrap_log_token_sample_pct=%s sort_proof_top_n=%s usenet_probe_log_urls=%s usenet_probe_log_urls_n=%s",
